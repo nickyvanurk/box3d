@@ -32,6 +32,7 @@
 #define MAX_WORLDS 4
 #define MAX_JOINTS 4096
 #define MAX_HULLS 8192
+#define MAX_SHAPES 65536
 
 typedef struct World
 {
@@ -48,6 +49,12 @@ typedef struct World
 	// Heap-owned hulls, released with the world — see RetainHull.
 	b3HullData* hulls[MAX_HULLS];
 	int hullCount;
+
+	// Shapes are handed back as handles so callers can destroy or re-filter one
+	// without holding a Box3D id. Slots are never reused: a stale handle then
+	// fails a validity check rather than addressing someone else's collider.
+	b3ShapeId shapes[MAX_SHAPES];
+	int shapeCount;
 
 	// pos(3) + quat(4) per body, interleaved, in body-handle order.
 	float* transforms;
@@ -118,6 +125,7 @@ int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableC
 	world->bodyCount = 0;
 	world->jointCount = 0;
 	world->hullCount = 0;
+	world->shapeCount = 0;
 
 	ReserveBodies( world, 256 );
 
@@ -192,13 +200,25 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
  * JS callback invoked per contact pair to express that; here it is a field, so
  * the comparison never crosses the boundary at all. Zero disables the rule.
  */
-void b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float density, float friction,
-						float restitution, int group )
+static int RetainShape( World* world, b3ShapeId shape )
+{
+	if ( world->shapeCount >= MAX_SHAPES )
+	{
+		return -1;
+	}
+
+	int handle = world->shapeCount++;
+	world->shapes[handle] = shape;
+	return handle;
+}
+
+int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float density, float friction,
+					   float restitution, int group )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
 	{
-		return;
+		return -1;
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
@@ -211,7 +231,7 @@ void b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, floa
 	// how Box3D's own samples do it. Only hulls built with b3CreateHull are
 	// heap-owned and have to outlive their shape.
 	b3BoxHull hull = b3MakeBoxHull( hx, hy, hz );
-	b3CreateHullShape( world->bodies[body], &def, &hull.base );
+	return RetainShape( world, b3CreateHullShape( world->bodies[body], &def, &hull.base ) );
 }
 
 int b3w_body_count( int handle )
@@ -431,13 +451,13 @@ int b3w_is_valid( int handle, int body )
 /// A capsule along local Y, the shape the player uses. `halfHeight` is the
 /// distance from the centre to a hemisphere's centre, matching the game's
 /// CapsuleColliderConfig rather than Box3D's two-point form.
-void b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius, float density, float friction,
+int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius, float density, float friction,
 							float restitution )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
 	{
-		return;
+		return -1;
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
@@ -450,7 +470,7 @@ void b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius
 		.center2 = ( b3Vec3 ){ 0.0f, halfHeight, 0.0f },
 		.radius = radius,
 	};
-	b3CreateCapsuleShape( world->bodies[body], &def, &capsule );
+	return RetainShape( world, b3CreateCapsuleShape( world->bodies[body], &def, &capsule ) );
 }
 
 // --- terrain and queries -------------------------------------------------
@@ -510,6 +530,7 @@ void b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int
 
 	b3ShapeDef shapeDef = b3DefaultShapeDef();
 	b3CreateHeightFieldShape( world->bodies[body], &shapeDef, field );
+	// Height fields are never destroyed or re-filtered, so no handle is kept.
 }
 
 /// Cast a ray and return the hit's world Y, or `missValue` when nothing is hit.
@@ -639,13 +660,13 @@ int b3w_add_prismatic_joint( int handle, int bodyA, int bodyB, float ax, float a
  * Box3D keeps a reference to the mesh (see b3CreateMeshShape), so the data is
  * copied into memory we own and outlives the shape.
  */
-void b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, int indicesPtr, int triangleCount,
+int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, int indicesPtr, int triangleCount,
 						 float friction, float restitution, int group )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
 	{
-		return;
+		return -1;
 	}
 
 	b3Vec3* vertices = (b3Vec3*)malloc( sizeof( b3Vec3 ) * vertexCount );
@@ -675,7 +696,7 @@ void b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount,
 	shapeDef.baseMaterial.restitution = restitution;
 	shapeDef.filter.groupIndex = group;
 
-	b3CreateMeshShape( world->bodies[body], &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } );
+	return RetainShape( world, b3CreateMeshShape( world->bodies[body], &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } ) );
 }
 
 // --- joint motors and limits ---------------------------------------------
@@ -826,13 +847,13 @@ static void RetainHull( World* world, b3HullData* hull )
 	world->hulls[world->hullCount++] = hull;
 }
 
-void b3w_add_sphere_shape( int handle, int body, float radius, float density, float friction, float restitution,
+int b3w_add_sphere_shape( int handle, int body, float radius, float density, float friction, float restitution,
 						   int group )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
 	{
-		return;
+		return -1;
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
@@ -842,17 +863,17 @@ void b3w_add_sphere_shape( int handle, int body, float radius, float density, fl
 	def.filter.groupIndex = group;
 
 	b3Sphere sphere = { .center = { 0.0f, 0.0f, 0.0f }, .radius = radius };
-	b3CreateSphereShape( world->bodies[body], &def, &sphere );
+	return RetainShape( world, b3CreateSphereShape( world->bodies[body], &def, &sphere ) );
 }
 
 /// A cylinder about local Y, matching how the game orients wheels.
-void b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius, int sides, float density,
+int b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius, int sides, float density,
 							 float friction, float restitution, int group )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
 	{
-		return;
+		return -1;
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
@@ -863,17 +884,17 @@ void b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radiu
 
 	b3HullData* hull = b3CreateCylinder( 2.0f * halfHeight, radius, -halfHeight, sides );
 	RetainHull( world, hull );
-	b3CreateHullShape( world->bodies[body], &def, hull );
+	return RetainShape( world, b3CreateHullShape( world->bodies[body], &def, hull ) );
 }
 
 /// A convex hull over a point cloud the host uploaded.
-void b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int maxVertices, float density,
+int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int maxVertices, float density,
 						 float friction, float restitution, int group )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
 	{
-		return;
+		return -1;
 	}
 
 	b3Vec3* points = (b3Vec3*)malloc( sizeof( b3Vec3 ) * pointCount );
@@ -887,7 +908,7 @@ void b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, in
 	free( points );
 	if ( hull == NULL )
 	{
-		return;
+		return -1;
 	}
 
 	RetainHull( world, hull );
@@ -898,7 +919,7 @@ void b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, in
 	def.baseMaterial.restitution = restitution;
 	def.filter.groupIndex = group;
 
-	b3CreateHullShape( world->bodies[body], &def, hull );
+	return RetainShape( world, b3CreateHullShape( world->bodies[body], &def, hull ) );
 }
 
 // --- lifecycle and world state -------------------------------------------
@@ -1005,4 +1026,66 @@ int b3w_cast_ray_detailed( int handle, float ox, float oy, float oz, float dx, f
 	out[6] = closest.fraction;
 	out[7] = (float)closest.body;
 	return 1;
+}
+
+/**
+ * Servo a revolute joint toward a target angle.
+ *
+ * Rapier has a position motor; Box3D has a SPRING with a target angle, tuned in
+ * hertz and damping ratio rather than stiffness and damping. That is a
+ * different parameterisation of the same idea, not a different feature, but the
+ * numbers do not carry across — hertz is a frequency, and the game's pivot
+ * stiffness values are not.
+ *
+ * `hertz <= 0` disables the spring, which is how a servo is turned off without
+ * leaving it pulling toward a stale angle.
+ */
+void b3w_set_revolute_servo( int handle, int joint, float targetRadians, float hertz, float dampingRatio )
+{
+	b3JointId id = JointId( handle, joint );
+
+	b3RevoluteJoint_EnableSpring( id, hertz > 0.0f );
+	b3RevoluteJoint_SetTargetAngle( id, targetRadians );
+	b3RevoluteJoint_SetSpringHertz( id, hertz );
+	b3RevoluteJoint_SetSpringDampingRatio( id, dampingRatio );
+}
+
+/// Current joint angle in radians, which the servo and the game's readouts need.
+float b3w_revolute_angle( int handle, int joint )
+{
+	return b3RevoluteJoint_GetAngle( JointId( handle, joint ) );
+}
+
+// --- shape mutation ------------------------------------------------------
+
+/**
+ * Destroy one shape, leaving its body alone.
+ *
+ * `updateBodyMass` is true because the game rebuilds a body's colliders in
+ * place — a structure that loses a block must lose its mass with it, or every
+ * force applied afterwards is computed against a body heavier than it looks.
+ */
+void b3w_destroy_shape( int handle, int shape )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || shape < 0 || shape >= world->shapeCount )
+	{
+		return;
+	}
+
+	if ( b3Shape_IsValid( world->shapes[shape] ) )
+	{
+		b3DestroyShape( world->shapes[shape], true );
+	}
+}
+
+int b3w_shape_is_valid( int handle, int shape )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || shape < 0 || shape >= world->shapeCount )
+	{
+		return 0;
+	}
+
+	return b3Shape_IsValid( world->shapes[shape] ) ? 1 : 0;
 }
