@@ -31,6 +31,7 @@
 
 #define MAX_WORLDS 4
 #define MAX_JOINTS 4096
+#define MAX_HULLS 8192
 
 typedef struct World
 {
@@ -43,6 +44,10 @@ typedef struct World
 
 	b3JointId joints[MAX_JOINTS];
 	int jointCount;
+
+	// Heap-owned hulls, released with the world — see RetainHull.
+	b3HullData* hulls[MAX_HULLS];
+	int hullCount;
 
 	// pos(3) + quat(4) per body, interleaved, in body-handle order.
 	float* transforms;
@@ -112,6 +117,7 @@ int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableC
 	world->inUse = true;
 	world->bodyCount = 0;
 	world->jointCount = 0;
+	world->hullCount = 0;
 
 	ReserveBodies( world, 256 );
 
@@ -127,6 +133,11 @@ void b3w_destroy_world( int handle )
 	}
 
 	b3DestroyWorld( world->id );
+
+	for ( int i = 0; i < world->hullCount; ++i )
+	{
+		b3DestroyHull( world->hulls[i] );
+	}
 
 	free( world->bodies );
 	free( world->transforms );
@@ -163,6 +174,11 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
 
 	int body = world->bodyCount++;
 	world->bodies[body] = b3CreateBody( world->id, &def );
+
+	// The handle rides ON the body, so a query result can name it without a
+	// reverse scan of the table. Offset by one so that a body whose user data
+	// was never set reads as "unknown" rather than as body zero.
+	b3Body_SetUserData( world->bodies[body], (void*)(intptr_t)( body + 1 ) );
 
 	return body;
 }
@@ -660,4 +676,333 @@ void b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount,
 	shapeDef.filter.groupIndex = group;
 
 	b3CreateMeshShape( world->bodies[body], &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } );
+}
+
+// --- joint motors and limits ---------------------------------------------
+//
+// The game drives every wheel, pivot and piston through a motor, so this is
+// the rest of the joint surface. Revolute and prismatic take the same shape
+// deliberately — one host-side call site rather than two — even though Box3D
+// names the force cap differently for each (torque vs force).
+
+static b3JointId JointId( int handle, int joint )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || joint < 0 || joint >= world->jointCount )
+	{
+		return b3_nullJointId;
+	}
+
+	return world->joints[joint];
+}
+
+/// Drive a revolute joint at `speed` rad/s, capped at `maxTorque`. A zero or
+/// negative cap disables the motor rather than fighting with zero authority.
+void b3w_set_revolute_motor( int handle, int joint, float speed, float maxTorque )
+{
+	b3JointId id = JointId( handle, joint );
+
+	b3RevoluteJoint_EnableMotor( id, maxTorque > 0.0f );
+	b3RevoluteJoint_SetMotorSpeed( id, speed );
+	b3RevoluteJoint_SetMaxMotorTorque( id, maxTorque );
+}
+
+void b3w_set_revolute_limits( int handle, int joint, int enable, float lower, float upper )
+{
+	b3JointId id = JointId( handle, joint );
+
+	b3RevoluteJoint_EnableLimit( id, enable != 0 );
+	if ( enable != 0 )
+	{
+		b3RevoluteJoint_SetLimits( id, lower, upper );
+	}
+}
+
+/// As above, for a prismatic joint: `speed` in m/s, capped at `maxForce`.
+void b3w_set_prismatic_motor( int handle, int joint, float speed, float maxForce )
+{
+	b3JointId id = JointId( handle, joint );
+
+	b3PrismaticJoint_EnableMotor( id, maxForce > 0.0f );
+	b3PrismaticJoint_SetMotorSpeed( id, speed );
+	b3PrismaticJoint_SetMaxMotorForce( id, maxForce );
+}
+
+void b3w_set_prismatic_limits( int handle, int joint, int enable, float lower, float upper )
+{
+	b3JointId id = JointId( handle, joint );
+
+	b3PrismaticJoint_EnableLimit( id, enable != 0 );
+	if ( enable != 0 )
+	{
+		b3PrismaticJoint_SetLimits( id, lower, upper );
+	}
+}
+
+// --- shape casts ---------------------------------------------------------
+//
+// Box3D casts a POINT CLOUD with a radius rather than a shape object: a sphere
+// is one point, a capsule is two. That covers what the game casts — the
+// player's ground probe and the vehicle controller's suspension — without the
+// binding needing a shape registry.
+//
+// The engine reports every hit through a callback and lets the callback clip
+// the remaining range by what it returns. Closest-hit is therefore "return the
+// fraction you just saw", which is cheaper than collecting and sorting.
+
+typedef struct ClosestHit
+{
+	float fraction;
+	b3Vec3 normal;
+	bool hit;
+} ClosestHit;
+
+static float OnCastHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction, uint64_t userMaterialId,
+						int triangleIndex, int childIndex, void* context )
+{
+	(void)shapeId;
+	(void)point;
+	(void)userMaterialId;
+	(void)triangleIndex;
+	(void)childIndex;
+
+	ClosestHit* closest = (ClosestHit*)context;
+	closest->fraction = fraction;
+	closest->normal = normal;
+	closest->hit = true;
+
+	// Clip the cast to here: anything beyond is no longer interesting.
+	return fraction;
+}
+
+/**
+ * Sweep a sphere and report the first surface it meets.
+ *
+ * `out` receives normal(3) + fraction(1). Returns 1 on a hit, 0 on a miss —
+ * the fraction is only meaningful when it returns 1.
+ */
+int b3w_cast_sphere( int handle, float cx, float cy, float cz, float radius, float dx, float dy, float dz, float* out )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL )
+	{
+		return 0;
+	}
+
+	b3Vec3 point = { 0.0f, 0.0f, 0.0f };
+	b3ShapeProxy proxy = { .points = &point, .count = 1, .radius = radius };
+
+	ClosestHit closest = { .fraction = 1.0f, .normal = { 0.0f, 1.0f, 0.0f }, .hit = false };
+	b3World_CastShape( world->id, ( b3Pos ){ cx, cy, cz }, &proxy, ( b3Vec3 ){ dx, dy, dz }, b3DefaultQueryFilter(),
+					   OnCastHit, &closest );
+
+	if ( closest.hit == false )
+	{
+		return 0;
+	}
+
+	out[0] = closest.normal.x;
+	out[1] = closest.normal.y;
+	out[2] = closest.normal.z;
+	out[3] = closest.fraction;
+	return 1;
+}
+
+// --- the rest of the shape vocabulary ------------------------------------
+//
+// Hulls built by b3CreateCylinder and b3CreateHull are HEAP-owned and must
+// outlive the shape that references them, unlike b3MakeBoxHull's stack value.
+// They are kept on the world and released with it, because the game rebuilds
+// structures constantly and a per-shape free would need a registry nobody
+// would keep in sync.
+
+static void RetainHull( World* world, b3HullData* hull )
+{
+	if ( world->hullCount >= MAX_HULLS )
+	{
+		return;
+	}
+
+	world->hulls[world->hullCount++] = hull;
+}
+
+void b3w_add_sphere_shape( int handle, int body, float radius, float density, float friction, float restitution,
+						   int group )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+
+	b3ShapeDef def = b3DefaultShapeDef();
+	def.density = density;
+	def.baseMaterial.friction = friction;
+	def.baseMaterial.restitution = restitution;
+	def.filter.groupIndex = group;
+
+	b3Sphere sphere = { .center = { 0.0f, 0.0f, 0.0f }, .radius = radius };
+	b3CreateSphereShape( world->bodies[body], &def, &sphere );
+}
+
+/// A cylinder about local Y, matching how the game orients wheels.
+void b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius, int sides, float density,
+							 float friction, float restitution, int group )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+
+	b3ShapeDef def = b3DefaultShapeDef();
+	def.density = density;
+	def.baseMaterial.friction = friction;
+	def.baseMaterial.restitution = restitution;
+	def.filter.groupIndex = group;
+
+	b3HullData* hull = b3CreateCylinder( 2.0f * halfHeight, radius, -halfHeight, sides );
+	RetainHull( world, hull );
+	b3CreateHullShape( world->bodies[body], &def, hull );
+}
+
+/// A convex hull over a point cloud the host uploaded.
+void b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int maxVertices, float density,
+						 float friction, float restitution, int group )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+
+	b3Vec3* points = (b3Vec3*)malloc( sizeof( b3Vec3 ) * pointCount );
+	const float* src = (const float*)(intptr_t)pointsPtr;
+	for ( int i = 0; i < pointCount; ++i )
+	{
+		points[i] = ( b3Vec3 ){ src[3 * i], src[3 * i + 1], src[3 * i + 2] };
+	}
+
+	b3HullData* hull = b3CreateHull( points, pointCount, maxVertices );
+	free( points );
+	if ( hull == NULL )
+	{
+		return;
+	}
+
+	RetainHull( world, hull );
+
+	b3ShapeDef def = b3DefaultShapeDef();
+	def.density = density;
+	def.baseMaterial.friction = friction;
+	def.baseMaterial.restitution = restitution;
+	def.filter.groupIndex = group;
+
+	b3CreateHullShape( world->bodies[body], &def, hull );
+}
+
+// --- lifecycle and world state -------------------------------------------
+
+/// Destroy a body and everything attached to it. The handle stays allocated so
+/// that stale references fail a validity check rather than addressing a
+/// recycled body — `b3w_is_valid` is the way to ask.
+void b3w_destroy_body( int handle, int body )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+
+	b3DestroyBody( world->bodies[body] );
+}
+
+void b3w_set_gravity( int handle, float x, float y, float z )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	b3World_SetGravity( world->id, ( b3Vec3 ){ x, y, z } );
+}
+
+int b3w_shape_count( int handle, int body )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return 0;
+	}
+
+	return b3Body_GetShapeCount( world->bodies[body] );
+}
+
+/**
+ * Cast a ray and report the full hit: point, normal and which body was struck.
+ *
+ * `out` receives point(3) + normal(3) + fraction(1) + bodyHandle(1). Returns 1
+ * on a hit, 0 on a miss. The body handle comes from the body's own user data
+ * rather than a scan of the body table — a raycast per tool per frame cannot
+ * afford a linear search, and the alternative registry would be one more thing
+ * to keep in sync.
+ *
+ * A body handle of -1 means the shape belongs to a body this binding did not
+ * create, which should not happen and is reported rather than guessed at.
+ */
+typedef struct ClosestRayHit
+{
+	float fraction;
+	b3Vec3 normal;
+	b3Pos point;
+	int body;
+	bool hit;
+} ClosestRayHit;
+
+static float OnRayHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction, uint64_t userMaterialId,
+					   int triangleIndex, int childIndex, void* context )
+{
+	(void)userMaterialId;
+	(void)triangleIndex;
+	(void)childIndex;
+
+	ClosestRayHit* closest = (ClosestRayHit*)context;
+	closest->fraction = fraction;
+	closest->normal = normal;
+	closest->point = point;
+	closest->hit = true;
+
+	intptr_t tagged = (intptr_t)b3Body_GetUserData( b3Shape_GetBody( shapeId ) );
+	closest->body = tagged > 0 ? (int)( tagged - 1 ) : -1;
+
+	return fraction;
+}
+
+int b3w_cast_ray_detailed( int handle, float ox, float oy, float oz, float dx, float dy, float dz, float* out )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL )
+	{
+		return 0;
+	}
+
+	ClosestRayHit closest = { .fraction = 1.0f, .body = -1, .hit = false };
+	b3World_CastRay( world->id, ( b3Pos ){ ox, oy, oz }, ( b3Vec3 ){ dx, dy, dz }, b3DefaultQueryFilter(), OnRayHit,
+					 &closest );
+
+	if ( closest.hit == false )
+	{
+		return 0;
+	}
+
+	out[0] = (float)closest.point.x;
+	out[1] = (float)closest.point.y;
+	out[2] = (float)closest.point.z;
+	out[3] = closest.normal.x;
+	out[4] = closest.normal.y;
+	out[5] = closest.normal.z;
+	out[6] = closest.fraction;
+	out[7] = (float)closest.body;
+	return 1;
 }
