@@ -165,7 +165,22 @@ void b3w_step( int handle, float timeStep, int subStepCount )
 
 // --- bodies --------------------------------------------------------------
 
-int b3w_create_body( int handle, int bodyType, float px, float py, float pz, float qx, float qy, float qz, float qw )
+/**
+ * Create a body.
+ *
+ * `lockRotations` uses Box3D's motion locks, which are exact — Rapier
+ * approximates the same thing with a spring that has a compliance floor, so a
+ * "locked" body there still rotates a little under load. A character capsule
+ * that tips at all is one that faceplants, so this is a real improvement and
+ * not just a different spelling.
+ *
+ * `softCcdPrediction` maps to continuous collision on the body. Box3D's CCD
+ * works against height fields where Rapier's silently does not, which is the
+ * root of terrain tunnelling — so this is the other place the swap is expected
+ * to fix something rather than merely match.
+ */
+int b3w_create_body( int handle, int bodyType, float px, float py, float pz, float qx, float qy, float qz, float qw,
+					 float linearDamping, float angularDamping, int lockRotations, int continuous )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL )
@@ -177,6 +192,16 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
 	def.type = (b3BodyType)bodyType;
 	def.position = ( b3Pos ){ px, py, pz };
 	def.rotation = ( b3Quat ){ { qx, qy, qz }, qw };
+	def.linearDamping = linearDamping;
+	def.angularDamping = angularDamping;
+	def.isBullet = continuous != 0;
+
+	if ( lockRotations != 0 )
+	{
+		def.motionLocks.angularX = true;
+		def.motionLocks.angularY = true;
+		def.motionLocks.angularZ = true;
+	}
 
 	ReserveBodies( world, world->bodyCount + 1 );
 
@@ -212,8 +237,17 @@ static int RetainShape( World* world, b3ShapeId shape )
 	return handle;
 }
 
-int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float density, float friction,
-					   float restitution, int group )
+/**
+ * Attach a box shape, optionally offset and rotated in body space.
+ *
+ * Box3D has no collider transform: a shape IS its geometry, so an offset box is
+ * a transformed hull rather than a hull plus a pose. That is why the offset is
+ * per shape here instead of a field on the shape def — the game's merged block
+ * colliders sit off-centre, and placing them at the body origin would look like
+ * a solver bug rather than a missing parameter.
+ */
+int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float ox, float oy, float oz, float qx,
+					   float qy, float qz, float qw, float density, float friction, float restitution, int group )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
@@ -230,7 +264,8 @@ int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float
 	// b3CreateHullShape copies the hull, so a stack local is enough — this is
 	// how Box3D's own samples do it. Only hulls built with b3CreateHull are
 	// heap-owned and have to outlive their shape.
-	b3BoxHull hull = b3MakeBoxHull( hx, hy, hz );
+	b3Transform pose = { .p = ( b3Vec3 ){ ox, oy, oz }, .q = ( b3Quat ){ { qx, qy, qz }, qw } };
+	b3BoxHull hull = b3MakeTransformedBoxHull( hx, hy, hz, pose );
 	return RetainShape( world, b3CreateHullShape( world->bodies[body], &def, &hull.base ) );
 }
 
@@ -451,8 +486,8 @@ int b3w_is_valid( int handle, int body )
 /// A capsule along local Y, the shape the player uses. `halfHeight` is the
 /// distance from the centre to a hemisphere's centre, matching the game's
 /// CapsuleColliderConfig rather than Box3D's two-point form.
-int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius, float density, float friction,
-							float restitution )
+int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius, float ox, float oy, float oz,
+						   float density, float friction, float restitution )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
@@ -466,8 +501,8 @@ int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius,
 	def.baseMaterial.restitution = restitution;
 
 	b3Capsule capsule = {
-		.center1 = ( b3Vec3 ){ 0.0f, -halfHeight, 0.0f },
-		.center2 = ( b3Vec3 ){ 0.0f, halfHeight, 0.0f },
+		.center1 = ( b3Vec3 ){ ox, oy - halfHeight, oz },
+		.center2 = ( b3Vec3 ){ ox, oy + halfHeight, oz },
 		.radius = radius,
 	};
 	return RetainShape( world, b3CreateCapsuleShape( world->bodies[body], &def, &capsule ) );
@@ -847,8 +882,8 @@ static void RetainHull( World* world, b3HullData* hull )
 	world->hulls[world->hullCount++] = hull;
 }
 
-int b3w_add_sphere_shape( int handle, int body, float radius, float density, float friction, float restitution,
-						   int group )
+int b3w_add_sphere_shape( int handle, int body, float radius, float ox, float oy, float oz, float density,
+						  float friction, float restitution, int group )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
@@ -862,7 +897,7 @@ int b3w_add_sphere_shape( int handle, int body, float radius, float density, flo
 	def.baseMaterial.restitution = restitution;
 	def.filter.groupIndex = group;
 
-	b3Sphere sphere = { .center = { 0.0f, 0.0f, 0.0f }, .radius = radius };
+	b3Sphere sphere = { .center = { ox, oy, oz }, .radius = radius };
 	return RetainShape( world, b3CreateSphereShape( world->bodies[body], &def, &sphere ) );
 }
 
@@ -1088,4 +1123,20 @@ int b3w_shape_is_valid( int handle, int shape )
 	}
 
 	return b3Shape_IsValid( world->shapes[shape] ) ? 1 : 0;
+}
+
+/// Destroy a joint. Joints otherwise live until their world does, which is
+/// wrong for a game that rebuilds structures on every placement.
+void b3w_destroy_joint( int handle, int joint )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || joint < 0 || joint >= world->jointCount )
+	{
+		return;
+	}
+
+	if ( b3Joint_IsValid( world->joints[joint] ) )
+	{
+		b3DestroyJoint( world->joints[joint], true );
+	}
 }
