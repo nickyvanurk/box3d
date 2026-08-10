@@ -37,7 +37,7 @@ EXPORTS='[
 	"_b3w_body_type","_b3w_set_body_type","_b3w_set_gravity_scale",
 	"_b3w_wake","_b3w_is_valid","_b3w_add_capsule_shape",
 	"_b3w_add_height_field","_b3w_cast_ray_y","_b3w_alloc_floats",
-	"_b3w_add_revolute_joint","_b3w_add_prismatic_joint",
+	"_b3w_add_revolute_joint","_b3w_add_prismatic_joint","_b3w_add_mesh_shape",
 	"_malloc","_free"
 ]'
 
@@ -59,7 +59,7 @@ emcc \
 	-s ALLOW_MEMORY_GROWTH=1 \
 	-s INITIAL_MEMORY=64MB \
 	-s EXPORTED_FUNCTIONS="$(echo "$EXPORTS" | tr -d '\n\t ')" \
-	-s EXPORTED_RUNTIME_METHODS='["HEAPF32","HEAPU8"]' \
+	-s EXPORTED_RUNTIME_METHODS='["HEAPF32","HEAP32","HEAPU8"]' \
 	-s SINGLE_FILE=0 \
 	-s FILESYSTEM=0
 

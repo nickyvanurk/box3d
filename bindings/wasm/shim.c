@@ -607,3 +607,57 @@ int b3w_add_prismatic_joint( int handle, int bodyA, int bodyB, float ax, float a
 	world->joints[joint] = b3CreatePrismaticJoint( world->id, &def );
 	return joint;
 }
+
+/**
+ * Attach a static triangle mesh.
+ *
+ * No internal-edge flag is passed because Box3D has none to pass: ghost-contact
+ * rejection is unconditional in `mesh_contact.c`, which classifies each
+ * triangle manifold by feature and accepts an edge or vertex contact only when
+ * no adjacent triangle already claimed it. Rapier needs
+ * `TriMeshFlags.FIX_INTERNAL_EDGES` for the same effect, and without it a
+ * capsule crossing the shared edge of two coplanar triangles is flicked
+ * upward. `weldTolerance` covers the vertex merging that flag also implies —
+ * adjacency cannot exist across duplicated vertices.
+ *
+ * Box3D keeps a reference to the mesh (see b3CreateMeshShape), so the data is
+ * copied into memory we own and outlives the shape.
+ */
+void b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, int indicesPtr, int triangleCount,
+						 float friction, float restitution, int group )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+
+	b3Vec3* vertices = (b3Vec3*)malloc( sizeof( b3Vec3 ) * vertexCount );
+	const float* src = (const float*)(intptr_t)verticesPtr;
+	for ( int i = 0; i < vertexCount; ++i )
+	{
+		vertices[i] = ( b3Vec3 ){ src[3 * i], src[3 * i + 1], src[3 * i + 2] };
+	}
+
+	int32_t* indices = (int32_t*)malloc( sizeof( int32_t ) * 3 * triangleCount );
+	memcpy( indices, (const void*)(intptr_t)indicesPtr, sizeof( int32_t ) * 3 * triangleCount );
+
+	b3MeshDef def = { 0 };
+	def.vertices = vertices;
+	def.indices = indices;
+	def.materialIndices = NULL;
+	def.weldTolerance = 1e-4f;
+	def.vertexCount = vertexCount;
+	def.triangleCount = triangleCount;
+
+	b3MeshData* mesh = b3CreateMesh( &def, NULL, 0 );
+	free( vertices );
+	free( indices );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.baseMaterial.friction = friction;
+	shapeDef.baseMaterial.restitution = restitution;
+	shapeDef.filter.groupIndex = group;
+
+	b3CreateMeshShape( world->bodies[body], &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } );
+}
