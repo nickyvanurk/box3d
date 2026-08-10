@@ -29,6 +29,15 @@ EXPORTS='[
 	"_b3w_create_world","_b3w_destroy_world","_b3w_step",
 	"_b3w_create_body","_b3w_add_box_shape","_b3w_body_count","_b3w_is_awake",
 	"_b3w_transforms_ptr","_b3w_read_transforms",
+	"_b3w_body_transform","_b3w_set_position","_b3w_set_rotation",
+	"_b3w_linear_velocity","_b3w_angular_velocity",
+	"_b3w_set_linear_velocity","_b3w_set_angular_velocity",
+	"_b3w_apply_impulse","_b3w_apply_force","_b3w_apply_torque",
+	"_b3w_mass","_b3w_principal_inertia",
+	"_b3w_body_type","_b3w_set_body_type","_b3w_set_gravity_scale",
+	"_b3w_wake","_b3w_is_valid","_b3w_add_capsule_shape",
+	"_b3w_add_height_field","_b3w_cast_ray_y","_b3w_alloc_floats",
+	"_b3w_add_revolute_joint","_b3w_add_prismatic_joint",
 	"_malloc","_free"
 ]'
 
