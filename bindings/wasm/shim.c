@@ -530,13 +530,13 @@ int b3w_alloc_floats( int count )
  * the binding is how "props fall through terrain in one quadrant" happens: the
  * bug becomes invisible from both sides. The host sends what Box3D wants.
  */
-void b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int countZ, float scaleX, float scaleY,
-						   float scaleZ )
+int b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int countZ, float scaleX, float scaleY,
+						  float scaleZ, float friction, float restitution )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
 	{
-		return;
+		return -1;
 	}
 
 	int sampleCount = countX * countZ;
@@ -563,9 +563,15 @@ void b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int
 	b3HeightFieldData* field = b3CreateHeightField( &def );
 	free( heights );
 
+	// Terrain is a surface the game tunes like any other: it states a friction
+	// and a collision group, and taking the library defaults instead left the
+	// ground with neither. A retained handle is what lets the caller apply the
+	// group through the same path every other shape uses.
 	b3ShapeDef shapeDef = b3DefaultShapeDef();
-	b3CreateHeightFieldShape( world->bodies[body], &shapeDef, field );
-	// Height fields are never destroyed or re-filtered, so no handle is kept.
+	shapeDef.baseMaterial.friction = friction;
+	shapeDef.baseMaterial.restitution = restitution;
+
+	return RetainShape( world, b3CreateHeightFieldShape( world->bodies[body], &shapeDef, field ) );
 }
 
 /// Cast a ray and return the hit's world Y, or `missValue` when nothing is hit.
