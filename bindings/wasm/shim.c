@@ -1328,3 +1328,82 @@ void b3w_set_body_mass( int handle, int body, float mass )
 	md.inertia.cz = b3MulSV( scale, md.inertia.cz );
 	b3Body_SetMassData( id, md );
 }
+
+/**
+ * Flatten a body's contact manifolds into `out`, returning how many were
+ * written (capped at `capacity`).
+ *
+ * 7 floats per manifold: normal xyz (pointing AWAY from the queried body),
+ * deepest penetration depth, normal impulse, tangent impulse, other body index.
+ *
+ * The normal is flipped here when the queried body is shape B, because Box3D
+ * reports A->B and the caller must not have to know which end it is on: a
+ * chassis pushed along an inverted normal moves INTO what it hit.
+ */
+int b3w_body_contacts( int handle, int body, float* out, int capacity )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount || capacity <= 0 )
+	{
+		return 0;
+	}
+
+	b3BodyId id = world->bodies[body];
+	int count = b3Body_GetContactCapacity( id );
+	if ( count <= 0 )
+	{
+		return 0;
+	}
+	if ( count > 64 )
+	{
+		count = 64;
+	}
+
+	b3ContactData data[64];
+	count = b3Body_GetContactData( id, data, count );
+
+	int written = 0;
+	for ( int i = 0; i < count && written < capacity; i++ )
+	{
+		b3BodyId bodyA = b3Shape_GetBody( data[i].shapeIdA );
+		bool queriedIsA = B3_ID_EQUALS( bodyA, id );
+		b3BodyId otherId = queriedIsA ? b3Shape_GetBody( data[i].shapeIdB ) : bodyA;
+		float sign = queriedIsA ? 1.0f : -1.0f;
+
+		intptr_t tagged = (intptr_t)b3Body_GetUserData( otherId );
+		int otherIndex = tagged > 0 ? (int)( tagged - 1 ) : -1;
+
+		for ( int m = 0; m < data[i].manifoldCount && written < capacity; m++ )
+		{
+			const b3Manifold* manifold = data[i].manifolds + m;
+			if ( manifold->pointCount == 0 )
+			{
+				continue;
+			}
+
+			float depth = 0.0f;
+			float normalImpulse = 0.0f;
+			for ( int p = 0; p < manifold->pointCount; p++ )
+			{
+				float separation = manifold->points[p].separation;
+				if ( separation < 0.0f && -separation > depth )
+				{
+					depth = -separation;
+				}
+				normalImpulse += manifold->points[p].normalImpulse;
+			}
+
+			float* o = out + written * 7;
+			o[0] = manifold->normal.x * sign;
+			o[1] = manifold->normal.y * sign;
+			o[2] = manifold->normal.z * sign;
+			o[3] = depth;
+			o[4] = normalImpulse;
+			o[5] = b3Length( manifold->frictionImpulse );
+			o[6] = (float)otherIndex;
+			written++;
+		}
+	}
+
+	return written;
+}
