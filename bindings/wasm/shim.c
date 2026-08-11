@@ -1491,3 +1491,67 @@ int b3w_body_shape_states( int handle, int body, float* out, int capacity )
 
 	return max;
 }
+
+/**
+ * A sphere cast that skips bodies, for the same reason the ray version does.
+ *
+ * The player's ground probe sweeps a sphere from inside its own capsule, so
+ * without exclusion the first thing it finds is the player — and the movement
+ * code that reads the result decides it is standing on itself.
+ */
+typedef struct
+{
+	ClosestHit closest;
+	b3BodyId exclude;
+} FilteredCastHit;
+
+static float OnFilteredCastHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction, uint64_t userMaterialId,
+								int triangleIndex, int childIndex, void* context )
+{
+	(void)point;
+	(void)userMaterialId;
+	(void)triangleIndex;
+	(void)childIndex;
+
+	FilteredCastHit* ctx = (FilteredCastHit*)context;
+	if ( B3_IS_NON_NULL( ctx->exclude ) && B3_ID_EQUALS( b3Shape_GetBody( shapeId ), ctx->exclude ) )
+	{
+		return -1.0f;
+	}
+
+	ctx->closest.fraction = fraction;
+	ctx->closest.normal = normal;
+	ctx->closest.hit = true;
+	return fraction;
+}
+
+int b3w_cast_sphere_filtered( int handle, float cx, float cy, float cz, float radius, float dx, float dy, float dz,
+							  int exclude, float* out )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL )
+	{
+		return 0;
+	}
+
+	b3Vec3 point = { 0.0f, 0.0f, 0.0f };
+	b3ShapeProxy proxy = { .points = &point, .count = 1, .radius = radius };
+
+	FilteredCastHit ctx = { .closest = { .fraction = 1.0f, .normal = { 0.0f, 1.0f, 0.0f }, .hit = false },
+							.exclude = ( exclude >= 0 && exclude < world->bodyCount ) ? world->bodies[exclude]
+																					 : b3_nullBodyId };
+
+	b3World_CastShape( world->id, ( b3Pos ){ cx, cy, cz }, &proxy, ( b3Vec3 ){ dx, dy, dz }, b3DefaultQueryFilter(),
+					   OnFilteredCastHit, &ctx );
+
+	if ( ctx.closest.hit == false )
+	{
+		return 0;
+	}
+
+	out[0] = ctx.closest.normal.x;
+	out[1] = ctx.closest.normal.y;
+	out[2] = ctx.closest.normal.z;
+	out[3] = ctx.closest.fraction;
+	return 1;
+}
