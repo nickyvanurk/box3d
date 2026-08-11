@@ -44,6 +44,7 @@ EXPORTS='[
 	"_b3w_destroy_body","_b3w_set_gravity","_b3w_shape_count","_b3w_cast_ray_detailed",
 	"_b3w_set_revolute_servo","_b3w_revolute_angle","_b3w_prismatic_translation",
 	"_b3w_destroy_shape","_b3w_shape_is_valid","_b3w_destroy_joint","_b3w_set_shape_filter",
+	"_b3w_cast_ray_filtered",
 	"_malloc","_free"
 ]'
 

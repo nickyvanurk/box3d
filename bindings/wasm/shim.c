@@ -1035,6 +1035,94 @@ static float OnRayHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float frac
 	return fraction;
 }
 
+/**
+ * A closest-hit ray cast that can skip bodies.
+ *
+ * `b3World_CastRay`'s callback returns -1 to drop a hit and keep going, which
+ * is the difference between "ignore this body" and "stop at this body and
+ * report nothing" — the game's tool picks and sensors need to see what is
+ * BEHIND the thing they exclude. `exclude` is a body index or -1; `skipLo`/
+ * `skipHi` bound a contiguous run of body indices to ignore (the caller's own
+ * structure), because passing a set across the wasm boundary per cast would
+ * cost more than the cast.
+ */
+typedef struct
+{
+	ClosestRayHit closest;
+	int exclude;
+	int skipLo;
+	int skipHi;
+} FilteredRayHit;
+
+static int BodyIndexOfShape( b3ShapeId shapeId )
+{
+	intptr_t tagged = (intptr_t)b3Body_GetUserData( b3Shape_GetBody( shapeId ) );
+	return tagged > 0 ? (int)( tagged - 1 ) : -1;
+}
+
+static float OnFilteredRayHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction, uint64_t userMaterialId,
+							   int triangleIndex, int childIndex, void* context )
+{
+	(void)userMaterialId;
+	(void)triangleIndex;
+	(void)childIndex;
+
+	FilteredRayHit* ctx = (FilteredRayHit*)context;
+	int body = BodyIndexOfShape( shapeId );
+
+	if ( body >= 0 && ( body == ctx->exclude || ( body >= ctx->skipLo && body <= ctx->skipHi ) ) )
+	{
+		return -1.0f;
+	}
+
+	ctx->closest.fraction = fraction;
+	ctx->closest.normal = normal;
+	ctx->closest.point = point;
+	ctx->closest.hit = true;
+	ctx->closest.body = body;
+
+	return fraction;
+}
+
+int b3w_cast_ray_filtered( int handle, float ox, float oy, float oz, float dx, float dy, float dz, int categoryBits,
+						   int maskBits, int exclude, int skipLo, int skipHi, float* out )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL )
+	{
+		return 0;
+	}
+
+	b3QueryFilter filter = b3DefaultQueryFilter();
+	if ( maskBits != 0 )
+	{
+		filter.categoryBits = (uint64_t)(uint32_t)categoryBits;
+		filter.maskBits = (uint64_t)(uint32_t)maskBits;
+	}
+
+	FilteredRayHit ctx = { .closest = { .fraction = 1.0f, .body = -1, .hit = false },
+						   .exclude = exclude,
+						   .skipLo = skipLo,
+						   .skipHi = skipHi };
+
+	b3World_CastRay( world->id, ( b3Pos ){ ox, oy, oz }, ( b3Vec3 ){ dx, dy, dz }, filter, OnFilteredRayHit, &ctx );
+
+	if ( ctx.closest.hit == false )
+	{
+		return 0;
+	}
+
+	out[0] = (float)ctx.closest.point.x;
+	out[1] = (float)ctx.closest.point.y;
+	out[2] = (float)ctx.closest.point.z;
+	out[3] = ctx.closest.normal.x;
+	out[4] = ctx.closest.normal.y;
+	out[5] = ctx.closest.normal.z;
+	out[6] = ctx.closest.fraction;
+	out[7] = (float)ctx.closest.body;
+	return 1;
+}
+
 int b3w_cast_ray_detailed( int handle, float ox, float oy, float oz, float dx, float dy, float dz, float* out )
 {
 	World* world = GetWorld( handle );
