@@ -1312,6 +1312,26 @@ void b3w_step_vehicle( int vehicle, float dt )
  * computed tensor rather than replacing it keeps the shape's inertia
  * PROPORTIONS, which is what makes the body rotate like its geometry.
  */
+/**
+ * The speed below which a body may fall asleep.
+ *
+ * Box3D defaults to 0.05 m/s and Rapier to 0.4 m/s — eight times stricter. A
+ * parked vehicle's suspension leaves a residual jitter that sits between the
+ * two, so the same car sleeps under Rapier and never qualifies under Box3D,
+ * and a body that never sleeps integrates that residual into a creep: measured
+ * at 14.8 m of drift over 30 s on a 1 degree slope, against Rapier's 0.39 m.
+ */
+void b3w_set_sleep_threshold( int handle, int body, float threshold )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount || threshold < 0.0f )
+	{
+		return;
+	}
+
+	b3Body_SetSleepThreshold( world->bodies[body], threshold );
+}
+
 void b3w_set_body_mass( int handle, int body, float mass )
 {
 	World* world = GetWorld( handle );
