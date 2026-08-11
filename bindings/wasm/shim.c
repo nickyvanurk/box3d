@@ -1266,3 +1266,65 @@ float b3w_prismatic_translation( int handle, int joint )
 {
 	return b3PrismaticJoint_GetTranslation( JointId( handle, joint ) );
 }
+
+// ---------------------------------------------------------------------------
+// Vehicle controller
+//
+// The controller itself lives in vehicle.c. These wrappers exist only to turn
+// JavaScript's world handle and body index into the ids it works in.
+// ---------------------------------------------------------------------------
+
+int b3w_vehicle_create( b3WorldId world, b3BodyId chassis );
+void b3w_vehicle_update( void* vehicle, float dt );
+void* b3w_vehicle_get( int handle );
+
+int b3w_create_vehicle( int handle, int chassis )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || chassis < 0 || chassis >= world->bodyCount )
+	{
+		return -1;
+	}
+	return b3w_vehicle_create( world->id, world->bodies[chassis] );
+}
+
+void b3w_step_vehicle( int vehicle, float dt )
+{
+	void* v = b3w_vehicle_get( vehicle );
+	if ( v != NULL )
+	{
+		b3w_vehicle_update( v, dt );
+	}
+}
+
+/**
+ * Force a body's total mass, keeping the inertia distribution Box3D computed.
+ *
+ * Box3D derives mass from shape density; the game sometimes states a mass
+ * outright — the player capsule fixes its own so movement feel does not change
+ * with height, and structural colliders carry per-cell masses. Scaling the
+ * computed tensor rather than replacing it keeps the shape's inertia
+ * PROPORTIONS, which is what makes the body rotate like its geometry.
+ */
+void b3w_set_body_mass( int handle, int body, float mass )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount || mass <= 0.0f )
+	{
+		return;
+	}
+
+	b3BodyId id = world->bodies[body];
+	b3MassData md = b3Body_GetMassData( id );
+	if ( md.mass <= 0.0f )
+	{
+		return;
+	}
+
+	float scale = mass / md.mass;
+	md.mass = mass;
+	md.inertia.cx = b3MulSV( scale, md.inertia.cx );
+	md.inertia.cy = b3MulSV( scale, md.inertia.cy );
+	md.inertia.cz = b3MulSV( scale, md.inertia.cz );
+	b3Body_SetMassData( id, md );
+}

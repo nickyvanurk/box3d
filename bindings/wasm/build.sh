@@ -44,7 +44,16 @@ EXPORTS='[
 	"_b3w_destroy_body","_b3w_set_gravity","_b3w_shape_count","_b3w_cast_ray_detailed",
 	"_b3w_set_revolute_servo","_b3w_revolute_angle","_b3w_prismatic_translation",
 	"_b3w_destroy_shape","_b3w_shape_is_valid","_b3w_destroy_joint","_b3w_set_shape_filter",
-	"_b3w_cast_ray_filtered",
+	"_b3w_cast_ray_filtered","_b3w_set_body_mass",
+	"_b3w_create_vehicle","_b3w_step_vehicle","_b3w_vehicle_destroy","_b3w_vehicle_add_wheel",
+	"_b3w_vehicle_read_wheels","_b3w_vehicle_wheel_count","_b3w_vehicle_set_exclusion",
+	"_b3w_vehicle_set_up_axis","_b3w_vehicle_up_axis","_b3w_vehicle_wheel_direction",
+	"_b3w_vehicle_set_engine_force","_b3w_vehicle_set_brake","_b3w_vehicle_set_steering",
+	"_b3w_vehicle_set_side_friction","_b3w_vehicle_set_friction_slip",
+	"_b3w_vehicle_set_suspension_stiffness","_b3w_vehicle_set_suspension_compression",
+	"_b3w_vehicle_set_suspension_relaxation","_b3w_vehicle_set_suspension_rest_length",
+	"_b3w_vehicle_set_max_suspension_travel","_b3w_vehicle_set_max_suspension_force",
+	"_b3w_vehicle_set_anti_squat",
 	"_malloc","_free"
 ]'
 
@@ -59,6 +68,7 @@ emcc \
 	-I"$ROOT/src" \
 	"$ROOT"/src/*.c \
 	"$HERE/shim.c" \
+	"$HERE/vehicle.c" \
 	-o "$OUT/box3d.mjs" \
 	-s MODULARIZE=1 \
 	-s EXPORT_ES6=1 \
