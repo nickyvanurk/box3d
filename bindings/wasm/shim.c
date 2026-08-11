@@ -1407,3 +1407,87 @@ int b3w_body_contacts( int handle, int body, float* out, int capacity )
 
 	return written;
 }
+
+/** A body's world AABB, as min xyz then max xyz. */
+void b3w_body_aabb( int handle, int body, float* out )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+
+	b3AABB aabb = b3Body_ComputeAABB( world->bodies[body] );
+	out[0] = (float)aabb.lowerBound.x;
+	out[1] = (float)aabb.lowerBound.y;
+	out[2] = (float)aabb.lowerBound.z;
+	out[3] = (float)aabb.upperBound.x;
+	out[4] = (float)aabb.upperBound.y;
+	out[5] = (float)aabb.upperBound.z;
+}
+
+/** World-space angular inertia tensor, row-major 3x3 into `out`. */
+void b3w_body_inertia_tensor( int handle, int body, float* out )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+
+	b3BodyId id = world->bodies[body];
+	b3MassData md = b3Body_GetMassData( id );
+	b3Quat q = b3Body_GetRotation( id );
+
+	// R * I_local * R^T, one column at a time.
+	b3Vec3 basis[3] = { { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f } };
+	for ( int c = 0; c < 3; c++ )
+	{
+		b3Vec3 local = b3InvRotateVector( q, basis[c] );
+		b3Vec3 mapped = b3RotateVector( q, b3MulMV( md.inertia, local ) );
+		out[c] = mapped.x;
+		out[3 + c] = mapped.y;
+		out[6 + c] = mapped.z;
+	}
+}
+
+/** Per-shape sensor flag and world position: 4 floats each (isSensor, xyz). */
+int b3w_body_shape_states( int handle, int body, float* out, int capacity )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return 0;
+	}
+
+	b3BodyId id = world->bodies[body];
+	int count = b3Body_GetShapeCount( id );
+	if ( count > capacity )
+	{
+		count = capacity;
+	}
+	if ( count <= 0 )
+	{
+		return 0;
+	}
+
+	b3ShapeId shapes[256];
+	int max = count > 256 ? 256 : count;
+	b3Body_GetShapes( id, shapes, max );
+
+	for ( int i = 0; i < max; i++ )
+	{
+		// Box3D exposes no local offset accessor on a shape, so the position is
+		// its world AABB centre. That is the shape's centre rather than the
+		// authored origin — the two differ for an off-centre hull — and this is
+		// used to locate a collider, not to reconstruct its transform.
+		b3AABB aabb = b3Shape_GetAABB( shapes[i] );
+
+		out[i * 4 + 0] = b3Shape_IsSensor( shapes[i] ) ? 1.0f : 0.0f;
+		out[i * 4 + 1] = (float)( ( aabb.lowerBound.x + aabb.upperBound.x ) * 0.5 );
+		out[i * 4 + 2] = (float)( ( aabb.lowerBound.y + aabb.upperBound.y ) * 0.5 );
+		out[i * 4 + 3] = (float)( ( aabb.lowerBound.z + aabb.upperBound.z ) * 0.5 );
+	}
+
+	return max;
+}
