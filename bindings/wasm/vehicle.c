@@ -872,11 +872,19 @@ static void UpdateWheelTransforms( Vehicle* v, int wheelId )
 
 void b3w_vehicle_update( Vehicle* v, float dt )
 {
-	// A sleeping chassis is not simulated, but applying an impulse still mutates
-	// its stored velocity — a parked vehicle silently wound its suspension
-	// impulses into a velocity that was never integrated away, then released it
-	// as an upward kick the instant anything woke it.
-	if ( !b3Body_IsAwake( v->chassis ) )
+	// A sleeping DYNAMIC chassis is not simulated, but applying an impulse still
+	// mutates its stored velocity — a parked vehicle silently wound its
+	// suspension impulses into a velocity that was never integrated away, then
+	// released it as an upward kick the instant anything woke it.
+	//
+	// The body type test is not decoration. Box3D reports a STATIC body as never
+	// awake, so guarding on awakeness alone skipped the whole controller for
+	// every static vehicle — their wheels kept the suspension length they were
+	// initialised with, zero, which draws a wheel retracted into its mount and
+	// makes the car look sunk into the ground with its wheels buried. Rapier's
+	// `is_sleeping` only ever describes a dynamic body, which is why the same
+	// guard behaved correctly there.
+	if ( b3Body_GetType( v->chassis ) == b3_dynamicBody && !b3Body_IsAwake( v->chassis ) )
 	{
 		return;
 	}
@@ -1214,6 +1222,13 @@ int b3w_vehicle_add_wheel( int handle, float cx, float cy, float cz, float dx, f
 	w->suspensionRestLength = restLength;
 	w->radius = radius;
 	w->width = width;
+
+	// Park the wheel at its rest length rather than at zero. Zero means "wheel
+	// retracted into its mount", which is what a renderer draws for a vehicle
+	// whose controller has not run yet — and a chassis that spawns already
+	// asleep never runs it, so the car sits with its wheels buried in the
+	// ground. A wheel that has never been cast is at rest, not collapsed.
+	w->info.suspensionLength = restLength;
 
 	w->suspensionStiffness = 5.88f;
 	w->dampingCompression = 0.83f;
