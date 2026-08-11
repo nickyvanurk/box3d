@@ -1140,3 +1140,41 @@ void b3w_destroy_joint( int handle, int joint )
 		b3DestroyJoint( world->joints[joint], true );
 	}
 }
+
+/**
+ * Set a shape's category and mask bits.
+ *
+ * The OTHER filtering mechanism, distinct from `groupIndex`: a group index says
+ * "these shapes are one assembly and must not self-collide", while these bits
+ * say "this shape is terrain, and terrain collides with these categories".
+ * Conflating them produces objects that collide with the wrong set, which reads
+ * as a solver bug rather than a filter bug.
+ *
+ * Applied after creation because that is where callers already set it — the
+ * equivalent Rapier call is made on the collider, not on its descriptor.
+ */
+void b3w_set_shape_filter( int handle, int shape, int category, int mask )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || shape < 0 || shape >= world->shapeCount )
+	{
+		return;
+	}
+
+	if ( b3Shape_IsValid( world->shapes[shape] ) == false )
+	{
+		return;
+	}
+
+	b3Filter filter = b3Shape_GetFilter( world->shapes[shape] );
+	filter.categoryBits = (uint64_t)(uint32_t)category;
+	filter.maskBits = (uint64_t)(uint32_t)mask;
+	b3Shape_SetFilter( world->shapes[shape], filter, true );
+}
+
+/// Current extension of a prismatic joint. Box3D tracks this; Rapier's binding
+/// exposes no equivalent, which is why its side re-derives it.
+float b3w_prismatic_translation( int handle, int joint )
+{
+	return b3PrismaticJoint_GetTranslation( JointId( handle, joint ) );
+}
