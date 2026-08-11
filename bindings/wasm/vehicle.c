@@ -32,6 +32,8 @@
 #include <string.h>
 
 #define B3W_MAX_WHEELS 32
+/** Bodies a vehicle may be told to ignore: its own, plus the player. */
+#define B3W_MAX_EXCLUDE 64
 /** Points per cap of the cast prism. See the header note on tread geometry. */
 #define TREAD_SEGMENTS 8
 
@@ -121,9 +123,20 @@ typedef struct
 	int indexUpAxis;
 	int indexForwardAxis;
 
-	/** Body indices the wheels may not stand on — own structure and the player. */
-	int excludeLo;
-	int excludeHi;
+	/**
+	 * Body indices the wheels may not stand on — the vehicle's own bodies and
+	 * the player.
+	 *
+	 * An explicit LIST, not a range. A range looks like a cheap way to cross the
+	 * boundary until you notice what it actually excludes: the player is body 0
+	 * and the terrain is body 1, so a vehicle whose own bodies are 40-42 asked to
+	 * skip [0, 42] and skipped the ground with them. Every wheel cast then found
+	 * nothing, the suspension never engaged, and the wheels went through the
+	 * floor. The set is a handful of entries; scanning it is nothing next to the
+	 * cast it guards.
+	 */
+	int excludeCount;
+	int exclude[B3W_MAX_EXCLUDE];
 } Vehicle;
 
 static b3Vec3 AxisVector( int index )
@@ -239,8 +252,8 @@ typedef struct
 {
 	/** The vehicle's own chassis, which can never be its own ground. */
 	b3BodyId chassis;
-	int excludeLo;
-	int excludeHi;
+	const int* exclude;
+	int excludeCount;
 	bool hit;
 	float fraction;
 	b3Vec3 normal;
@@ -277,9 +290,15 @@ static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fr
 
 	// The vehicle's own structure and the player are not ground either. Return
 	// -1 so the cast keeps looking past them rather than stopping.
-	if ( body >= 0 && body >= ctx->excludeLo && body <= ctx->excludeHi )
+	if ( body >= 0 )
 	{
-		return -1.0f;
+		for ( int i = 0; i < ctx->excludeCount; i++ )
+		{
+			if ( ctx->exclude[i] == body )
+			{
+				return -1.0f;
+			}
+		}
 	}
 
 	ctx->hit = true;
@@ -336,8 +355,8 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 	proxy.radius = 0.0f;
 
 	WheelCast cast = { .chassis = v->chassis,
-					   .excludeLo = v->excludeLo,
-					   .excludeHi = v->excludeHi,
+					   .exclude = v->exclude,
+					   .excludeCount = v->excludeCount,
 					   .hit = false,
 					   .fraction = 1.0f,
 					   .body = -1,
@@ -1147,8 +1166,7 @@ int b3w_vehicle_create( b3WorldId world, b3BodyId chassis )
 		v->chassis = chassis;
 		v->indexUpAxis = 1;
 		v->indexForwardAxis = 0;
-		v->excludeLo = -1;
-		v->excludeHi = -2;
+		v->excludeCount = 0;
 		return i;
 	}
 	return -1;
@@ -1163,14 +1181,25 @@ void b3w_vehicle_destroy( int handle )
 	}
 }
 
-void b3w_vehicle_set_exclusion( int handle, int lo, int hi )
+void b3w_vehicle_set_exclusion( int handle, int bodiesPtr, int count )
 {
 	Vehicle* v = b3w_vehicle_get( handle );
-	if ( v != NULL )
+	if ( v == NULL )
 	{
-		v->excludeLo = lo;
-		v->excludeHi = hi;
+		return;
 	}
+
+	if ( count > B3W_MAX_EXCLUDE )
+	{
+		count = B3W_MAX_EXCLUDE;
+	}
+	if ( count < 0 )
+	{
+		count = 0;
+	}
+
+	memcpy( v->exclude, (const void*)(intptr_t)bodiesPtr, sizeof( int ) * (size_t)count );
+	v->excludeCount = count;
 }
 
 void b3w_vehicle_set_up_axis( int handle, int axis )
