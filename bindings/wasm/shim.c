@@ -93,6 +93,11 @@ static void ReserveBodies( World* world, int needed )
 // Defined in vehicle.c; registered as the world substep callback below.
 void b3w_vehicle_substep( float h, void* context );
 
+// Defined in vehicle.c; registered as the world substep callback below.
+void b3w_vehicle_substep( float h, void* context );
+void b3w_vehicle_destroy_world( b3WorldId world );
+void b3w_vehicle_disarm_world( b3WorldId world );
+
 // --- world ---------------------------------------------------------------
 
 int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableContinuous )
@@ -127,7 +132,9 @@ int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableC
 
 	// The vehicle force model runs per substep, not per tick — see
 	// `b3w_vehicle_substep`. Registered once here so no caller has to know.
-	b3World_SetSubStepCallback( world->id, b3w_vehicle_substep, NULL );
+	// The context is WHICH world is stepping: the vehicle registry is global, so
+	// the callback needs it to solve this world's vehicles and no others.
+	b3World_SetSubStepCallback( world->id, b3w_vehicle_substep, (void*)(uintptr_t)b3StoreWorldId( world->id ) );
 	world->inUse = true;
 	world->bodyCount = 0;
 	world->jointCount = 0;
@@ -147,6 +154,9 @@ void b3w_destroy_world( int handle )
 		return;
 	}
 
+	// Before the world goes: its vehicles hold body ids that are about to be
+	// freed, and ids are reused by the next world to take this slot.
+	b3w_vehicle_destroy_world( world->id );
 	b3DestroyWorld( world->id );
 
 	for ( int i = 0; i < world->hullCount; ++i )
@@ -168,6 +178,9 @@ void b3w_step( int handle, float timeStep, int subStepCount )
 	}
 
 	b3World_Step( world->id, timeStep, subStepCount );
+
+	// The casts this step ran on are spent — see `b3w_vehicle_disarm_world`.
+	b3w_vehicle_disarm_world( world->id );
 }
 
 // --- bodies --------------------------------------------------------------

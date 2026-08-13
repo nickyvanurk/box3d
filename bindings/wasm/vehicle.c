@@ -186,6 +186,21 @@ typedef struct
 typedef struct
 {
 	bool used;
+	/**
+	 * Whether this vehicle's cast state is fresh enough to solve against.
+	 *
+	 * `prepare` does the shape casts once per tick and `solve` runs per substep
+	 * off what they found. A world step that had no prepare therefore solves
+	 * against LAST tick's contacts — or, for a vehicle that has never been
+	 * prepared, against a zeroed contact point at the world origin, which sends
+	 * the chassis to NaN in one step. `createGround` ends with exactly such a
+	 * step (a gravity-free settle), so building a machine and then loading a
+	 * world destroyed it.
+	 *
+	 * Set by prepare, cleared by the world step that consumes it: cast state is
+	 * good for one step and no more.
+	 */
+	bool armed;
 	b3WorldId world;
 	b3BodyId chassis;
 	int wheelCount;
@@ -1166,6 +1181,7 @@ static void UpdateWheelTransforms( Vehicle* v, int wheelId )
 void b3w_vehicle_prepare( Vehicle* v, float dt )
 {
 	v->stepDt = dt > 0.0f ? dt : 1.0f / 60.0f;
+	v->armed = true;
 
 	// A fresh friction budget for the tick the substeps are about to share.
 	for ( int i = 0; i < v->wheelCount; i++ )
@@ -1186,6 +1202,26 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 	// makes the car look sunk into the ground with its wheels buried. Rapier's
 	// `is_sleeping` only ever describes a dynamic body, which is why the same
 	// guard behaved correctly there.
+	//
+	// A COMMAND TO DRIVE WAKES THE VEHICLE, and it has to happen here, above the
+	// guard. It used to sit inside `solve`, below solve's identical sleep
+	// early-out, so it could only ever run on a chassis that was already awake —
+	// dead code for the one case it was written for. Measured: a real car driven
+	// fresh travels 31.76 m in 5 s, and the same car after 30 s parked travels
+	// 0.00 m. Park, wait, press the throttle, nothing happens.
+	//
+	// Drive only, never the brake: an idle vehicle carries a standing brake, so
+	// waking on that would hold every parked machine in the world awake forever
+	// and sleep is the tick budget's biggest lever.
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		if ( v->wheels[i].engineForce != 0.0f )
+		{
+			b3Body_SetAwake( v->chassis, true );
+			break;
+		}
+	}
+
 	if ( b3Body_GetType( v->chassis ) == b3_dynamicBody && !b3Body_IsAwake( v->chassis ) )
 	{
 		return;
@@ -1270,16 +1306,6 @@ void b3w_vehicle_solve( Vehicle* v, float h )
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
 		Wheel* w = &v->wheels[i];
-		// Any drive at all wakes the chassis, forward OR reverse. Testing
-		// `> 0` woke it only when driving forwards, so a parked vehicle asked to
-		// reverse stayed asleep and its wheels never turned — reported as the
-		// wheels locking up in reverse. Same fault as the joint setters: a
-		// command that does not wake what it commands is a command that a
-		// sleeping machine ignores.
-		if ( w->engineForce != 0.0f )
-		{
-			b3Body_SetAwake( v->chassis, true );
-		}
 
 		// The cap is the WHEEL's, so an over-force wheel scales all of its
 		// contacts down together rather than capping each one and delivering
@@ -1463,19 +1489,67 @@ void b3w_vehicle_solve( Vehicle* v, float h )
 static Vehicle g_vehicles[B3W_MAX_VEHICLES];
 
 /**
- * Solve every live vehicle for one substep. Registered with the world as its
- * substep callback, so the force model keeps step with the solver instead of
- * being applied once per tick and left to be 32 substeps stale.
+ * Solve the STEPPING world's vehicles for one substep. Registered with the world
+ * as its substep callback, so the force model keeps step with the solver instead
+ * of being applied once per tick and left to be 32 substeps stale.
+ *
+ * `context` is the stepping world, stored by `b3StoreWorldId`. The registry is
+ * global while worlds are not, and iterating all of it was wrong twice over: a
+ * second world solved the first world's vehicles, and — because body ids are
+ * reused as worlds are destroyed and created — a vehicle whose world had gone
+ * would find a LIVE body at its old chassis id and drive it. That reads as an
+ * unrelated car creeping or twitching, with nothing in its own world to blame.
  */
 void b3w_vehicle_substep( float h, void* context )
 {
-	(void)context;
+	uint32_t stepping = (uint32_t)(uintptr_t)context;
 
 	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
 	{
-		if ( g_vehicles[i].used )
+		if ( g_vehicles[i].used && g_vehicles[i].armed && b3StoreWorldId( g_vehicles[i].world ) == stepping )
 		{
 			b3w_vehicle_solve( &g_vehicles[i], h );
+		}
+	}
+}
+
+/**
+ * Spend the cast state of a world's vehicles, called as its step completes.
+ *
+ * The pairing with `prepare` is the whole invariant: one prepare arms one step.
+ * Anything that steps the world without preparing — a settle step, a tool, a
+ * test — then simulates the vehicles as inert bodies rather than driving them
+ * from stale contacts.
+ */
+void b3w_vehicle_disarm_world( b3WorldId world )
+{
+	uint32_t stepped = b3StoreWorldId( world );
+
+	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	{
+		if ( g_vehicles[i].used && b3StoreWorldId( g_vehicles[i].world ) == stepped )
+		{
+			g_vehicles[i].armed = false;
+		}
+	}
+}
+
+/**
+ * Release every vehicle belonging to a world, called as that world is destroyed.
+ *
+ * A vehicle holds a chassis id and nothing owns it but this registry, so without
+ * this a destroyed world leaks its slots permanently — 64 of them — and leaves
+ * entries pointing at freed bodies.
+ */
+void b3w_vehicle_destroy_world( b3WorldId world )
+{
+	uint32_t dying = b3StoreWorldId( world );
+
+	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	{
+		if ( g_vehicles[i].used && b3StoreWorldId( g_vehicles[i].world ) == dying )
+		{
+			g_vehicles[i].used = false;
 		}
 	}
 }
