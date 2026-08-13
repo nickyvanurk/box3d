@@ -1270,7 +1270,13 @@ void b3w_vehicle_solve( Vehicle* v, float h )
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
 		Wheel* w = &v->wheels[i];
-		if ( w->engineForce > 0.0f )
+		// Any drive at all wakes the chassis, forward OR reverse. Testing
+		// `> 0` woke it only when driving forwards, so a parked vehicle asked to
+		// reverse stayed asleep and its wheels never turned — reported as the
+		// wheels locking up in reverse. Same fault as the joint setters: a
+		// command that does not wake what it commands is a command that a
+		// sleeping machine ignores.
+		if ( w->engineForce != 0.0f )
 		{
 			b3Body_SetAwake( v->chassis, true );
 		}

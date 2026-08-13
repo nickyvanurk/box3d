@@ -90,6 +90,9 @@ static void ReserveBodies( World* world, int needed )
 	world->bodyCapacity = capacity;
 }
 
+// Defined in vehicle.c; registered as the world substep callback below.
+void b3w_vehicle_substep( float h, void* context );
+
 // --- world ---------------------------------------------------------------
 
 int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableContinuous )
@@ -108,10 +111,6 @@ int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableC
 	{
 		return -1;
 	}
-
-// Defined in vehicle.c; registered as the world substep callback below.
-void b3w_vehicle_substep( float h, void* context );
-
 
 	b3WorldDef def = b3DefaultWorldDef();
 	def.gravity = ( b3Vec3 ){ gx, gy, gz };
@@ -775,6 +774,39 @@ void b3w_set_revolute_motor( int handle, int joint, float speed, float maxTorque
 	b3RevoluteJoint_EnableMotor( id, maxTorque > 0.0f );
 	b3RevoluteJoint_SetMotorSpeed( id, speed );
 	b3RevoluteJoint_SetMaxMotorTorque( id, maxTorque );
+
+}
+
+/**
+ * How hard a joint holds its bodies together.
+ *
+ * Box3D's joints are SOFT constraints and default to 60 Hz
+ * (`src/joint.c:30`), which lets a linkage deviate visibly from its ideal
+ * geometry — the strandbeest scenario runs its pivots at 240 for exactly this
+ * reason. The engine clamps to a quarter of the substep rate internally
+ * (`joint.c:1466`), so asking for more than is solvable is safe.
+ */
+void b3w_set_joint_constraint_tuning( int handle, int joint, float hertz, float dampingRatio )
+{
+	b3Joint_SetConstraintTuning( JointId( handle, joint ), hertz, dampingRatio );
+}
+
+
+/**
+ * Wake the two bodies a joint connects.
+ *
+ * Box3D's joint setters only write their value — `b3RevoluteJoint_SetMotorSpeed`
+ * and `SetTargetAngle` both just assign — so a machine that has settled and
+ * gone to sleep never acts on a new command. Rapier's setters wake by default,
+ * which is why the same build drives there and sits still here.
+ *
+ * Exposed separately rather than folded into the setters because waking on
+ * EVERY command means nothing ever sleeps: the caller knows whether the command
+ * actually asks for motion, and only it can tell.
+ */
+void b3w_wake_joint_bodies( int handle, int joint )
+{
+	b3Joint_WakeBodies( JointId( handle, joint ) );
 }
 
 void b3w_set_revolute_limits( int handle, int joint, int enable, float lower, float upper )
@@ -1204,6 +1236,7 @@ void b3w_set_revolute_servo( int handle, int joint, float targetRadians, float h
 	b3RevoluteJoint_SetTargetAngle( id, targetRadians );
 	b3RevoluteJoint_SetSpringHertz( id, hertz );
 	b3RevoluteJoint_SetSpringDampingRatio( id, dampingRatio );
+
 }
 
 /// Current joint angle in radians, which the servo and the game's readouts need.
