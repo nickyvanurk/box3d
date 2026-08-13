@@ -765,6 +765,20 @@ static float ImpulseDenominator( b3BodyId body, b3Pos pos, b3Vec3 n )
 	return InvMass( body ) + b3Dot( n, v );
 }
 
+/**
+ * The impulse that cancels a point's velocity along `normal`.
+ *
+ * The denominator is how much that point moves along `normal` per unit impulse:
+ * `1/m + n . ((I^-1 (r x n)) x r)`. It used to read `1/m + |I^-1 (r x n)|^2`,
+ * which is not that quantity — it is the squared magnitude of an angular
+ * velocity, and it sized every lateral tyre impulse wrong. Where the wheels sit
+ * far from the centre of mass the error is large and the cancel OVERSHOOTS, so
+ * each wheel reverses the velocity it was asked to remove; on four wheels
+ * sharing one body the surplus lands in the least damped axis. The built-in Car
+ * template, spawned and left alone, span at 0.6 rad/s for ever with all four
+ * wheels gripping, and its wheels turned with it because a rolling wheel is what
+ * the renderer spins. `ImpulseDenominator` above already had the right form.
+ */
 static float ResolveSingleUnilateral( b3BodyId body, b3Pos pt, b3Vec3 normal, float biasVelocity )
 {
 	b3Vec3 vel = b3Body_GetWorldPointVelocity( body, pt );
@@ -772,7 +786,7 @@ static float ResolveSingleUnilateral( b3BodyId body, b3Pos pt, b3Vec3 normal, fl
 	b3Vec3 aj = b3Cross( dpt, normal );
 	b3Vec3 iaj = b3MulMV( WorldInvInertia( body ), aj );
 
-	float jacDiagAb = InvMass( body ) + b3Dot( iaj, iaj );
+	float jacDiagAb = InvMass( body ) + b3Dot( normal, b3Cross( iaj, dpt ) );
 	float jacDiagAbInv = SafeInv( jacDiagAb );
 	float relVel = b3Dot( normal, vel );
 
@@ -794,7 +808,11 @@ static float ResolveSingleBilateral( b3BodyId body1, b3Pos pt1, b3BodyId body2, 
 	b3Vec3 iaj = b3MulMV( WorldInvInertia( body1 ), aj );
 	b3Vec3 ibj = b3MulMV( WorldInvInertia( body2 ), bj );
 
-	float jacDiagAb = InvMass( body1 ) + InvMass( body2 ) + b3Dot( iaj, iaj ) + b3Dot( ibj, ibj );
+	// Same denominator as the unilateral case above, for two bodies. The second
+	// body's constraint normal is the negated one — `bj` is built from it — so its
+	// term is measured along -normal, or the two would subtract.
+	float jacDiagAb = InvMass( body1 ) + InvMass( body2 ) + b3Dot( normal, b3Cross( iaj, dpt1 ) ) -
+					  b3Dot( normal, b3Cross( ibj, dpt2 ) );
 	float jacDiagAbInv = SafeInv( jacDiagAb );
 	float relVel = b3Dot( normal, dvel );
 
