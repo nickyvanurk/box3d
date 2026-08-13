@@ -972,13 +972,30 @@ static void UpdateFriction( Vehicle* v, float dt )
 			}
 			else
 			{
-				// What the wheel resists with is what the brake holds. An
-				// undriven, unbraked wheel does not resist along its travel
-				// direction — raising this to the tyre's full static grip makes
-				// a free wheel an immovable anchor, which pinned thruster-driven
-				// craft in place. Creep is handled by the position anchor, whose
-				// demand while parked is a tiny fraction of even a token brake.
+				// A brake resists ROTATION; the ground resists SLIDING. They are
+				// different limits and conflating them is why a parked car ran
+				// away downhill: an idle vehicle carries a token brake
+				// (VEHICLE_BRAKE_FORCE, 0.5), and capping the hold at that meant
+				// a stationary tyre could resist half a newton-second while
+				// gravity pulled with a hundred. Measured on a 20 degree slope,
+				// a parked car slid 342 m in 20 s; on 10 degrees, half a metre.
+				//
+				// So a STATIONARY tyre — anchored, undriven, on static ground —
+				// is held by its friction circle, the same limit the combined
+				// impulse is tested against below. A ROLLING one still decays
+				// only as fast as the brake allows, which is what keeps coasting
+				// feeling like coasting.
+				//
+				// Still gated on a brake being asked for at all: the game zeroes
+				// the brake for thruster-driven craft (`hasActiveThruster`), and
+				// that zero is what keeps a free wheel from becoming an immovable
+				// anchor and pinning them in place.
 				float maxImpulse = w->brake;
+				if ( w->hasAnchor && w->brake > 0.0f )
+				{
+					float grip = w->wheelSuspensionForce * v->stepDt * w->frictionSlip;
+					maxImpulse = maxImpulse > grip ? maxImpulse : grip;
+				}
 
 				float biasVelocity = 0.0f;
 				if ( w->hasAnchor )
