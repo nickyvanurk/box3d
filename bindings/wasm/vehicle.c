@@ -1210,6 +1210,40 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 	{
 		ShapeCastWheel( v, i, dt );
 	}
+
+	// Wheel spin, once per TICK. It is odometry — how far the tyre rolled — not a
+	// force, so it advances with the tick, not with each substep.
+	//
+	// Per substep the AIRBORNE branch was catastrophic: it re-adds the last
+	// grounded `deltaRotation` every time, so summed over 32 substeps with the
+	// 0.99 decay that is ~27x one tick's rotation. A wheel off the ground span
+	// far too fast and coasted almost forever — "the wheels keep rotating". The
+	// 0.99 decay is per tick for the same reason: applied 32 times it is 0.72,
+	// which stops a free wheel ~30x too quickly.
+
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		Wheel* w = &v->wheels[i];
+		b3Vec3 vel = b3Body_GetWorldPointVelocity( v->chassis, w->info.hardPointWs );
+
+		if ( w->info.isInContact )
+		{
+			b3Quat rot = b3Body_GetRotation( v->chassis );
+			b3Vec3 fwd = b3RotateVector( rot, AxisVector( v->indexForwardAxis ) );
+			float proj = b3Dot( fwd, w->info.contactNormalWs );
+			fwd = Sub3( fwd, Scale( w->info.contactNormalWs, proj ) );
+
+			float proj2 = b3Dot( fwd, vel );
+			w->deltaRotation = ( proj2 * dt ) / w->radius;
+			w->rotation += w->deltaRotation;
+		}
+		else
+		{
+			w->rotation += w->deltaRotation;
+		}
+
+		w->deltaRotation *= 0.99f; // damping of rotation when not in contact
+	}
 }
 
 /**
@@ -1404,30 +1438,6 @@ void b3w_vehicle_solve( Vehicle* v, float h )
 	// velocity constraint above, which is where a penetration error belongs.
 
 	UpdateFriction( v, h );
-
-	for ( int i = 0; i < v->wheelCount; i++ )
-	{
-		Wheel* w = &v->wheels[i];
-		b3Vec3 vel = b3Body_GetWorldPointVelocity( v->chassis, w->info.hardPointWs );
-
-		if ( w->info.isInContact )
-		{
-			b3Quat rot = b3Body_GetRotation( v->chassis );
-			b3Vec3 fwd = b3RotateVector( rot, AxisVector( v->indexForwardAxis ) );
-			float proj = b3Dot( fwd, w->info.contactNormalWs );
-			fwd = Sub3( fwd, Scale( w->info.contactNormalWs, proj ) );
-
-			float proj2 = b3Dot( fwd, vel );
-			w->deltaRotation = ( proj2 * h ) / w->radius;
-			w->rotation += w->deltaRotation;
-		}
-		else
-		{
-			w->rotation += w->deltaRotation;
-		}
-
-		w->deltaRotation *= 0.99f; // damping of rotation when not in contact
-	}
 }
 
 // ---------------------------------------------------------------------------
