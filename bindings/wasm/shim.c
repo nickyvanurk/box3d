@@ -267,7 +267,8 @@ static int RetainShape( World* world, b3ShapeId shape )
  * a solver bug rather than a missing parameter.
  */
 int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float ox, float oy, float oz, float qx,
-					   float qy, float qz, float qw, float density, float friction, float restitution, int group )
+					   float qy, float qz, float qw, float density, float friction, float restitution, int group,
+					   int isSensor )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
@@ -280,6 +281,11 @@ int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float
 	def.baseMaterial.friction = friction;
 	def.baseMaterial.restitution = restitution;
 	def.filter.groupIndex = group;
+	// A sensor overlaps without solving contacts. Box3D binds this at CREATION
+	// (it allocates a sensor slot in b3CreateShape), so there is no setter to
+	// call afterwards and it has to arrive as a parameter.
+	def.isSensor = isSensor != 0;
+	def.enableSensorEvents = isSensor != 0;
 
 	// b3CreateHullShape copies the hull, so a stack local is enough — this is
 	// how Box3D's own samples do it. Only hulls built with b3CreateHull are
@@ -507,7 +513,7 @@ int b3w_is_valid( int handle, int body )
 /// distance from the centre to a hemisphere's centre, matching the game's
 /// CapsuleColliderConfig rather than Box3D's two-point form.
 int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius, float ox, float oy, float oz,
-						   float density, float friction, float restitution )
+						   float density, float friction, float restitution, int isSensor )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
@@ -519,6 +525,8 @@ int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius,
 	def.density = density;
 	def.baseMaterial.friction = friction;
 	def.baseMaterial.restitution = restitution;
+	def.isSensor = isSensor != 0;
+	def.enableSensorEvents = isSensor != 0;
 
 	b3Capsule capsule = {
 		.center1 = ( b3Vec3 ){ ox, oy - halfHeight, oz },
@@ -722,7 +730,7 @@ int b3w_add_prismatic_joint( int handle, int bodyA, int bodyB, float ax, float a
  * copied into memory we own and outlives the shape.
  */
 int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, int indicesPtr, int triangleCount,
-						 float friction, float restitution, int group )
+						 float friction, float restitution, int group, int isSensor )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
@@ -755,6 +763,8 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 	b3ShapeDef shapeDef = b3DefaultShapeDef();
 	shapeDef.baseMaterial.friction = friction;
 	shapeDef.baseMaterial.restitution = restitution;
+	shapeDef.isSensor = isSensor != 0;
+	shapeDef.enableSensorEvents = isSensor != 0;
 	shapeDef.filter.groupIndex = group;
 
 	return RetainShape( world, b3CreateMeshShape( world->bodies[body], &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } ) );
@@ -942,7 +952,7 @@ static void RetainHull( World* world, b3HullData* hull )
 }
 
 int b3w_add_sphere_shape( int handle, int body, float radius, float ox, float oy, float oz, float density,
-						  float friction, float restitution, int group )
+						  float friction, float restitution, int group, int isSensor )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
@@ -955,6 +965,8 @@ int b3w_add_sphere_shape( int handle, int body, float radius, float ox, float oy
 	def.baseMaterial.friction = friction;
 	def.baseMaterial.restitution = restitution;
 	def.filter.groupIndex = group;
+	def.isSensor = isSensor != 0;
+	def.enableSensorEvents = isSensor != 0;
 
 	b3Sphere sphere = { .center = { ox, oy, oz }, .radius = radius };
 	return RetainShape( world, b3CreateSphereShape( world->bodies[body], &def, &sphere ) );
@@ -962,7 +974,7 @@ int b3w_add_sphere_shape( int handle, int body, float radius, float ox, float oy
 
 /// A cylinder about local Y, matching how the game orients wheels.
 int b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius, int sides, float density,
-							 float friction, float restitution, int group )
+							 float friction, float restitution, int group, int isSensor )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
@@ -975,6 +987,8 @@ int b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius
 	def.baseMaterial.friction = friction;
 	def.baseMaterial.restitution = restitution;
 	def.filter.groupIndex = group;
+	def.isSensor = isSensor != 0;
+	def.enableSensorEvents = isSensor != 0;
 
 	b3HullData* hull = b3CreateCylinder( 2.0f * halfHeight, radius, -halfHeight, sides );
 	RetainHull( world, hull );
@@ -983,7 +997,7 @@ int b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius
 
 /// A convex hull over a point cloud the host uploaded.
 int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int maxVertices, float density,
-						 float friction, float restitution, int group )
+						 float friction, float restitution, int group, int isSensor )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
@@ -1012,6 +1026,8 @@ int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int
 	def.baseMaterial.friction = friction;
 	def.baseMaterial.restitution = restitution;
 	def.filter.groupIndex = group;
+	def.isSensor = isSensor != 0;
+	def.enableSensorEvents = isSensor != 0;
 
 	return RetainShape( world, b3CreateHullShape( world->bodies[body], &def, hull ) );
 }
