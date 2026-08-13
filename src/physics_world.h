@@ -249,6 +249,20 @@ typedef struct b3World
 	b3PreSolveFcn* preSolveFcn;
 	void* preSolveContext;
 
+	/**
+	 * Called once per SUBSTEP, after velocities are integrated and before
+	 * constraints are solved.
+	 *
+	 * For force models that are not constraints and must nonetheless keep step
+	 * with the solver — the raycast vehicle's suspension being the case this
+	 * exists for. Applied once per full step, such a model integrates at the tick
+	 * rate while everything around it integrates at the substep rate, so it is
+	 * the least accurate thing in the world and it is attached to the thing
+	 * players look at hardest.
+	 */
+	b3SubStepFcn* subStepFcn;
+	void* subStepContext;
+
 	b3CustomFilterFcn* customFilterFcn;
 	void* customFilterContext;
 

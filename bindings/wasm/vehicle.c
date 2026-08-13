@@ -36,13 +36,69 @@
 #define B3W_MAX_EXCLUDE 64
 /** Points per cap of the cast prism. See the header note on tread geometry. */
 #define TREAD_SEGMENTS 8
+/** Contact points a single wheel may rest on. Uncharted 4's number, and for
+ *  their reason: one is a wheel that ping-pongs between surfaces. */
+#define B3W_MAX_CONTACTS 3
+/** Rows the bump-stop system will solve simultaneously. Bounds the dense
+ *  matrix on the stack; beyond it the extra bottomed contacts simply wait for
+ *  the next substep. */
+#define B3W_MAX_BUMP_ROWS 32
+
+/**
+ * Two hits closer together than this describe the same patch of surface.
+ *
+ * Without it, a flat floor gives a wheel three contacts a couple of millimetres
+ * apart and a genuinely different surface — the second plank, the kerb edge —
+ * never gets a slot.
+ */
+static const float CONTACT_SPREAD = 0.04f;
 
 /** Below this chassis speed a wheel with no drive or brake grips longitudinally. */
 static const float STATIC_FRICTION_MAX_SPEED = 0.5f;
 /** Fraction of anchor drift undone per step — the usual Baumgarte trade. */
 static const float STATIC_FRICTION_ERP = 0.2f;
+
+/** Fraction of a bump-stop overshoot removed per second. Firm enough to look
+ *  rigid, soft enough not to launch a chassis that is briefly deep. */
+static const float BUMP_STOP_ERP = 0.6f;
 /** Furthest a stuck contact may drift before the tyre is treated as having slipped. */
 static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
+
+/**
+ * One place a wheel touches the world.
+ *
+ * A wheel gets up to `B3W_MAX_CONTACTS` of these. The nearest-only version is
+ * Uncharted 4's first attempt, and it fails the same way theirs did: a tyre
+ * spanning two planks, or crossing a seam, has its single contact snap between
+ * surfaces and the wheel ping-pongs. Holding the three nearest instead lets the
+ * suspension rest on both at once.
+ */
+typedef struct
+{
+	b3Vec3 normalWs;
+	b3Pos pointWs;
+	float suspensionLength;
+	float clippedInvContactDotSuspension;
+	bool bottomedOut;
+	float bottomOutOvershoot;
+	/**
+	 * Where the wheel centre sits relative to the contact plane, along the
+	 * contact normal, at the length the cast measured.
+	 *
+	 * This is the ONE number that lets the spring re-measure its own compression
+	 * every substep without casting again. The cast is expensive and its
+	 * geometry — contact point, normal, the inverse dot — is good for the whole
+	 * tick because the chassis moves millimetres. The chassis POSE is not: it
+	 * rises and falls under the spring 32 times per tick, and a spring reading a
+	 * tick-old compression is the position twin of the stale-velocity damper. It
+	 * overshoots, corrects late, and settles into a limit cycle instead of
+	 * settling. Holding the plane offset turns the cast's answer into a plane
+	 * the live hard point can be measured against.
+	 */
+	float planeOffset;
+	/** Share of the wheel's suspension force this contact carries. */
+	float force;
+} WheelContact;
 
 typedef struct
 {
@@ -52,6 +108,10 @@ typedef struct
 	float suspensionLength;
 	b3Pos hardPointWs;
 	bool isInContact;
+	/** The kept contacts, nearest first. Index 0 mirrors the singular fields
+	 *  above, which friction, reporting and the wheel transform still read. */
+	WheelContact contacts[B3W_MAX_CONTACTS];
+	int contactCount;
 	/** Body index of the ground for reporting, or -1. */
 	int groundBody;
 	/** The ground body itself, so the dynamic-ground branches never look one up. */
@@ -96,6 +156,19 @@ typedef struct
 
 	float forwardImpulse;
 	float sideImpulse;
+	/**
+	 * Friction impulse already spent this TICK, across its substeps.
+	 *
+	 * The friction circle is a budget, and a budget is per tick — the tyre can
+	 * deliver so much before it breaks traction, not so much per substep. Without
+	 * carrying it, the per-substep budget (suspensionForce * h * slip) was
+	 * compared against a lateral impulse that cancels velocity and therefore has
+	 * no time scale at all: the circle broke every substep, skidInfo pinned to
+	 * ~1/32, and a car at full throttle travelled 0.9mm. This is warm starting,
+	 * and it is what makes solving 32 times equivalent to solving once.
+	 */
+	float accumForward;
+	float accumSide;
 
 	float steering;
 	float engineForce;
@@ -120,6 +193,9 @@ typedef struct
 	b3Vec3 forwardWs[B3W_MAX_WHEELS];
 	b3Vec3 axle[B3W_MAX_WHEELS];
 	float currentVehicleSpeed;
+	/** The whole tick, recorded at prepare. Error-correction rates use this;
+	 *  impulses use the substep. See UpdateFriction. */
+	float stepDt;
 	int indexUpAxis;
 	int indexForwardAxis;
 
@@ -250,22 +326,80 @@ static float SafeInv( float x )
 
 typedef struct
 {
-	/** The vehicle's own chassis, which can never be its own ground. */
-	b3BodyId chassis;
-	const int* exclude;
-	int excludeCount;
-	bool hit;
 	float fraction;
 	b3Vec3 normal;
 	b3Pos point;
 	int body;
 	b3BodyId bodyId;
+} WheelHit;
+
+typedef struct
+{
+	/** The vehicle's own chassis, which can never be its own ground. */
+	b3BodyId chassis;
+	const int* exclude;
+	int excludeCount;
+	/** The surface filter, applied here rather than after the cast: a hit on a
+	 *  wall must not occupy a slot a drivable surface behind it could use. */
+	b3Vec3 worldUp;
+	float minSurfaceUpFacing;
+	int count;
+	WheelHit hits[B3W_MAX_CONTACTS];
 } WheelCast;
 
 static int BodyIndexOfShapeV( b3ShapeId shapeId )
 {
 	intptr_t tagged = (intptr_t)b3Body_GetUserData( b3Shape_GetBody( shapeId ) );
 	return tagged > 0 ? (int)( tagged - 1 ) : -1;
+}
+
+/**
+ * Merge a hit into the nearest-first set, spread rule and all.
+ *
+ * A candidate sitting on top of one already kept is the same surface seen
+ * twice — it replaces that entry only if it is nearer, and never takes a second
+ * slot. Anything else is inserted by fraction and the furthest falls off the
+ * end.
+ */
+static void KeepWheelHit( WheelCast* ctx, WheelHit hit )
+{
+	for ( int i = 0; i < ctx->count; i++ )
+	{
+		if ( b3Length( SubPos( hit.point, ctx->hits[i].point ) ) >= CONTACT_SPREAD )
+		{
+			continue;
+		}
+		if ( hit.fraction < ctx->hits[i].fraction )
+		{
+			// Nearer duplicate: take the slot, then bubble it into order.
+			ctx->hits[i] = hit;
+			for ( int k = i; k > 0 && ctx->hits[k].fraction < ctx->hits[k - 1].fraction; k-- )
+			{
+				WheelHit tmp = ctx->hits[k];
+				ctx->hits[k] = ctx->hits[k - 1];
+				ctx->hits[k - 1] = tmp;
+			}
+		}
+		return;
+	}
+
+	int slot = ctx->count < B3W_MAX_CONTACTS ? ctx->count : B3W_MAX_CONTACTS - 1;
+	if ( ctx->count == B3W_MAX_CONTACTS && hit.fraction >= ctx->hits[slot].fraction )
+	{
+		return;
+	}
+
+	int at = slot;
+	while ( at > 0 && hit.fraction < ctx->hits[at - 1].fraction )
+	{
+		ctx->hits[at] = ctx->hits[at - 1];
+		at--;
+	}
+	ctx->hits[at] = hit;
+	if ( ctx->count < B3W_MAX_CONTACTS )
+	{
+		ctx->count++;
+	}
 }
 
 static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction, uint64_t userMaterialId,
@@ -301,13 +435,39 @@ static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fr
 		}
 	}
 
-	ctx->hit = true;
-	ctx->fraction = fraction;
-	ctx->normal = normal;
-	ctx->point = point;
-	ctx->body = body;
-	ctx->bodyId = b3Shape_GetBody( shapeId );
-	return fraction;
+	// Drivability is a world-space property of the surface, so it compares
+	// against world up rather than the suspension direction — otherwise chassis
+	// tilt would move the accept boundary around.
+	if ( b3Dot( normal, ctx->worldUp ) <= ctx->minSurfaceUpFacing )
+	{
+		return -1.0f;
+	}
+
+	WheelHit hit = { .fraction = fraction, .normal = normal, .point = point, .body = body, .bodyId = hitBody };
+	KeepWheelHit( ctx, hit );
+
+	// Keep searching the whole sweep until three slots are full; after that
+	// nothing beyond the furthest kept hit can improve the set.
+	return ctx->count < B3W_MAX_CONTACTS ? 1.0f : ctx->hits[ctx->count - 1].fraction;
+}
+
+/**
+ * Turn a raw travel distance into the contact's stored suspension state.
+ *
+ * The cast measures this once per tick and the substep solve re-measures it
+ * from the live chassis pose; both must clamp identically or the end stop and
+ * the bump stop would mean different things depending on who asked.
+ *
+ * The wheel cannot travel past the hard point — the spring has a mechanical end
+ * stop, and a negative raw length means the chassis is overshooting into the
+ * ground and must be absorbed rigidly.
+ */
+static void StoreSuspensionLength( WheelContact* contact, float rawLength, float maxSuspensionLength )
+{
+	contact->suspensionLength =
+		rawLength < 0.0f ? 0.0f : ( rawLength > maxSuspensionLength ? maxSuspensionLength : rawLength );
+	contact->bottomedOut = rawLength < 0.0f;
+	contact->bottomOutOvershoot = rawLength < 0.0f ? -rawLength : 0.0f;
 }
 
 /**
@@ -357,80 +517,105 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 	WheelCast cast = { .chassis = v->chassis,
 					   .exclude = v->exclude,
 					   .excludeCount = v->excludeCount,
-					   .hit = false,
-					   .fraction = 1.0f,
-					   .body = -1,
-					   .bodyId = b3_nullBodyId };
+					   .worldUp = worldUp,
+					   .minSurfaceUpFacing = cosf( w->surfaceRejectAngle ),
+					   .count = 0 };
 
 	float maxToi = raylen + offset;
 	b3World_CastShape( v->world, castStart, &proxy, Scale( direction, maxToi ), b3DefaultQueryFilter(), OnWheelHit,
 					   &cast );
 
-	// Filter 1: chassis pose. Drop the hit when the suspension does not point
+	// Filter: chassis pose. Drop every hit when the suspension does not point
 	// broadly downward — sideways, nose-standing or inverted, where a
-	// heightfield's always-outward normal would mislead a normal-only test.
+	// heightfield's always-outward normal would mislead a normal-only test. The
+	// surface filter is applied per hit, inside the cast callback.
 	float suspensionDownward = -b3Dot( direction, worldUp );
-	bool accepted = cast.hit && suspensionDownward > cosf( w->suspensionRejectAngle );
-
-	// Filter 2: surface. Drivability is a world-space property of the surface,
-	// so this compares against world up rather than the suspension direction —
-	// otherwise chassis tilt would move the accept boundary around.
-	if ( accepted )
-	{
-		float worldUpFacing = b3Dot( cast.normal, worldUp );
-		accepted = worldUpFacing > cosf( w->surfaceRejectAngle );
-	}
+	bool accepted = cast.count > 0 && suspensionDownward > cosf( w->suspensionRejectAngle );
 
 	w->info.groundBody = -1;
 	w->info.groundBodyId = b3_nullBodyId;
+	w->info.contactCount = 0;
 
 	if ( accepted )
 	{
-		// Suspension and friction both use the real ground normal so the spring
-		// stays aligned with the contact plane on slopes; fall back to the
-		// suspension axis when the hit is more than ~60° off it, which is what
-		// stops the spring shoving the chassis sideways off a vertical face.
+		float maxSuspensionLength = w->suspensionRestLength + w->maxSuspensionTravel;
 		b3Vec3 axial = Scale( w->wheelDirectionWs, -1.0f );
-		b3Vec3 groundNormal = b3Dot( cast.normal, axial ) > 0.5f ? cast.normal : axial;
 
-		w->info.contactNormalWs = groundNormal;
-		w->info.groundNormalWs = groundNormal;
+		for ( int c = 0; c < cast.count; c++ )
+		{
+			const WheelHit* hit = &cast.hits[c];
+			WheelContact* contact = &w->info.contacts[c];
+
+			// Suspension and friction both use the real ground normal so the
+			// spring stays aligned with the contact plane on slopes; fall back to
+			// the suspension axis when the hit is more than ~60° off it, which is
+			// what stops the spring shoving the chassis sideways off a vertical
+			// face.
+			contact->normalWs = b3Dot( hit->normal, axial ) > 0.5f ? hit->normal : axial;
+
+			float rawLength = hit->fraction * maxToi - offset;
+			StoreSuspensionLength( contact, rawLength, maxSuspensionLength );
+			contact->force = 0.0f;
+
+			// The wheel centre at the length the cast found, measured against the
+			// contact plane. Kept UNCLAMPED so a bottomed wheel re-derives the same
+			// negative raw length the cast saw, and so the end stop keeps working.
+			b3Pos centerAtCast = AddPosVec( source, Scale( w->wheelDirectionWs, rawLength ) );
+
+			// Slide the witness point across the contact plane until it sits
+			// under the wheel's centre.
+			//
+			// A prism resting flat on flat ground is a FACE-face contact, so the
+			// witness GJK returns is any point of that face — and it snaps
+			// between them on sub-micron input changes. Measured on a parked car
+			// it teleported the full wheel width, 0.242 m, every single tick.
+			// That point is where the suspension force is applied and where the
+			// damper reads its velocity, so an alternating lever arm turned the
+			// damper into a pump: the chassis rocked in a 4 Hz roll limit cycle
+			// forever and the reported suspension length swung 9.8 mm on a
+			// chassis whose centre held to 0.17 mm.
+			//
+			// Under the wheel centre is where a symmetric tyre's patch actually
+			// is, and it is the only choice that leaves no ambiguity to snap
+			// between. Moving the point WITHIN its plane is exactly neutral for
+			// everything measured along the normal, so the suspension length,
+			// the end stop and the bump stop are untouched by construction —
+			// only the lever arm changes, from arbitrary to stable.
+			b3Vec3 toCenter = SubPos( centerAtCast, hit->point );
+			b3Vec3 alongPlane = Sub3( toCenter, Scale( contact->normalWs, b3Dot( contact->normalWs, toCenter ) ) );
+			contact->pointWs = AddPosVec( hit->point, alongPlane );
+
+			contact->planeOffset = b3Dot( contact->normalWs, SubPos( centerAtCast, contact->pointWs ) );
+
+			float denominator = b3Dot( contact->normalWs, w->wheelDirectionWs );
+			contact->clippedInvContactDotSuspension = denominator >= -0.1f ? 1.0f / 0.1f : -1.0f / denominator;
+		}
+		w->info.contactCount = cast.count;
+
+		// The nearest contact is the wheel's: it is the surface the tyre rests
+		// on, and what friction, the wheel transform and the readback all mean by
+		// "the" contact.
+		const WheelContact* primary = &w->info.contacts[0];
+		w->info.contactNormalWs = primary->normalWs;
+		w->info.groundNormalWs = primary->normalWs;
+		w->info.contactPointWs = primary->pointWs;
+		w->info.suspensionLength = primary->suspensionLength;
+		w->info.bottomedOut = primary->bottomedOut;
+		w->info.bottomOutOvershoot = primary->bottomOutOvershoot;
+		w->clippedInvContactDotSuspension = primary->clippedInvContactDotSuspension;
 		w->info.isInContact = true;
-		w->info.groundBody = cast.body;
-		w->info.groundBodyId = cast.bodyId;
+		w->info.groundBody = cast.hits[0].body;
+		w->info.groundBodyId = cast.hits[0].bodyId;
 
-		float toi = cast.fraction * maxToi;
-		float rawLength = toi - offset;
-		w->info.lastToi = toi;
+		w->info.lastToi = cast.hits[0].fraction * maxToi;
 		w->info.lastCastOffset = offset;
 		w->info.lastCastStart = castStart;
 		w->info.lastAxleWs = axle;
 
-		// The wheel cannot travel past the hard point — the spring has a
-		// mechanical end stop, and a negative raw length means the chassis is
-		// overshooting into the ground and must be absorbed rigidly.
-		float maxSuspensionLength = w->suspensionRestLength + w->maxSuspensionTravel;
-		float targetLength = rawLength < 0.0f ? 0.0f : ( rawLength > maxSuspensionLength ? maxSuspensionLength : rawLength );
-		w->info.bottomedOut = rawLength < 0.0f;
-		w->info.bottomOutOvershoot = rawLength < 0.0f ? -rawLength : 0.0f;
-		w->info.suspensionLength = targetLength;
-		w->info.contactPointWs = cast.point;
-
-		float denominator = b3Dot( w->info.contactNormalWs, w->wheelDirectionWs );
 		b3Vec3 velAtContact = b3Body_GetWorldPointVelocity( v->chassis, w->info.contactPointWs );
 		float projVel = b3Dot( w->info.contactNormalWs, velAtContact );
-
-		if ( denominator >= -0.1f )
-		{
-			w->suspensionRelativeVelocity = 0.0f;
-			w->clippedInvContactDotSuspension = 1.0f / 0.1f;
-		}
-		else
-		{
-			float inv = -1.0f / denominator;
-			w->suspensionRelativeVelocity = projVel * inv;
-			w->clippedInvContactDotSuspension = inv;
-		}
+		float denominator = b3Dot( w->info.contactNormalWs, w->wheelDirectionWs );
+		w->suspensionRelativeVelocity = denominator >= -0.1f ? 0.0f : projVel * w->clippedInvContactDotSuspension;
 	}
 	else
 	{
@@ -479,16 +664,76 @@ static void UpdateSuspension( Vehicle* v, float chassisMass, float dt )
 			continue;
 		}
 
-		float lengthDiff = w->suspensionRestLength - w->info.suspensionLength;
-		float force = w->suspensionStiffness * lengthDiff * w->clippedInvContactDotSuspension;
+		// One spring row PER CONTACT, each carrying an equal share of the wheel's
+		// load. The share is what keeps this honest: a wheel is one spring no
+		// matter how many surfaces it happens to touch, so the TOTAL it delivers
+		// must not grow with the contact count. Letting it would make a tyre
+		// crossing a plank seam kick — the same Jacobi over-correction the side
+		// friction already divides by `numWheelsOnGround`, one level down.
+		int n = w->info.contactCount > 0 ? w->info.contactCount : 1;
+		float share = 1.0f / (float)n;
+		float total = 0.0f;
 
-		float projectedRelVel = w->suspensionRelativeVelocity;
-		float suspDamping = projectedRelVel < 0.0f ? w->dampingCompression : w->dampingRelaxation;
-		float implicit = 1.0f / ( 1.0f + dt * suspDamping * (float)contacts );
-		force -= suspDamping * projectedRelVel * implicit;
+		// Re-measure compression against the LIVE chassis, the same way and for
+		// the same reason the damper re-reads velocity below. No new cast: the
+		// contact plane the tick found still holds, only the hard point has
+		// moved — which is exactly the spring's input.
+		b3WorldTransform t = b3Body_GetTransform( v->chassis );
+		b3Pos hardPointNow = AddPosVec( t.p, b3RotateVector( t.q, w->chassisConnectionPointCs ) );
+		float maxSuspensionLength = w->suspensionRestLength + w->maxSuspensionTravel;
 
-		float result = force * chassisMass;
-		w->wheelSuspensionForce = result > 0.0f ? result : 0.0f;
+		for ( int c = 0; c < w->info.contactCount; c++ )
+		{
+			WheelContact* contact = &w->info.contacts[c];
+
+			// Solve dot(n, hardPoint + dir*length - contactPoint) == planeOffset
+			// for length. The stored inverse dot is already negated — dir points
+			// into the ground and the normal out of it — so dividing by
+			// dot(n, dir) is a multiply by it here.
+			float gap = b3Dot( contact->normalWs, SubPos( hardPointNow, contact->pointWs ) ) - contact->planeOffset;
+			StoreSuspensionLength( contact, gap * contact->clippedInvContactDotSuspension, maxSuspensionLength );
+
+			float lengthDiff = w->suspensionRestLength - contact->suspensionLength;
+			float force = w->suspensionStiffness * lengthDiff * contact->clippedInvContactDotSuspension;
+
+			// Re-read the closing speed from the LIVE chassis every substep.
+			//
+			// The cast measures it once per tick, and a damper fed a stale
+			// velocity is an energy pump: the chassis rises, the damper still
+			// believes it is compressing, and keeps pushing up. Applied once per
+			// tick that was a wobble; applied 32 times it launched a car to 575
+			// metres. The geometry (contact point, normal, the clipped inverse
+			// dot) is fine to reuse — the chassis moves millimetres in a tick —
+			// but the VELOCITY is exactly what changes while the substeps run,
+			// and it is the only input the damper has.
+			b3Vec3 velNow = b3Body_GetWorldPointVelocity( v->chassis, contact->pointWs );
+			float projectedRelVel = b3Dot( contact->normalWs, velNow ) * contact->clippedInvContactDotSuspension;
+			if ( c == 0 )
+			{
+				w->suspensionRelativeVelocity = projectedRelVel;
+			}
+
+			float suspDamping = projectedRelVel < 0.0f ? w->dampingCompression : w->dampingRelaxation;
+			float implicit = 1.0f / ( 1.0f + dt * suspDamping * (float)contacts );
+			force -= suspDamping * projectedRelVel * implicit;
+
+			float result = force * chassisMass * share;
+			contact->force = result > 0.0f ? result : 0.0f;
+			total += contact->force;
+		}
+
+		w->wheelSuspensionForce = total;
+
+		// Index 0 mirrors the singular fields, which reporting and the wheel
+		// transform read; they should show the length the spring just used, not
+		// the one the cast measured a substep-count ago.
+		if ( w->info.contactCount > 0 )
+		{
+			const WheelContact* primary = &w->info.contacts[0];
+			w->info.suspensionLength = primary->suspensionLength;
+			w->info.bottomedOut = primary->bottomedOut;
+			w->info.bottomOutOvershoot = primary->bottomOutOvershoot;
+		}
 	}
 }
 
@@ -579,6 +824,15 @@ static float CalcRollingFriction( b3BodyId chassis, b3BodyId ground, b3Pos conta
  * the suspension axis, or drive force lifts a pitched chassis), solve lateral,
  * then longitudinal, then apply the friction circle, then apply the impulses.
  */
+/**
+ * `dt` is the SUBSTEP here; `v->stepDt` is the whole tick.
+ *
+ * Impulses scale with the substep — a force applied 32 times must each time be
+ * worth a 32nd. Position-error correction does NOT: it is a RATE, "remove this
+ * fraction of the accumulated slide per second", so dividing it by the substep
+ * makes it 32x stronger and then applies it 32 times. That is 1024x, and it
+ * pinned the vehicle to the ground so hard that full throttle moved it 0.9mm.
+ */
 static void UpdateFriction( Vehicle* v, float dt )
 {
 	int numWheels = v->wheelCount;
@@ -658,7 +912,7 @@ static void UpdateFriction( Vehicle* v, float dt )
 		if ( w->hasAnchor )
 		{
 			b3Vec3 slid = SubPos( w->info.contactPointWs, w->staticFrictionAnchor );
-			lateralBias = b3Dot( slid, v->axle[i] ) * STATIC_FRICTION_ERP / dt;
+			lateralBias = b3Dot( slid, v->axle[i] ) * STATIC_FRICTION_ERP / v->stepDt;
 		}
 
 		bool groundIsDynamic = B3_IS_NON_NULL( w->info.groundBodyId ) &&
@@ -715,7 +969,7 @@ static void UpdateFriction( Vehicle* v, float dt )
 				if ( w->hasAnchor )
 				{
 					b3Vec3 slid = SubPos( w->info.contactPointWs, w->staticFrictionAnchor );
-					biasVelocity = b3Dot( slid, v->forwardWs[i] ) * STATIC_FRICTION_ERP / dt;
+					biasVelocity = b3Dot( slid, v->forwardWs[i] ) * STATIC_FRICTION_ERP / v->stepDt;
 				}
 
 				float demand = CalcRollingFriction( v->chassis, w->info.groundBodyId, w->info.contactPointWs,
@@ -743,13 +997,21 @@ static void UpdateFriction( Vehicle* v, float dt )
 
 		if ( hasGround )
 		{
-			float maxImp = w->wheelSuspensionForce * dt * w->frictionSlip;
+			// The budget is the whole tick's, because what it is being compared
+			// against is: the lateral solve cancels velocity outright and the
+			// longitudinal impulses accumulate over the substeps to engineForce
+			// times the tick. Both sides of this test are now tick-scale.
+			float maxImp = w->wheelSuspensionForce * v->stepDt * w->frictionSlip;
 			float maxImpSquared = maxImp * maxImp;
 
 			w->forwardImpulse = rollingFriction;
 
-			float x = w->forwardImpulse * fwdFactor;
-			float y = w->sideImpulse * sideFactor;
+			float x = ( w->accumForward + w->forwardImpulse ) * fwdFactor;
+			// Lateral IS accumulated, and testing the alternative is how I know:
+			// charging only the current substep's lateral impulse pinned the car
+			// again (0.5mm at full throttle). Both terms describe grip the tick
+			// has committed, so both belong in the same running total.
+			float y = ( w->accumSide + w->sideImpulse ) * sideFactor;
 			float impulseSquared = x * x + y * y;
 
 			if ( impulseSquared > maxImpSquared )
@@ -805,6 +1067,10 @@ static void UpdateFriction( Vehicle* v, float dt )
 				AddPosVec( contactPoint, Scale( chassisUp, -toContactUp * ( 1.0f - w->rollInfluence ) ) );
 			b3Body_ApplyLinearImpulse( v->chassis, sideImpulse, sidePoint, false );
 		}
+
+		// Spent, so the next substep sees what this tick has already used.
+		w->accumForward += w->forwardImpulse;
+		w->accumSide += w->sideImpulse;
 	}
 }
 
@@ -889,8 +1155,25 @@ static void UpdateWheelTransforms( Vehicle* v, int wheelId )
 	w->center = AddPosVec( w->info.hardPointWs, Scale( w->wheelDirectionWs, w->info.suspensionLength ) );
 }
 
-void b3w_vehicle_update( Vehicle* v, float dt )
+/**
+ * Everything that must happen ONCE per full step: where the wheels are, how
+ * fast the chassis is going, and the shape casts that find the ground.
+ *
+ * Casting is the expensive half and its answer is good for the whole step —
+ * the chassis moves millimetres in one tick. Splitting it from the solve is
+ * what makes solving 32 times affordable.
+ */
+void b3w_vehicle_prepare( Vehicle* v, float dt )
 {
+	v->stepDt = dt > 0.0f ? dt : 1.0f / 60.0f;
+
+	// A fresh friction budget for the tick the substeps are about to share.
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		v->wheels[i].accumForward = 0.0f;
+		v->wheels[i].accumSide = 0.0f;
+	}
+
 	// A sleeping DYNAMIC chassis is not simulated, but applying an impulse still
 	// mutates its stored velocity — a parked vehicle silently wound its
 	// suspension impulses into a velocity that was never integrated away, then
@@ -927,9 +1210,28 @@ void b3w_vehicle_update( Vehicle* v, float dt )
 	{
 		ShapeCastWheel( v, i, dt );
 	}
+}
+
+/**
+ * The force model, once per SUBSTEP, against `h` rather than the whole tick.
+ *
+ * Applied once per tick this was the least accurate thing in the world and it
+ * was attached to the thing players look at hardest: the suspension integrated
+ * explicitly at the tick rate while every constraint around it integrated 32
+ * times finer. The damper suffered worst — its implicit attenuation is
+ * 1/(1 + h*c*contacts), so a tick-sized h delivered a fraction of the damping
+ * the springs were tuned for, and the chassis wobbled until the sleep
+ * threshold caught it.
+ */
+void b3w_vehicle_solve( Vehicle* v, float h )
+{
+	if ( b3Body_GetType( v->chassis ) == b3_dynamicBody && !b3Body_IsAwake( v->chassis ) )
+	{
+		return;
+	}
 
 	float chassisMass = b3Body_GetMass( v->chassis );
-	UpdateSuspension( v, chassisMass, dt );
+	UpdateSuspension( v, chassisMass, h );
 
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
@@ -939,14 +1241,21 @@ void b3w_vehicle_update( Vehicle* v, float dt )
 			b3Body_SetAwake( v->chassis, true );
 		}
 
-		float suspensionForce = w->wheelSuspensionForce;
-		if ( suspensionForce > w->maxSuspensionForce )
+		// The cap is the WHEEL's, so an over-force wheel scales all of its
+		// contacts down together rather than capping each one and delivering
+		// N times the limit.
+		float scale = 1.0f;
+		if ( w->wheelSuspensionForce > w->maxSuspensionForce )
 		{
-			suspensionForce = w->maxSuspensionForce;
+			scale = w->maxSuspensionForce / w->wheelSuspensionForce;
 		}
 
-		b3Vec3 impulse = Scale( w->info.contactNormalWs, suspensionForce * dt );
-		b3Body_ApplyLinearImpulse( v->chassis, impulse, w->info.contactPointWs, false );
+		for ( int c = 0; c < w->info.contactCount; c++ )
+		{
+			const WheelContact* contact = &w->info.contacts[c];
+			b3Vec3 impulse = Scale( contact->normalWs, contact->force * scale * h );
+			b3Body_ApplyLinearImpulse( v->chassis, impulse, contact->pointWs, false );
+		}
 	}
 
 	// Bump-stop velocity constraint — one simultaneous solve across every
@@ -954,30 +1263,53 @@ void b3w_vehicle_update( Vehicle* v, float dt )
 	// Enforce v_at(p_i)·n_i >= 0 with lambda >= 0; drop any wheel whose lambda
 	// goes negative (it would have to pull the chassis down) and resolve.
 	{
-		int idx[B3W_MAX_WHEELS];
-		b3Pos contacts[B3W_MAX_WHEELS];
-		b3Vec3 normals[B3W_MAX_WHEELS];
-		float relVels[B3W_MAX_WHEELS];
+		int idx[B3W_MAX_BUMP_ROWS];
+		b3Pos contacts[B3W_MAX_BUMP_ROWS];
+		b3Vec3 normals[B3W_MAX_BUMP_ROWS];
+		float relVels[B3W_MAX_BUMP_ROWS];
 		int n = 0;
 
-		for ( int i = 0; i < v->wheelCount; i++ )
+		for ( int i = 0; i < v->wheelCount && n < B3W_MAX_BUMP_ROWS; i++ )
 		{
 			Wheel* w = &v->wheels[i];
-			if ( !w->info.bottomedOut )
+
+			for ( int c = 0; c < w->info.contactCount && n < B3W_MAX_BUMP_ROWS; c++ )
 			{
-				continue;
+				const WheelContact* contact = &w->info.contacts[c];
+				if ( !contact->bottomedOut )
+				{
+					continue;
+				}
+
+				b3Vec3 vel = b3Body_GetWorldPointVelocity( v->chassis, contact->pointWs );
+				float relVel = b3Dot( contact->normalWs, vel );
+
+				// How fast the chassis must rise to undo the overshoot, as a
+				// RATE: a fraction of the error per second, so it is independent
+				// of both the tick and the substep. This replaces a position
+				// teleport — see below — and it is the whole reason the bump stop
+				// stops chattering.
+				float bias = 0.0f;
+				if ( contact->bottomOutOvershoot > 0.0f )
+				{
+					float capped = contact->bottomOutOvershoot < w->maxSuspensionTravel ? contact->bottomOutOvershoot
+																						: w->maxSuspensionTravel;
+					bias = capped * BUMP_STOP_ERP / v->stepDt;
+				}
+
+				if ( relVel >= bias )
+				{
+					continue;
+				}
+				idx[n] = i;
+				contacts[n] = contact->pointWs;
+				normals[n] = contact->normalWs;
+				// Solved toward the bias rather than toward zero, so the
+				// constraint both stops the chassis sinking further AND lifts it
+				// out.
+				relVels[n] = relVel - bias;
+				n++;
 			}
-			b3Vec3 vel = b3Body_GetWorldPointVelocity( v->chassis, w->info.contactPointWs );
-			float relVel = b3Dot( w->info.contactNormalWs, vel );
-			if ( relVel >= 0.0f )
-			{
-				continue;
-			}
-			idx[n] = i;
-			contacts[n] = w->info.contactPointWs;
-			normals[n] = w->info.contactNormalWs;
-			relVels[n] = relVel;
-			n++;
 		}
 
 		if ( n > 0 )
@@ -1063,47 +1395,15 @@ void b3w_vehicle_update( Vehicle* v, float dt )
 		}
 	}
 
-	// Bump-stop position correction — ONE correction on the chassis per step,
-	// resolving the worst overshoot. Aggregating is what makes a full-strength
-	// correction safe; per-wheel at that factor stacks and launches the chassis.
-	{
-		float deepest = 0.0f;
-		b3Vec3 correctionNormal = { 0.0f, 0.0f, 0.0f };
-		float cap = 0.0f;
+	// The bump-stop position correction that used to live here is gone. It moved
+	// the chassis with b3Body_SetTransform — a teleport on a dynamic body, which
+	// the solver knows nothing about: it fought the solver's own position
+	// integration, left velocity untouched so the wheel was bottomed again next
+	// step, and corrected again. That loop is a rapid chatter you can see, and it
+	// was there at every tick rate. The overshoot is now a bias inside the
+	// velocity constraint above, which is where a penetration error belongs.
 
-		for ( int i = 0; i < v->wheelCount; i++ )
-		{
-			Wheel* w = &v->wheels[i];
-			if ( !w->info.bottomedOut )
-			{
-				continue;
-			}
-			if ( w->maxSuspensionTravel > cap )
-			{
-				cap = w->maxSuspensionTravel;
-			}
-			if ( w->info.bottomOutOvershoot > deepest )
-			{
-				deepest = w->info.bottomOutOvershoot;
-				correctionNormal = w->info.contactNormalWs;
-			}
-		}
-
-		if ( deepest > 0.0f )
-		{
-			// Capped at the wheel's max suspension travel: a real bottom-out is
-			// corrected over a few frames (visually identical, gentler on
-			// velocity), and a spurious one — a cast clipping a seam between
-			// adjacent static colliders — only nudges the chassis a few cm
-			// before the next frame re-evaluates.
-			float applied = deepest < cap ? deepest : cap;
-			b3WorldTransform t = b3Body_GetTransform( v->chassis );
-			b3Pos newPos = AddPosVec( t.p, Scale( correctionNormal, applied ) );
-			b3Body_SetTransform( v->chassis, newPos, t.q );
-		}
-	}
-
-	UpdateFriction( v, dt );
+	UpdateFriction( v, h );
 
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
@@ -1118,7 +1418,7 @@ void b3w_vehicle_update( Vehicle* v, float dt )
 			fwd = Sub3( fwd, Scale( w->info.contactNormalWs, proj ) );
 
 			float proj2 = b3Dot( fwd, vel );
-			w->deltaRotation = ( proj2 * dt ) / w->radius;
+			w->deltaRotation = ( proj2 * h ) / w->radius;
 			w->rotation += w->deltaRotation;
 		}
 		else
@@ -1137,9 +1437,32 @@ void b3w_vehicle_update( Vehicle* v, float dt )
 // layer: it turns JavaScript's integers into ids and calls straight through.
 // ---------------------------------------------------------------------------
 
+/** Fraction of a bump-stop overshoot removed per second. Matches the static
+ *  friction anchor's role: firm enough to look rigid, soft enough not to launch
+ *  a chassis that is briefly deep. */
+#define BUMP_STOP_ERP 0.6f
+
 #define B3W_MAX_VEHICLES 64
 
 static Vehicle g_vehicles[B3W_MAX_VEHICLES];
+
+/**
+ * Solve every live vehicle for one substep. Registered with the world as its
+ * substep callback, so the force model keeps step with the solver instead of
+ * being applied once per tick and left to be 32 substeps stale.
+ */
+void b3w_vehicle_substep( float h, void* context )
+{
+	(void)context;
+
+	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	{
+		if ( g_vehicles[i].used )
+		{
+			b3w_vehicle_solve( &g_vehicles[i], h );
+		}
+	}
+}
 
 Vehicle* b3w_vehicle_get( int handle )
 {

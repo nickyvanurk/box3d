@@ -3313,6 +3313,13 @@ void b3World_SetPreSolveCallback( b3WorldId worldId, b3PreSolveFcn* fcn, void* c
 	world->preSolveContext = context;
 }
 
+void b3World_SetSubStepCallback( b3WorldId worldId, b3SubStepFcn* fcn, void* context )
+{
+	b3World* world = b3GetWorldFromId( worldId );
+	world->subStepFcn = fcn;
+	world->subStepContext = context;
+}
+
 void b3World_SetGravity( b3WorldId worldId, b3Vec3 gravity )
 {
 	b3World* world = b3GetWorldFromId( worldId );

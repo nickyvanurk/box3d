@@ -109,6 +109,10 @@ int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableC
 		return -1;
 	}
 
+// Defined in vehicle.c; registered as the world substep callback below.
+void b3w_vehicle_substep( float h, void* context );
+
+
 	b3WorldDef def = b3DefaultWorldDef();
 	def.gravity = ( b3Vec3 ){ gx, gy, gz };
 	def.enableSleep = enableSleep != 0;
@@ -121,6 +125,10 @@ int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableC
 
 	World* world = &g_worlds[handle];
 	world->id = b3CreateWorld( &def );
+
+	// The vehicle force model runs per substep, not per tick — see
+	// `b3w_vehicle_substep`. Registered once here so no caller has to know.
+	b3World_SetSubStepCallback( world->id, b3w_vehicle_substep, NULL );
 	world->inUse = true;
 	world->bodyCount = 0;
 	world->jointCount = 0;
@@ -990,6 +998,25 @@ void b3w_set_gravity( int handle, float x, float y, float z )
 	b3World_SetGravity( world->id, ( b3Vec3 ){ x, y, z } );
 }
 
+/**
+ * The ceiling on every awake body's linear speed.
+ *
+ * Not just a clamp on impulses: the solver reads it in IntegratePositions
+ * (`src/solver.c:182`) and applies it to every awake body every substep, so the
+ * default of 400 m/s is a hard limit on how fast anything in the world can
+ * travel by any route. Games that fly need to say otherwise.
+ */
+void b3w_set_maximum_linear_speed( int handle, float speed )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || speed <= 0.0f )
+	{
+		return;
+	}
+
+	b3World_SetMaximumLinearSpeed( world->id, speed );
+}
+
 int b3w_shape_count( int handle, int body )
 {
 	World* world = GetWorld( handle );
@@ -1281,7 +1308,8 @@ float b3w_prismatic_translation( int handle, int joint )
 // ---------------------------------------------------------------------------
 
 int b3w_vehicle_create( b3WorldId world, b3BodyId chassis );
-void b3w_vehicle_update( void* vehicle, float dt );
+void b3w_vehicle_prepare( void* vehicle, float dt );
+void b3w_vehicle_substep( float h, void* context );
 void* b3w_vehicle_get( int handle );
 
 int b3w_create_vehicle( int handle, int chassis )
@@ -1294,12 +1322,18 @@ int b3w_create_vehicle( int handle, int chassis )
 	return b3w_vehicle_create( world->id, world->bodies[chassis] );
 }
 
+/**
+ * The once-per-tick half: shape casts and wheel transforms. The force model
+ * itself now runs per substep, driven by the world's substep callback — see
+ * `b3w_vehicle_substep`. The JS API is unchanged: this is still called once
+ * before `b3w_step`.
+ */
 void b3w_step_vehicle( int vehicle, float dt )
 {
 	void* v = b3w_vehicle_get( vehicle );
 	if ( v != NULL )
 	{
-		b3w_vehicle_update( v, dt );
+		b3w_vehicle_prepare( v, dt );
 	}
 }
 

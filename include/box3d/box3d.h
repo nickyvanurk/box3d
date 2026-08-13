@@ -162,6 +162,13 @@ B3_API void b3World_SetCustomFilterCallback( b3WorldId worldId, b3CustomFilterFc
 /// Register the pre-solve callback. This is optional.
 B3_API void b3World_SetPreSolveCallback( b3WorldId worldId, b3PreSolveFcn* fcn, void* context );
 
+/// Register a callback invoked once per substep, after velocities are
+/// integrated and before constraints are solved. `h` is the substep duration.
+/// Intended for non-constraint force models that must keep step with the
+/// solver rather than being applied once per full step.
+/// @ingroup world
+B3_API void b3World_SetSubStepCallback( b3WorldId worldId, b3SubStepFcn* fcn, void* context );
+
 /// Set the gravity vector for the entire world. Box3D has no concept of an up direction and this
 /// is left as a decision for the application. Usually in m/s^2.
 /// @see b3WorldDef

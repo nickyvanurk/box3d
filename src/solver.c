@@ -1246,6 +1246,17 @@ static void b3SolverTask( void* taskContext )
 
 			profile->integrateVelocities += b3GetMillisecondsAndReset( &ticks );
 
+			// Non-constraint force models, once per SUBSTEP.
+			//
+			// After velocities are integrated so gravity is already in, and before
+			// the constraint solve so what this applies is something the solver
+			// then resolves against rather than something layered on top of an
+			// already-solved state.
+			if ( context->world->subStepFcn != NULL )
+			{
+				context->world->subStepFcn( context->h, context->world->subStepContext );
+			}
+
 			// Warm start constraints
 			b3WarmStartJoints_Overflow( context );
 			b3WarmStartContacts_Overflow( context );

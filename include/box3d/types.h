@@ -87,6 +87,11 @@ typedef bool b3CustomFilterFcn( b3ShapeId shapeIdA, b3ShapeId shapeIdB, void* co
 /// @ingroup world
 typedef bool b3PreSolveFcn( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Vec3 normal, void* context );
 
+/// Called once per substep, after velocities are integrated and before
+/// constraints are solved. `h` is the substep duration in seconds.
+/// @see b3World_SetSubStepCallback
+typedef void b3SubStepFcn( float h, void* context );
+
 /// Prototype callback for overlap queries.
 /// Called for each shape found in the query.
 /// @see b3World_OverlapAABB
