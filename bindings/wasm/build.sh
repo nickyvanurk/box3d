@@ -41,7 +41,7 @@ EXPORTS='[
 	"_b3w_set_revolute_motor","_b3w_set_revolute_limits","_b3w_set_joint_constraint_tuning","_b3w_wake_joint_bodies",
 	"_b3w_set_prismatic_motor","_b3w_set_prismatic_limits","_b3w_cast_sphere",
 	"_b3w_add_sphere_shape","_b3w_add_cylinder_shape","_b3w_add_hull_shape",
-	"_b3w_destroy_body","_b3w_set_gravity","_b3w_set_maximum_linear_speed","_b3w_shape_count","_b3w_cast_ray_detailed",
+	"_b3w_destroy_body","_b3w_set_gravity","_b3w_set_contact_tuning","_b3w_set_maximum_linear_speed","_b3w_shape_count","_b3w_cast_ray_detailed",
 	"_b3w_set_revolute_servo","_b3w_revolute_angle","_b3w_prismatic_translation",
 	"_b3w_destroy_shape","_b3w_shape_is_valid","_b3w_destroy_joint","_b3w_set_shape_filter",
 	"_b3w_cast_ray_filtered","_b3w_cast_sphere_filtered","_b3w_set_body_mass","_b3w_set_sleep_threshold","_b3w_body_contacts","_b3w_body_aabb","_b3w_body_inertia_tensor","_b3w_body_shape_states",

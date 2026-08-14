@@ -1048,6 +1048,33 @@ void b3w_destroy_body( int handle, int body )
 	b3DestroyBody( world->bodies[body] );
 }
 
+/**
+ * Contact stiffness, as a spring frequency in Hz.
+ *
+ * Box3D's default is 30 Hz, sized for metre-scale bodies. A block here is
+ * 0.25 m, and a contact spring lets an impact sink roughly v/(2*pi*f) before it
+ * pushes back — at 3 m/s that is 17 mm, which is 7% of a block and plainly
+ * visible as one block dipping into another before popping out.
+ *
+ * Static contacts already get double this (`physics_world.c:1123`), which is
+ * why a block landing on TERRAIN looks right and a block landing on another
+ * BLOCK does not. Exposed so the game can state a stiffness that matches its
+ * own scale instead of inheriting one that matches nobody's.
+ *
+ * The solver caps the effective value at an eighth of the substep rate, so
+ * there is no way to ask for something it cannot resolve.
+ */
+void b3w_set_contact_tuning( int handle, float hertz, float dampingRatio, float pushSpeed )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	b3World_SetContactTuning( world->id, hertz, dampingRatio, pushSpeed );
+}
+
 void b3w_set_gravity( int handle, float x, float y, float z )
 {
 	World* world = GetWorld( handle );

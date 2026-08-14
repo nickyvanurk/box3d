@@ -383,8 +383,23 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 	b3BodySim* bodySim = b3GetBodySim( world, body );
 	B3_ASSERT( body->type == b3_staticBody || ( fastBodySim->flags & b3_isBullet ) );
 
-	// Skip bullets
-	if ( bodySim->flags & b3_isBullet )
+	// Skip bullets that are doing their own sweep this step.
+	//
+	// Upstream skipped EVERY bullet target, which is right when both bodies are
+	// moving fast: each sweeps for itself, and sweeping both ways doubles the
+	// work and lets two TOIs fight. It is wrong when the target is a bullet that
+	// is slow or asleep, because then nobody sweeps that pair at all.
+	//
+	// That case is the common one in a game where bullet is the DEFAULT rather
+	// than a rare marker for a projectile. Mechacraft sets it on every structure
+	// body, so a block falling onto a resting block, and a physgun-held platform
+	// driven into a block sitting on it, both got no continuous collision
+	// whatever — measured at 19-32% of a block of interpenetration before the
+	// solver pushed them apart. `b3_isFast` is the honest test: it is set during
+	// integration only for a body that moved more than half its own min extent
+	// this step, and cleared every step, so a resting bullet is swept against
+	// and a moving one is left to sweep itself.
+	if ( ( bodySim->flags & b3_isBullet ) && ( bodySim->flags & b3_isFast ) )
 	{
 		return true;
 	}
