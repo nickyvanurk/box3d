@@ -1704,3 +1704,209 @@ int b3w_cast_sphere_filtered( int handle, float cx, float cy, float cz, float ra
 	out[3] = ctx.closest.fraction;
 	return 1;
 }
+
+// --- debug wireframe -----------------------------------------------------
+//
+// The game's F3 view. Rapier shipped `world.debugRender()`; Box3D's own
+// `b3World_Draw` hands shapes back through `DrawShapeFcn` as an opaque
+// *application* object it expects the caller to have registered, so there is
+// nothing to draw unless the app already built renderable shapes. This walks
+// the world instead and emits line segments from the engine's OWN shape data —
+// which is the point of a physics debug view: it must show what the solver
+// believes, not what the renderer believes, or it cannot disagree with the
+// picture and is worth nothing.
+//
+// Line list, two vertices per segment, matching what the host feeds a
+// THREE.LineSegments: xyz per vertex, rgba per vertex.
+
+typedef struct DebugSink
+{
+	float* verts;
+	float* colors;
+	int capacityVerts;
+	int count;
+	float r, g, b;
+} DebugSink;
+
+static void PushVertex( DebugSink* sink, b3Vec3 p )
+{
+	if ( sink->count >= sink->capacityVerts )
+	{
+		return;
+	}
+
+	sink->verts[sink->count * 3 + 0] = (float)p.x;
+	sink->verts[sink->count * 3 + 1] = (float)p.y;
+	sink->verts[sink->count * 3 + 2] = (float)p.z;
+	sink->colors[sink->count * 4 + 0] = sink->r;
+	sink->colors[sink->count * 4 + 1] = sink->g;
+	sink->colors[sink->count * 4 + 2] = sink->b;
+	sink->colors[sink->count * 4 + 3] = 1.0f;
+	sink->count++;
+}
+
+static void PushSegment( DebugSink* sink, b3Vec3 a, b3Vec3 b )
+{
+	PushVertex( sink, a );
+	PushVertex( sink, b );
+}
+
+/// World-space point of a body-local point.
+static b3Vec3 ToWorld( b3WorldTransform t, b3Vec3 local )
+{
+	b3Vec3 r = b3RotateVector( t.q, local );
+	return B3_LITERAL( b3Vec3 ){ (float)t.p.x + r.x, (float)t.p.y + r.y, (float)t.p.z + r.z };
+}
+
+/// A circle of `segments` lines around `centre`, spanning the two given axes.
+static void PushCircle( DebugSink* sink, b3WorldTransform t, b3Vec3 centre, b3Vec3 axisA, b3Vec3 axisB, float radius,
+						int segments )
+{
+	b3Vec3 previous;
+	for ( int i = 0; i <= segments; i++ )
+	{
+		float angle = ( 2.0f * 3.14159265f * (float)i ) / (float)segments;
+		float ca = cosf( angle ) * radius;
+		float sa = sinf( angle ) * radius;
+		b3Vec3 local = { centre.x + axisA.x * ca + axisB.x * sa, centre.y + axisA.y * ca + axisB.y * sa,
+						 centre.z + axisA.z * ca + axisB.z * sa };
+		b3Vec3 world = ToWorld( t, local );
+		if ( i > 0 )
+		{
+			PushSegment( sink, previous, world );
+		}
+		previous = world;
+	}
+}
+
+/**
+ * Every shape in the world as a wireframe, in world space.
+ *
+ * `excludeBody` drops one body — the ground. Its collider is a mesh the size of
+ * the island, and drawing it buries every machine in a haystack of triangles;
+ * Rapier's version excluded it for the same reason. Mesh shapes are skipped
+ * outright for that reason too.
+ *
+ * Colour carries body STATE, because "is the physics doing anything" is the
+ * question this view exists to answer: grey static, blue kinematic, green awake
+ * dynamic, red asleep. A machine that stops moving should go red, and one that
+ * is asleep when it should not be is then visible at a glance.
+ *
+ * Returns the number of VERTICES written; the host reads 3 floats of position
+ * and 4 of colour per vertex. Writing stops at capacity rather than growing:
+ * the buffer is allocated once by the host and a debug view that reallocates
+ * every frame would be its own performance bug.
+ */
+int b3w_debug_draw( int handle, float* verts, float* colors, int capacityVerts, int excludeBody )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || verts == NULL || colors == NULL )
+	{
+		return 0;
+	}
+
+	DebugSink sink = { verts, colors, capacityVerts, 0, 1.0f, 1.0f, 1.0f };
+
+	for ( int i = 0; i < world->bodyCount; ++i )
+	{
+		if ( i == excludeBody )
+		{
+			continue;
+		}
+
+		b3BodyId bodyId = world->bodies[i];
+		if ( b3Body_IsValid( bodyId ) == false )
+		{
+			continue;
+		}
+
+		b3BodyType type = b3Body_GetType( bodyId );
+		bool awake = b3Body_IsAwake( bodyId );
+		if ( type == b3_staticBody )
+		{
+			sink.r = 0.55f, sink.g = 0.55f, sink.b = 0.55f;
+		}
+		else if ( type == b3_kinematicBody )
+		{
+			sink.r = 0.35f, sink.g = 0.65f, sink.b = 1.0f;
+		}
+		else if ( awake )
+		{
+			sink.r = 0.35f, sink.g = 0.95f, sink.b = 0.45f;
+		}
+		else
+		{
+			sink.r = 0.95f, sink.g = 0.35f, sink.b = 0.35f;
+		}
+
+		b3WorldTransform transform = b3Body_GetTransform( bodyId );
+
+		b3ShapeId shapes[256];
+		int shapeCount = b3Body_GetShapeCount( bodyId );
+		if ( shapeCount > 256 )
+		{
+			shapeCount = 256;
+		}
+		b3Body_GetShapes( bodyId, shapes, shapeCount );
+
+		for ( int s = 0; s < shapeCount; ++s )
+		{
+			b3ShapeType shapeType = b3Shape_GetType( shapes[s] );
+
+			if ( shapeType == b3_sphereShape )
+			{
+				b3Sphere sphere = b3Shape_GetSphere( shapes[s] );
+				b3Vec3 x = { 1.0f, 0.0f, 0.0f }, y = { 0.0f, 1.0f, 0.0f }, z = { 0.0f, 0.0f, 1.0f };
+				PushCircle( &sink, transform, sphere.center, x, y, sphere.radius, 16 );
+				PushCircle( &sink, transform, sphere.center, y, z, sphere.radius, 16 );
+				PushCircle( &sink, transform, sphere.center, x, z, sphere.radius, 16 );
+			}
+			else if ( shapeType == b3_capsuleShape )
+			{
+				b3Capsule capsule = b3Shape_GetCapsule( shapes[s] );
+				b3Vec3 x = { 1.0f, 0.0f, 0.0f }, y = { 0.0f, 1.0f, 0.0f }, z = { 0.0f, 0.0f, 1.0f };
+				PushCircle( &sink, transform, capsule.center1, x, z, capsule.radius, 12 );
+				PushCircle( &sink, transform, capsule.center2, x, z, capsule.radius, 12 );
+				b3Vec3 c1 = capsule.center1, c2 = capsule.center2;
+				for ( int e = 0; e < 4; ++e )
+				{
+					b3Vec3 axis = ( e == 0 ) ? x : ( e == 1 ) ? z : ( e == 2 ) ? B3_LITERAL( b3Vec3 ){ -1, 0, 0 }
+																			  : B3_LITERAL( b3Vec3 ){ 0, 0, -1 };
+					b3Vec3 a = { c1.x + axis.x * capsule.radius, c1.y + axis.y * capsule.radius,
+								 c1.z + axis.z * capsule.radius };
+					b3Vec3 b = { c2.x + axis.x * capsule.radius, c2.y + axis.y * capsule.radius,
+								 c2.z + axis.z * capsule.radius };
+					PushSegment( &sink, ToWorld( transform, a ), ToWorld( transform, b ) );
+				}
+			}
+			else if ( shapeType == b3_hullShape )
+			{
+				// Boxes are hulls here, so this covers every block and every
+				// authored collider. Half-edges come in twin pairs; emitting only
+				// the one with the lower index draws each edge once.
+				const b3HullData* hull = b3Shape_GetHull( shapes[s] );
+				if ( hull == NULL )
+				{
+					continue;
+				}
+
+				const b3Vec3* points = b3GetHullPoints( hull );
+				const b3HullHalfEdge* edges = b3GetHullEdges( hull );
+				for ( int e = 0; e < hull->edgeCount; ++e )
+				{
+					if ( edges[e].twin < e )
+					{
+						continue;
+					}
+
+					b3Vec3 a = points[edges[e].origin];
+					b3Vec3 b = points[edges[edges[e].twin].origin];
+					PushSegment( &sink, ToWorld( transform, a ), ToWorld( transform, b ) );
+				}
+			}
+			// Mesh shapes fall through: see the note above.
+		}
+	}
+
+	return sink.count;
+}
