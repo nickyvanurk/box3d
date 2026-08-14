@@ -973,7 +973,21 @@ static void UpdateFriction( Vehicle* v, float dt )
 	}
 
 	float sideFactor = 1.0f;
-	float fwdFactor = 0.5f;
+	/*
+	 * DELIBERATE DIVERGENCE from Bullet/Rapier, which both use 0.5 here.
+	 *
+	 * This factor weights the longitudinal term when the tyre's total impulse is
+	 * tested against the friction circle. At 0.5 a purely forward impulse has to
+	 * reach TWICE the circle's radius before it counts as sliding, so a wheel
+	 * driving in a straight line transmits up to 2*mu*N — twice what the surface
+	 * can hold. Measured on the game's Car template: 24.9 m/s^2 against a
+	 * mu*g ceiling of 22.5, with the code's own limit sitting at 45.
+	 *
+	 * The circle bounds the tyre's TOTAL force at mu*N, and a force that is
+	 * entirely longitudinal is bounded by exactly the same number, so the two
+	 * axes are weighted alike.
+	 */
+	float fwdFactor = 1.0f;
 	bool sliding = false;
 
 	for ( int i = 0; i < numWheels; i++ )
@@ -1078,7 +1092,10 @@ static void UpdateFriction( Vehicle* v, float dt )
 		for ( int i = 0; i < numWheels; i++ )
 		{
 			Wheel* w = &v->wheels[i];
-			if ( w->sideImpulse != 0.0f && w->skidInfo < 1.0f )
+			// Also diverges: upstream additionally requires `sideImpulse != 0`,
+			// which skips the clamp for a wheel driving dead straight — the one
+			// case where the whole friction budget is being spent forwards.
+			if ( w->skidInfo < 1.0f )
 			{
 				// The friction circle just said this tyre is past what it can
 				// hold, so it is no longer stuck to the point it latched.
