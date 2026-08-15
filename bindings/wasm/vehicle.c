@@ -20,7 +20,7 @@
  * r rounds the tread and would change ride height wherever a wheel meets an
  * edge. So the wheel is cast as a polygonal prism: two rings of
  * `TREAD_SEGMENTS` points at the tyre's outer radius, zero proxy radius. The
- * error is r·(1 − cos(π/TREAD_SEGMENTS)), which at 8 segments is 1.9% of the
+ * error is r·(1 − cos(π/TREAD_SEGMENTS)), which at 16 segments is 0.5% of the
  * radius and under Box3D's 5 mm linear slop for any wheel the game builds.
  */
 
@@ -36,7 +36,7 @@
 /** Owner id reserved for bodies that are never ground for any vehicle. */
 #define B3W_OWNER_NEVER_GROUND 0xFFFFFFFFu
 /** Points per cap of the cast prism. See the header note on tread geometry. */
-#define TREAD_SEGMENTS 8
+#define TREAD_SEGMENTS 16
 /** Contact points a single wheel may rest on. Uncharted 4's number, and for
  *  their reason: one is a wheel that ping-pongs between surfaces. */
 #define B3W_MAX_CONTACTS 3
