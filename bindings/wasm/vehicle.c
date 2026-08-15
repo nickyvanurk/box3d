@@ -151,6 +151,27 @@ typedef struct
 
 	float rotation;
 	float deltaRotation;
+	/**
+	 * The wheel's OWN spin rate, in rad/s, positive rolling forward.
+	 *
+	 * Real state, integrated from the torques acting on the wheel, rather than
+	 * read off the chassis. `deltaRotation` used to be defined as
+	 * `groundSpeed / radius`, which makes the wheel match the ground by
+	 * construction — so slip could not exist, and with it neither could wheel
+	 * spin, engine RPM taken from the fastest wheel, differentials, or the
+	 * torque feedback the Uncharted 4 talk builds its drivetrain out of. All of
+	 * those need a wheel that is allowed to disagree with the ground.
+	 */
+	float angularVelocity;
+	/**
+	 * Rotational inertia, kg*m^2. A solid disc is 0.5*m*r^2; the default assumes
+	 * a wheel of ~20 kg and is overridden per wheel from the game.
+	 *
+	 * It sets how quickly a tyre can break traction and how long it spins up
+	 * once it has: too low and the wheel snaps to any speed asked of it, which
+	 * is the no-slip behaviour this replaces.
+	 */
+	float inertia;
 	float rollInfluence;
 	float antiSquat;
 	float suspensionRejectAngle;
@@ -1409,6 +1430,47 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 		Wheel* w = &v->wheels[i];
 		b3Vec3 vel = b3Body_GetWorldPointVelocity( v->chassis, w->info.hardPointWs );
 
+		if ( w->inertia <= 0.0f )
+		{
+			// Solid disc, ~20 kg. Only a default: the game sets this per wheel.
+			w->inertia = 0.5f * 20.0f * w->radius * w->radius;
+		}
+
+		/*
+		 * The wheel is its own body about one axis, and this integrates it.
+		 *
+		 * Drive torque spins it up; the friction the tyre actually delivered
+		 * spins it back down; the brake resists rotation. Whatever is left over
+		 * IS wheel spin — the Uncharted 4 talk's "the leftover difference is
+		 * applied back to the wheel as additional rotational velocity because
+		 * the tire is slipping".
+		 *
+		 * The previous version simply defined the wheel's speed as the ground's,
+		 * which is the same as declaring that tyres never slip. Everything the
+		 * talk builds downstream — engine RPM from the fastest-spinning wheel,
+		 * differentials, the slip feedback loop — needs this number to be able
+		 * to disagree with the chassis.
+		 */
+		float driveTorque = w->engineForce * w->radius;
+		// forwardImpulse is what the contact actually delivered over the tick;
+		// as a force it is the reaction the ground applied back to the tyre.
+		float frictionTorque = ( w->forwardImpulse * SafeInv( dt ) ) * w->radius;
+
+		w->angularVelocity += ( driveTorque - frictionTorque ) * SafeInv( w->inertia ) * dt;
+
+		if ( w->brake > 0.0f )
+		{
+			// A brake resists rotation and cannot reverse it, so it is clamped
+			// at the speed that brings the wheel to a stop this tick.
+			float brakeDeltaV = ( w->brake * w->radius ) * SafeInv( w->inertia ) * dt;
+			float magnitude = fabsf( w->angularVelocity );
+			if ( brakeDeltaV > magnitude )
+			{
+				brakeDeltaV = magnitude;
+			}
+			w->angularVelocity -= ( w->angularVelocity < 0.0f ? -1.0f : 1.0f ) * brakeDeltaV;
+		}
+
 		if ( w->info.isInContact )
 		{
 			b3Quat rot = b3Body_GetRotation( v->chassis );
@@ -1416,16 +1478,22 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 			float proj = b3Dot( fwd, w->info.contactNormalWs );
 			fwd = Sub3( fwd, Scale( w->info.contactNormalWs, proj ) );
 
-			float proj2 = b3Dot( fwd, vel );
-			w->deltaRotation = ( proj2 * dt ) / w->radius;
-			w->rotation += w->deltaRotation;
-		}
-		else
-		{
-			w->rotation += w->deltaRotation;
+			// The spin a rolling tyre would have at this ground speed.
+			float rollingOmega = b3Dot( fwd, vel ) * SafeInv( w->radius );
+
+			// A tyre that still has grip is coupled to the ground: the talk's
+			// "apply an opposing braking force to the wheel's angular velocity so
+			// it slows toward the rotational velocity required by the vehicle's
+			// movement". skidInfo is exactly how much of the friction circle is
+			// left, so it is how hard that coupling pulls — at full grip the
+			// wheel is dragged onto the rolling speed within the tick, and a tyre
+			// that has broken traction is left to spin.
+			float grip = w->skidInfo > 1.0f ? 1.0f : ( w->skidInfo < 0.0f ? 0.0f : w->skidInfo );
+			w->angularVelocity += ( rollingOmega - w->angularVelocity ) * grip;
 		}
 
-		w->deltaRotation *= 0.99f; // damping of rotation when not in contact
+		w->deltaRotation = w->angularVelocity * dt;
+		w->rotation += w->deltaRotation;
 	}
 }
 
@@ -1809,6 +1877,8 @@ int b3w_vehicle_add_wheel( int handle, float cx, float cy, float cz, float dx, f
 	w->dampingCompression = 0.83f;
 	w->dampingRelaxation = 0.88f;
 	w->maxSuspensionTravel = 5.0f;
+	w->angularVelocity = 0.0f;
+	w->inertia = 0.0f; // derived from the radius on first use
 	w->sideFrictionStiffness = 1.0f;
 	w->frictionSlip = 10.5f;
 	w->maxSuspensionForce = 6000.0f;
@@ -1845,6 +1915,7 @@ WHEEL_SETTER( b3w_vehicle_set_suspension_compression, dampingCompression )
 WHEEL_SETTER( b3w_vehicle_set_suspension_relaxation, dampingRelaxation )
 WHEEL_SETTER( b3w_vehicle_set_suspension_rest_length, suspensionRestLength )
 WHEEL_SETTER( b3w_vehicle_set_max_suspension_travel, maxSuspensionTravel )
+WHEEL_SETTER( b3w_vehicle_set_wheel_inertia, inertia )
 WHEEL_SETTER( b3w_vehicle_set_max_suspension_force, maxSuspensionForce )
 WHEEL_SETTER( b3w_vehicle_set_anti_squat, antiSquat )
 
@@ -1899,7 +1970,7 @@ void b3w_vehicle_read_wheels( int handle, float* out )
 		o[16] = w->info.lastAxleWs.x;
 		o[17] = w->info.lastAxleWs.y;
 		o[18] = w->info.lastAxleWs.z;
-		o[19] = w->rotation;
+		o[19] = w->angularVelocity;
 	}
 }
 
