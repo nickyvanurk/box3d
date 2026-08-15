@@ -1084,6 +1084,20 @@ b3CastOutput b3ShapeCast( const b3ShapeCastPairInput* input )
 					b3Vec3 c1 = b3MulAdd( distanceOutput.pointA, input->proxyA.radius, distanceOutput.normal );
 					b3Vec3 c2 = b3MulAdd( distanceOutput.pointB, -input->proxyB.radius, distanceOutput.normal );
 					output.point = b3Lerp( c1, c2, 0.5f );
+
+					// The separating axis, so an overlapped cast still says WHICH WAY
+					// OUT. It was left at zero here, and a zero normal is worse than
+					// no hit at all: every caller that judges a surface by its normal
+					// throws the contact away. A vehicle wheel overtaken by rising
+					// ground — which is what happens driving up a hill faster than
+					// the suspension can travel — was reported as touching nothing,
+					// got no suspension force, and stayed buried in the hillside.
+					//
+					// Jolt does the same thing for the same reason: its wheel cast
+					// sets mReturnDeepestPoint and takes the contact normal from
+					// -penetrationAxis, precisely so an embedded wheel can be pushed
+					// back out.
+					output.normal = distanceOutput.normal;
 					return output;
 				}
 			}
