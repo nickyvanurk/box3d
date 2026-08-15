@@ -78,6 +78,15 @@ static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
 typedef struct
 {
 	b3Vec3 normalWs;
+	/**
+	 * The surface's OWN normal, kept because `normalWs` is deliberately a lie.
+	 *
+	 * Forcing every contact normal to the suspension direction is what stops
+	 * bumps stealing momentum, but the talk is equally clear about its cost:
+	 * "the wheels no longer respond perfectly to collision, so we reimplement
+	 * wheel collision response ourselves". Doing that needs the truth back.
+	 */
+	b3Vec3 surfaceNormalWs;
 	b3Pos pointWs;
 	float suspensionLength;
 	float clippedInvContactDotSuspension;
@@ -108,6 +117,18 @@ typedef struct
 	b3Vec3 groundNormalWs;
 	b3Pos contactPointWs;
 	float suspensionLength;
+	/**
+	 * Where the wheel is DRAWN, which is not where the spring thinks it is.
+	 *
+	 * The spring measures along the suspension against a plane whose normal is
+	 * forced to the suspension axis. On a slope the real ground rises across the
+	 * tyre, so its lower edge ends up under the surface — wheels visibly sunk
+	 * into the floor, and worse the faster you go. This is the talk's own
+	 * remedy: find the deepest point of the tyre against the REAL surface and
+	 * lift the wheel along the suspension until it tangents the ground, never
+	 * past the hard point. Placement only — the spring keeps `suspensionLength`.
+	 */
+	float placedSuspensionLength;
 	b3Pos hardPointWs;
 	bool isInContact;
 	/** The kept contacts, nearest first. Index 0 mirrors the singular fields
@@ -590,6 +611,7 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 	w->info.groundBody = -1;
 	w->info.groundBodyId = b3_nullBodyId;
 	w->info.contactCount = 0;
+	w->info.placedSuspensionLength = w->info.suspensionLength;
 
 	if ( accepted )
 	{
@@ -620,6 +642,7 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 			// is rejected on its own geometry, not on this one. What changes here
 			// is only the direction the suspension pushes once a surface has been
 			// accepted, which is the one thing the talk says to lie about.
+			contact->surfaceNormalWs = hit->normal;
 			contact->normalWs = axial;
 
 			float rawLength = hit->fraction * maxToi - offset;
@@ -675,6 +698,53 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 		w->info.isInContact = true;
 		w->info.groundBody = cast.hits[0].body;
 		w->info.groundBodyId = cast.hits[0].bodyId;
+
+		/*
+		 * Lift the wheel out of the ground it is really touching.
+		 *
+		 * The deepest point of the tyre in the direction the surface pushes: a
+		 * cylinder's support point along -N, which is its rim on the radial side
+		 * plus the near face along the axle. The talk builds this from two
+		 * candidate corners P1/P2 and takes whichever is deeper; a support point
+		 * is the same answer for a shape that is round rather than boxy.
+		 *
+		 * The separation cannot be applied along N — that would pull the wheel
+		 * out of line with its own suspension — so it is projected onto the
+		 * suspension direction, exactly as the talk says, and clamped so the
+		 * wheel can never travel up past its hard point.
+		 */
+		{
+			b3Vec3 n = primary->surfaceNormalWs;
+			b3Vec3 a = TryNormalize( w->wheelAxleWs, w->wheelAxleWs );
+			float nDotA = b3Dot( n, a );
+
+			b3Vec3 radial = Sub3( n, Scale( a, nDotA ) );
+			float radialLen = b3Length( radial );
+			b3Vec3 radialDir = radialLen > 1.0e-4f ? Scale( radial, 1.0f / radialLen ) : B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f };
+
+			b3Pos centerNow = AddPosVec( w->info.hardPointWs, Scale( w->wheelDirectionWs, w->info.suspensionLength ) );
+			b3Vec3 toDeepest = Add3( Scale( radialDir, -w->radius ), Scale( a, nDotA > 0.0f ? -w->width * 0.5f : w->width * 0.5f ) );
+			b3Pos deepest = AddPosVec( centerNow, toDeepest );
+
+			float penetration = b3Dot( n, SubPos( primary->pointWs, deepest ) );
+
+			float placed = w->info.suspensionLength;
+			if ( penetration > 0.0f )
+			{
+				// How far along the suspension buys one metre out of the surface.
+				float denom = -b3Dot( n, w->wheelDirectionWs );
+				if ( denom < 0.1f )
+				{
+					denom = 0.1f;
+				}
+				placed -= penetration / denom;
+				if ( placed < 0.0f )
+				{
+					placed = 0.0f;
+				}
+			}
+			w->info.placedSuspensionLength = placed;
+		}
 
 		w->info.lastToi = cast.hits[0].fraction * maxToi;
 		w->info.lastCastOffset = offset;
@@ -1335,7 +1405,7 @@ static void UpdateWheelTransforms( Vehicle* v, int wheelId )
 	b3Quat steerRot = b3MakeQuatFromAxisAngle( TryNormalize( steerAxis, steerAxis ), w->steering );
 	w->wheelAxleWs = b3RotateVector( steerRot, b3RotateVector( t.q, w->axleCs ) );
 
-	w->center = AddPosVec( w->info.hardPointWs, Scale( w->wheelDirectionWs, w->info.suspensionLength ) );
+	w->center = AddPosVec( w->info.hardPointWs, Scale( w->wheelDirectionWs, w->info.placedSuspensionLength ) );
 }
 
 /**
@@ -1949,7 +2019,7 @@ void b3w_vehicle_read_wheels( int handle, float* out )
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
 		Wheel* w = &v->wheels[i];
-		float* o = out + i * 20;
+		float* o = out + i * 21;
 
 		o[0] = w->info.isInContact ? 1.0f : 0.0f;
 		o[1] = w->info.suspensionLength;
@@ -1971,6 +2041,7 @@ void b3w_vehicle_read_wheels( int handle, float* out )
 		o[17] = w->info.lastAxleWs.y;
 		o[18] = w->info.lastAxleWs.z;
 		o[19] = w->angularVelocity;
+		o[20] = w->info.placedSuspensionLength;
 	}
 }
 
