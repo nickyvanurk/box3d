@@ -594,12 +594,29 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 	b3Vec3 axle = TryNormalize( w->wheelAxleWs, B3_LITERAL( b3Vec3 ){ 0.0f, 1.0f, 0.0f } );
 	b3Vec3 direction = TryNormalize( w->wheelDirectionWs, w->wheelDirectionWs );
 
-	// Start one radius behind the hard point so the prism's near cap sits at
-	// it, and grow the cast length by the same offset so detection range is
-	// unchanged. suspension_length = toi − offset.
+	/*
+	 * Start WELL above the hard point, not just clear of it.
+	 *
+	 * The talk is specific about this and about why: "another tweak was to cast
+	 * the ray from above the hard point — in this case well above the hard
+	 * point. There are cases where the nose of the vehicle would spend a frame
+	 * already in collision and get stuck. Moving the start of the cast up made
+	 * sure that never happens."
+	 *
+	 * One radius was not enough. Climbing a slope the ground rises faster than
+	 * the suspension can travel — 0.375 m per tick at 15 m/s on a 60% grade,
+	 * three times the whole travel — so the wheel begins the next cast already
+	 * inside the terrain. Box3D answers an overlapped cast with fraction 0 and
+	 * gives up on continuous collision, which is the wheel getting stuck exactly
+	 * as described.
+	 *
+	 * Starting a full suspension travel higher costs nothing but cast length:
+	 * the offset is subtracted straight back out of the time of impact, so the
+	 * suspension length is unchanged for every cast that was already working.
+	 */
 	float r = w->radius;
 	float raylen = w->suspensionRestLength + r;
-	float offset = r;
+	float offset = 2.0f * r + w->maxSuspensionTravel;
 
 	b3Pos castStart = AddPosVec( source, Scale( direction, -offset ) );
 
