@@ -1926,6 +1926,45 @@ int b3w_debug_draw( int handle, float* verts, float* colors, int capacityVerts, 
 					PushSegment( &sink, ToWorld( transform, a ), ToWorld( transform, b ) );
 				}
 			}
+			else if ( shapeType == b3_meshShape )
+			{
+				/*
+				 * Terrain, and anything else built from triangles.
+				 *
+				 * Absent until now, so F3 drew every collider EXCEPT the ground —
+				 * which is the one place a wrong collider is invisible from inside
+				 * the game. A day was spent guessing whether terrain colliders
+				 * existed while the overlay could have answered it in a second.
+				 *
+				 * One edge per triangle side, drawn from the mesh's own vertex and
+				 * triangle arrays. Terrain is thousands of triangles per chunk, so
+				 * the vertex budget is what stops this: the sink drops what will
+				 * not fit rather than overrunning it.
+				 */
+				b3Mesh mesh = b3Shape_GetMesh( shapes[s] );
+				const b3MeshData* data = mesh.data;
+				if ( data != NULL )
+				{
+					const uint8_t* base = (const uint8_t*)data;
+					const b3Vec3* verts = (const b3Vec3*)( base + data->vertexOffset );
+					const b3MeshTriangle* tris = (const b3MeshTriangle*)( base + data->triangleOffset );
+
+					for ( int t = 0; t < data->triangleCount; ++t )
+					{
+						b3Vec3 a = verts[tris[t].index1];
+						b3Vec3 b = verts[tris[t].index2];
+						b3Vec3 c = verts[tris[t].index3];
+
+						a.x *= mesh.scale.x, a.y *= mesh.scale.y, a.z *= mesh.scale.z;
+						b.x *= mesh.scale.x, b.y *= mesh.scale.y, b.z *= mesh.scale.z;
+						c.x *= mesh.scale.x, c.y *= mesh.scale.y, c.z *= mesh.scale.z;
+
+						PushSegment( &sink, ToWorld( transform, a ), ToWorld( transform, b ) );
+						PushSegment( &sink, ToWorld( transform, b ), ToWorld( transform, c ) );
+						PushSegment( &sink, ToWorld( transform, c ), ToWorld( transform, a ) );
+					}
+				}
+			}
 			else if ( shapeType == b3_hullShape )
 			{
 				// Boxes are hulls here, so this covers every block and every
