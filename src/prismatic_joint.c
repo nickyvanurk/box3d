@@ -483,8 +483,22 @@ void b3SolvePrismaticJoint( b3JointSim* base, b3StepContext* context, bool useBi
 
 	if ( joint->enableMotor && fixedRotation == false )
 	{
+		// A motor may not command travel it does not have. The motor is a rigid
+		// velocity constraint and the limit is an inequality solved after it, so
+		// a motor still driving outward at the stop spends the whole substep
+		// fighting the limit — and in a chain the two settle past the stop
+		// instead of at it. Clamping the target to the remaining travel makes a
+		// piston at full extension simply stop, which is what it does in life.
+		float motorSpeed = joint->motorSpeed;
+		if ( joint->enableLimit )
+		{
+			float maxOut = ( joint->upperTranslation - jointTranslation ) * context->inv_h;
+			float maxIn = ( joint->lowerTranslation - jointTranslation ) * context->inv_h;
+			motorSpeed = b3ClampFloat( motorSpeed, maxIn, maxOut );
+		}
+
 		b3Vec3 vRel = b3Sub( b3Sub( b3Add( vB, b3Cross( wB, rB ) ), vA ), b3Cross( wA, b3Add( rA, d ) ) );
-		float cdot = b3Dot( vRel, jointAxis ) - joint->motorSpeed;
+		float cdot = b3Dot( vRel, jointAxis ) - motorSpeed;
 
 		float deltaImpulse = -axialMass * cdot;
 		float newImpulse = joint->motorImpulse + deltaImpulse;
@@ -523,9 +537,13 @@ void b3SolvePrismaticJoint( b3JointSim* base, b3StepContext* context, bool useBi
 				}
 				else if ( useBias )
 				{
-					bias = base->constraintSoftness.biasRate * C;
-					massScale = base->constraintSoftness.massScale;
-					impulseScale = base->constraintSoftness.impulseScale;
+					// A violated limit is solved HARD, not through constraintSoftness.
+					// A motor is a rigid velocity constraint, so a soft stop and a
+					// saturated motor reach an equilibrium wherever the softness
+					// yields — the joint parks past its own stop and stays there,
+					// which is a piston chain visibly pulling apart. Full positional
+					// correction, the same bias the speculative branch above uses.
+					bias = C * context->inv_h;
 				}
 
 				b3Vec3 vRel = b3Sub( b3Sub( b3Add( vB, b3Cross( wB, rB ) ), vA ), b3Cross( wA, b3Add( rA, d ) ) );
@@ -566,9 +584,8 @@ void b3SolvePrismaticJoint( b3JointSim* base, b3StepContext* context, bool useBi
 				}
 				else if ( useBias )
 				{
-					bias = base->constraintSoftness.biasRate * C;
-					massScale = base->constraintSoftness.massScale;
-					impulseScale = base->constraintSoftness.impulseScale;
+					// Hard, for the reason given on the lower limit above.
+					bias = C * context->inv_h;
 				}
 
 				// sign flipped on Cdot
