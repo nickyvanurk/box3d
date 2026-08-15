@@ -59,9 +59,10 @@ static const float STATIC_FRICTION_MAX_SPEED = 0.5f;
 /** Fraction of anchor drift undone per step — the usual Baumgarte trade. */
 static const float STATIC_FRICTION_ERP = 0.2f;
 
-/** Fraction of a bump-stop overshoot removed per second. Firm enough to look
- *  rigid, soft enough not to launch a chassis that is briefly deep. */
+/** Fraction of a bump-stop overshoot removed per STEP — which is what the
+ *  formula below implements, and what the comment used to deny. */
 static const float BUMP_STOP_ERP = 0.6f;
+
 /** Furthest a stuck contact may drift before the tyre is treated as having slipped. */
 static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
 
@@ -579,12 +580,26 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 			const WheelHit* hit = &cast.hits[c];
 			WheelContact* contact = &w->info.contacts[c];
 
-			// Suspension and friction both use the real ground normal so the
-			// spring stays aligned with the contact plane on slopes; fall back to
-			// the suspension axis when the hit is more than ~60° off it, which is
-			// what stops the spring shoving the chassis sideways off a vertical
-			// face.
-			contact->normalWs = b3Dot( hit->normal, axial ) > 0.5f ? hit->normal : axial;
+			// EVERY contact normal is the suspension direction. Not the surface's.
+			//
+			// Straight from the Uncharted 4 talk, which is explicit about it:
+			// "We didn't like the collision response to surfaces whose normal
+			// isn't aligned with the suspension direction. Hitting a bump could
+			// cause the vehicle to completely lose momentum... so we fake it and
+			// tell Havok that all normals are in the direction of the suspension.
+			// This produces a much smoother, player-favoring response."
+			//
+			// Using the true normal within 60 degrees, as this did, means every
+			// facet of the ground tilts the spring force and steals a little
+			// forward momentum. On a dual-contoured collider — flat plates meeting
+			// at creases — that is a bump at every crease, including across ground
+			// that looks and IS flat. The surface is not rough; the response was.
+			//
+			// Drivability still reads the REAL normal, in the cast callback: a wall
+			// is rejected on its own geometry, not on this one. What changes here
+			// is only the direction the suspension pushes once a surface has been
+			// accepted, which is the one thing the talk says to lie about.
+			contact->normalWs = axial;
 
 			float rawLength = hit->fraction * maxToi - offset;
 			StoreSuspensionLength( contact, rawLength, maxSuspensionLength );
@@ -725,6 +740,28 @@ static void UpdateSuspension( Vehicle* v, float chassisMass, float dt )
 			// dot(n, dir) is a multiply by it here.
 			float gap = b3Dot( contact->normalWs, SubPos( hardPointNow, contact->pointWs ) ) - contact->planeOffset;
 			StoreSuspensionLength( contact, gap * contact->clippedInvContactDotSuspension, maxSuspensionLength );
+
+
+			// Carry the contact point along under the wheel as the chassis moves.
+			//
+			// The cast runs ONCE per tick; the substeps then drive the chassis
+			// forward. At 15 m/s and 24 Hz that is 0.625 m per tick, so by the end
+			// of one the spring was still pushing at a point half a metre behind
+			// its own wheel, with a lever arm that grew all tick and snapped back
+			// on the next cast. That is a 24 Hz pitching oscillation on ground
+			// that is perfectly flat — "bumps everywhere" — and in the debug
+			// overlay it draws as the chassis running ahead of its wheels.
+			//
+			// Sliding WITHIN the contact plane is neutral by construction: an
+			// in-plane vector dotted with the normal is zero, so `gap` above, the
+			// end stop and the bump stop are all untouched. Only the lever arm and
+			// the point the damper samples change — from stale to current. Same
+			// argument the cast already makes when it centres the witness point,
+			// applied at the rate the chassis actually moves.
+			b3Pos centerNow = AddPosVec( hardPointNow, Scale( w->wheelDirectionWs, contact->suspensionLength ) );
+			b3Vec3 toCenterNow = SubPos( centerNow, contact->pointWs );
+			b3Vec3 inPlane = Sub3( toCenterNow, Scale( contact->normalWs, b3Dot( contact->normalWs, toCenterNow ) ) );
+			contact->pointWs = AddPosVec( contact->pointWs, inPlane );
 
 			float lengthDiff = w->suspensionRestLength - contact->suspensionLength;
 			float force = w->suspensionStiffness * lengthDiff * contact->clippedInvContactDotSuspension;
@@ -1588,11 +1625,6 @@ void b3w_vehicle_solve( Vehicle* v, float h )
 // Vehicles live here rather than in the shim so the shim stays a translation
 // layer: it turns JavaScript's integers into ids and calls straight through.
 // ---------------------------------------------------------------------------
-
-/** Fraction of a bump-stop overshoot removed per second. Matches the static
- *  friction anchor's role: firm enough to look rigid, soft enough not to launch
- *  a chassis that is briefly deep. */
-#define BUMP_STOP_ERP 0.6f
 
 #define B3W_MAX_VEHICLES 64
 
