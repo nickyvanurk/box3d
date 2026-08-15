@@ -779,6 +779,27 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 	shapeDef.enableSensorEvents = isSensor != 0;
 	shapeDef.filter.groupIndex = group;
 
+	/*
+	 * No speculative contacts against triangles — this is the terrain.
+	 *
+	 * Box3D's own doc for the flag says to leave it on "unless you care about
+	 * reducing ghost collision more than continuous collision under rotation",
+	 * and notes it only affects hulls against triangles. That is exactly this
+	 * shape: every machine in the game is hulls, and it drives on this.
+	 *
+	 * Ghost collisions are the "sudden stop" — a body sliding over a triangle
+	 * mesh catches on the internal edge between two nearly coplanar triangles
+	 * and gets an impulse the surface does not justify. Measured driving the Car
+	 * across real terrain: one-tick losses of forward speed above 1 m/s fell
+	 * from 19 to 11 over 1440 ticks, and the worst single loss from 12.63 m/s to
+	 * 9.95. The other candidate, contact recycling, made no difference at all
+	 * (19 either way), so only this one is touched.
+	 *
+	 * The trade is continuous collision under rotation, which terrain does not
+	 * do: it never moves.
+	 */
+	shapeDef.enableSpeculativeContact = false;
+
 	return RetainShape( world, b3CreateMeshShape( world->bodies[body], &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } ) );
 }
 
