@@ -2121,7 +2121,7 @@ void b3w_vehicle_read_wheels( int handle, float* out )
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
 		Wheel* w = &v->wheels[i];
-		float* o = out + i * 21;
+		float* o = out + i * 22;
 
 		o[0] = w->info.isInContact ? 1.0f : 0.0f;
 		o[1] = w->info.suspensionLength;
@@ -2144,6 +2144,10 @@ void b3w_vehicle_read_wheels( int handle, float* out )
 		o[18] = w->info.lastAxleWs.z;
 		o[19] = w->angularVelocity;
 		o[20] = w->info.placedSuspensionLength;
+		// How much of the friction circle this tyre has left, 1 = gripping,
+		// approaching 0 as it slides. The one number worth driving smoke, skid
+		// marks and tyre squeal from: it saturates smoothly instead of flipping.
+		o[21] = w->skidInfo;
 	}
 }
 
