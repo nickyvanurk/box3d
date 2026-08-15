@@ -49,6 +49,16 @@ typedef struct World
 	 * once. One slot, one meaning.
 	 */
 	uint32_t* bodyOwner;
+	/**
+	 * Bodies whose contacts are DETECTED but never solved — the vehicle chassis.
+	 *
+	 * The game resolves these positionally after the step (`depenetrateChassis`)
+	 * so a machine SLIDES along what it hits instead of being stopped by an
+	 * impulse. Rapier did this through filterContactPair returning EMPTY; this is
+	 * the same thing through Box3D's pre-solve callback, which returns false to
+	 * drop a contact from the solver while still reporting it.
+	 */
+	uint8_t* detectOnly;
 	int bodyCount;
 	int bodyCapacity;
 
@@ -98,6 +108,8 @@ static void ReserveBodies( World* world, int needed )
 	world->transforms = (float*)realloc( world->transforms, sizeof( float ) * 7 * capacity );
 	world->bodyOwner = (uint32_t*)realloc( world->bodyOwner, sizeof( uint32_t ) * capacity );
 	memset( world->bodyOwner + world->bodyCapacity, 0, sizeof( uint32_t ) * (size_t)( capacity - world->bodyCapacity ) );
+	world->detectOnly = (uint8_t*)realloc( world->detectOnly, sizeof( uint8_t ) * capacity );
+	memset( world->detectOnly + world->bodyCapacity, 0, sizeof( uint8_t ) * (size_t)( capacity - world->bodyCapacity ) );
 	world->bodyCapacity = capacity;
 }
 
@@ -239,6 +251,7 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
 	int body = world->bodyCount++;
 	world->bodies[body] = b3CreateBody( world->id, &def );
 	world->bodyOwner[body] = 0;
+	world->detectOnly[body] = 0;
 
 	// The handle rides ON the body, so a query result can name it without a
 	// reverse scan of the table. Offset by one so that a body whose user data
@@ -1106,6 +1119,103 @@ void b3w_set_contact_tuning( int handle, float hertz, float dampingRatio, float 
 	}
 
 	b3World_SetContactTuning( world->id, hertz, dampingRatio, pushSpeed );
+}
+
+/** Defined below with the ray-cast helpers — the tagged-userData scheme. */
+static int BodyIndexOfShape( b3ShapeId shapeId );
+
+/**
+ * Drop a contact from the solver while still reporting it.
+ *
+ * Returning false here is Box3D's "detect but do not solve". The game marks
+ * vehicle chassis bodies and resolves their contacts positionally after the
+ * step, so a machine slides along what it hits rather than being stopped dead
+ * by an impulse — which is the jarring stop when a car clips terrain at an
+ * angle.
+ *
+ * Chassis vs chassis is left to the solver deliberately: two machines colliding
+ * should push each other, and the positional pass only knows how to move one.
+ */
+static bool PreSolveDetectOnly( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Vec3 normal, void* context )
+{
+	(void)point;
+	(void)normal;
+
+	World* world = (World*)context;
+	int a = BodyIndexOfShape( shapeIdA );
+	int b = BodyIndexOfShape( shapeIdB );
+
+	bool aDetect = a >= 0 && a < world->bodyCapacity && world->detectOnly[a] != 0;
+	bool bDetect = b >= 0 && b < world->bodyCapacity && world->detectOnly[b] != 0;
+
+	if ( aDetect && bDetect )
+	{
+		return true;
+	}
+
+	return !( aDetect || bDetect );
+}
+
+/**
+ * Mark the bodies whose contacts the solver must not resolve.
+ *
+ * Pre-solve events are per SHAPE, so every shape on a marked body has to opt
+ * in; the callback itself is registered once, lazily, because a world with no
+ * vehicles should not pay for it.
+ */
+void b3w_set_detect_only( int handle, int bodiesPtr, int count )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	static bool callbackRegistered = false;
+	if ( callbackRegistered == false )
+	{
+		b3World_SetPreSolveCallback( world->id, PreSolveDetectOnly, world );
+		callbackRegistered = true;
+	}
+
+	const int32_t* src = (const int32_t*)(intptr_t)bodiesPtr;
+
+	for ( int i = 0; i < world->bodyCapacity; ++i )
+	{
+		if ( world->detectOnly[i] == 0 )
+		{
+			continue;
+		}
+		world->detectOnly[i] = 0;
+		if ( world->bodies[i].index1 != 0 && b3Body_IsValid( world->bodies[i] ) )
+		{
+			int shapeCount = b3Body_GetShapeCount( world->bodies[i] );
+			b3ShapeId shapes[64];
+			int n = b3Body_GetShapes( world->bodies[i], shapes, shapeCount < 64 ? shapeCount : 64 );
+			for ( int k = 0; k < n; ++k )
+			{
+				b3Shape_EnablePreSolveEvents( shapes[k], false );
+			}
+		}
+	}
+
+	for ( int i = 0; i < count; ++i )
+	{
+		int body = src[i];
+		if ( body < 0 || body >= world->bodyCapacity || b3Body_IsValid( world->bodies[body] ) == false )
+		{
+			continue;
+		}
+		world->detectOnly[body] = 1;
+
+		int shapeCount = b3Body_GetShapeCount( world->bodies[body] );
+		b3ShapeId shapes[64];
+		int n = b3Body_GetShapes( world->bodies[body], shapes, shapeCount < 64 ? shapeCount : 64 );
+		for ( int k = 0; k < n; ++k )
+		{
+			b3Shape_EnablePreSolveEvents( shapes[k], true );
+		}
+	}
 }
 
 void b3w_set_gravity( int handle, float x, float y, float z )
