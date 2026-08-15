@@ -225,6 +225,18 @@ typedef struct
 	float suspensionRelativeVelocity;
 	float wheelSuspensionForce;
 	float skidInfo;
+	/**
+	 * The friction of the ground under this tyre, from the shape it is standing
+	 * on. 1.0 when it is not standing on anything.
+	 *
+	 * The talk keeps tyre and surface separate and multiplies them: "Define
+	 * friction for both the tires and the surfaces they drive on... Calculate
+	 * the coefficient of friction by multiplying tire friction by surface
+	 * friction." A tyre grade is then a property of the build and the ground is
+	 * a property of the world, which is what lets ice be slippery for everyone
+	 * without touching a single vehicle.
+	 */
+	float surfaceFriction;
 } Wheel;
 
 typedef struct
@@ -398,6 +410,8 @@ static float SafeInv( float x )
 typedef struct
 {
 	float fraction;
+	/** The friction of the SURFACE that was hit — mud, rock, road. */
+	float surfaceFriction;
 	b3Vec3 normal;
 	b3Pos point;
 	int body;
@@ -519,7 +533,12 @@ static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fr
 		return -1.0f;
 	}
 
-	WheelHit hit = { .fraction = fraction, .normal = normal, .point = point, .body = body, .bodyId = hitBody };
+	WheelHit hit = { .fraction = fraction,
+					 .surfaceFriction = b3Shape_GetFriction( shapeId ),
+					 .normal = normal,
+					 .point = point,
+					 .body = body,
+					 .bodyId = hitBody };
 	KeepWheelHit( ctx, hit );
 
 	// Keep searching the whole sweep until three slots are full; after that
@@ -612,6 +631,7 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 	w->info.groundBodyId = b3_nullBodyId;
 	w->info.contactCount = 0;
 	w->info.placedSuspensionLength = w->info.suspensionLength;
+	w->surfaceFriction = 1.0f;
 
 	if ( accepted )
 	{
@@ -745,6 +765,8 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 			}
 			w->info.placedSuspensionLength = placed;
 		}
+
+		w->surfaceFriction = cast.hits[0].surfaceFriction > 0.0f ? cast.hits[0].surfaceFriction : 1.0f;
 
 		w->info.lastToi = cast.hits[0].fraction * maxToi;
 		w->info.lastCastOffset = offset;
@@ -1251,7 +1273,12 @@ static void UpdateFriction( Vehicle* v, float dt )
 			// against is: the lateral solve cancels velocity outright and the
 			// longitudinal impulses accumulate over the substeps to engineForce
 			// times the tick. Both sides of this test are now tick-scale.
-			float maxImp = w->wheelSuspensionForce * v->stepDt * w->frictionSlip;
+			// Tyre grade times what it is standing on, times the load it carries —
+			// the talk's "multiply tire friction by surface friction", then "multiply
+			// this coefficient by the normal force to obtain the maximum friction
+			// force". The surface half was missing, so every ground drove like every
+			// other and a mud slope gripped exactly like tarmac.
+			float maxImp = w->wheelSuspensionForce * v->stepDt * w->frictionSlip * w->surfaceFriction;
 			float maxImpSquared = maxImp * maxImp;
 
 			w->forwardImpulse = rollingFriction;
