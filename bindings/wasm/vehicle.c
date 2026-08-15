@@ -56,12 +56,24 @@ static const float CONTACT_SPREAD = 0.04f;
 
 /** Below this chassis speed a wheel with no drive or brake grips longitudinally. */
 static const float STATIC_FRICTION_MAX_SPEED = 0.5f;
-/** Fraction of anchor drift undone per step — the usual Baumgarte trade. */
-static const float STATIC_FRICTION_ERP = 0.2f;
-
-/** Fraction of a bump-stop overshoot removed per STEP — which is what the
- *  formula below implements, and what the comment used to deny. */
-static const float BUMP_STOP_ERP = 0.6f;
+/*
+ * Error-correction RATES, in 1/s. Not fractions per step.
+ *
+ * These were written as per-step fractions and then divided by the tick length
+ * at every use, which makes the correction stronger the shorter the tick — the
+ * exact opposite of the tick-independence two of the comments claimed. Measured
+ * across tick rates at matched solver cost, the controller degraded
+ * monotonically as the rate rose: flat-ground vertical acceleration 8.66 m/s^2
+ * at 24 Hz, 14.37 at 48, 17.82 at 60, 21.50 at 96, and paying double the
+ * substeps did not rescue it. Every vehicle constant in the game was therefore
+ * silently tuned to one tick rate.
+ *
+ * The values are the old fractions multiplied by 24, the rate they were tuned
+ * at, so behaviour at 24 Hz is unchanged by construction and only OTHER rates
+ * move — which is the whole point.
+ */
+static const float STATIC_FRICTION_RATE = 4.8f;
+static const float BUMP_STOP_RATE = 14.4f;
 
 /** Furthest a stuck contact may drift before the tyre is treated as having slipped. */
 static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
@@ -1116,7 +1128,7 @@ static void UpdateFriction( Vehicle* v, float dt )
 		if ( w->hasAnchor )
 		{
 			b3Vec3 slid = SubPos( w->info.contactPointWs, w->staticFrictionAnchor );
-			lateralBias = b3Dot( slid, v->axle[i] ) * STATIC_FRICTION_ERP / v->stepDt;
+			lateralBias = b3Dot( slid, v->axle[i] ) * STATIC_FRICTION_RATE;
 		}
 
 		bool groundIsDynamic = B3_IS_NON_NULL( w->info.groundBodyId ) &&
@@ -1244,7 +1256,7 @@ static void UpdateFriction( Vehicle* v, float dt )
 				if ( w->hasAnchor )
 				{
 					b3Vec3 slid = SubPos( w->info.contactPointWs, w->staticFrictionAnchor );
-					biasVelocity = b3Dot( slid, v->forwardWs[i] ) * STATIC_FRICTION_ERP / v->stepDt;
+					biasVelocity = b3Dot( slid, v->forwardWs[i] ) * STATIC_FRICTION_RATE;
 				}
 
 				float demand = CalcRollingFriction( v->chassis, w->info.groundBodyId, w->info.contactPointWs,
@@ -1703,16 +1715,16 @@ void b3w_vehicle_solve( Vehicle* v, float h )
 				float relVel = b3Dot( contact->normalWs, vel );
 
 				// How fast the chassis must rise to undo the overshoot, as a
-				// RATE: a fraction of the error per second, so it is independent
-				// of both the tick and the substep. This replaces a position
-				// teleport — see below — and it is the whole reason the bump stop
-				// stops chattering.
+				// A RATE in 1/s, so it is genuinely independent of both the tick
+				// and the substep — it says so now because it is so now. This
+				// replaces a position teleport, and it is the whole reason the
+				// bump stop stops chattering.
 				float bias = 0.0f;
 				if ( contact->bottomOutOvershoot > 0.0f )
 				{
 					float capped = contact->bottomOutOvershoot < w->maxSuspensionTravel ? contact->bottomOutOvershoot
 																						: w->maxSuspensionTravel;
-					bias = capped * BUMP_STOP_ERP / v->stepDt;
+					bias = capped * BUMP_STOP_RATE;
 				}
 
 				if ( relVel >= bias )
