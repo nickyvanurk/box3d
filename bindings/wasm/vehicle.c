@@ -75,6 +75,28 @@ static const float STATIC_FRICTION_MAX_SPEED = 0.5f;
 static const float STATIC_FRICTION_RATE = 4.8f;
 static const float BUMP_STOP_RATE = 14.4f;
 
+/**
+ * Sideways contact speed at which a tyre is treated as sliding rather than
+ * gripping — the handoff between static and kinetic friction.
+ *
+ * Below it the lateral constraint holds the tyre exactly where it is, which is
+ * what keeps parked machines still. Above it the slip curve takes over and grip
+ * fades progressively, which is what allows a drift.
+ */
+static const float LATERAL_SLIP_ONSET = 0.5f;
+
+/**
+ * Converts `sideFrictionStiffness` from the constraint's units into the curve's.
+ *
+ * One authored number feeds both models and they do not mean the same thing:
+ * for the constraint it scales a velocity-cancelling impulse, for the curve a
+ * FORCE per unit slip. Raising the shared constant to suit the curve made the
+ * constraint 12x too strong and parked machines began sliding again — the same
+ * bug from the other end — so the conversion lives here, on the curve's side
+ * only.
+ */
+static const float SLIP_STIFFNESS_GAIN = 48.0f;
+
 /** Furthest a stuck contact may drift before the tyre is treated as having slipped. */
 static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
 
@@ -1134,18 +1156,64 @@ static void UpdateFriction( Vehicle* v, float dt )
 		bool groundIsDynamic = B3_IS_NON_NULL( w->info.groundBodyId ) &&
 							   b3Body_GetType( w->info.groundBodyId ) == b3_dynamicBody;
 
-		if ( groundIsDynamic )
+		/*
+		 * Lateral grip from the tyre's SLIP ANGLE, per the Uncharted 4 talk:
+		 * "The lateral force is calculated using a lateral slip coefficient based
+		 * on lateralVelocity / forwardVelocity. Multiply this by the normal force
+		 * to obtain the lateral force."
+		 *
+		 * Why it is worth having: cancelling lateral velocity outright makes a
+		 * tyre binary. It holds perfectly, then the friction circle breaks and it
+		 * lets go all at once, with no band in between where the car is sideways
+		 * and still steering. That band is what drifting is.
+		 *
+		 * THE SPLIT IS PER TYRE, ON ITS OWN SLIDING SPEED — not on how fast the
+		 * chassis happens to be going. A slip-ratio force is proportional to how
+		 * fast the contact is already sliding, so it cannot hold anything at
+		 * rest: gate it on chassis speed and a machine parked on a slope creeps,
+		 * and creeping keeps it over any threshold. Measured that way it drifted
+		 * 2.85 m in 10 s and thresholds of 3, 8 and 12 m/s gave 2.85, 2.53 and
+		 * 7.54 — not even monotonic.
+		 *
+		 * A tyre that is not sliding sideways is in STATIC friction and keeps the
+		 * constraint, however fast the car is travelling; one that is sliding is
+		 * in kinetic friction and gets the curve. That is the actual physics, and
+		 * it makes the parked case fall out for free — a machine creeping
+		 * downhill has almost no LATERAL slip, so it never leaves the constraint.
+		 */
+		b3Vec3 velAtContact = b3Body_GetWorldPointVelocity( v->chassis, w->info.contactPointWs );
+		float lateralVel = b3Dot( velAtContact, v->axle[i] );
+		bool sliding = fabsf( lateralVel ) > LATERAL_SLIP_ONSET;
+
+		if ( sliding )
+		{
+			float forwardVel = b3Dot( velAtContact, v->forwardWs[i] );
+
+			// Floored so a wheel that is barely rolling forwards cannot report an
+			// enormous slip ratio.
+			float denom = fabsf( forwardVel );
+			if ( denom < LATERAL_SLIP_ONSET )
+			{
+				denom = LATERAL_SLIP_ONSET;
+			}
+			float slip = lateralVel / denom;
+
+			// The circle below still bounds this, so the curve decides the SHAPE
+			// of the grip and the circle decides its ceiling.
+			w->sideImpulse = -slip * w->wheelSuspensionForce * w->sideFrictionStiffness * SLIP_STIFFNESS_GAIN * dt;
+		}
+		else if ( groundIsDynamic )
 		{
 			w->sideImpulse = ResolveSingleBilateral( v->chassis, w->info.contactPointWs, w->info.groundBodyId,
 													w->info.contactPointWs, v->axle[i], 0.0f );
+			w->sideImpulse *= w->sideFrictionStiffness;
 		}
 		else
 		{
 			w->sideImpulse =
 				ResolveSingleUnilateral( v->chassis, w->info.contactPointWs, v->axle[i], lateralBias );
+			w->sideImpulse *= w->sideFrictionStiffness;
 		}
-
-		w->sideImpulse *= w->sideFrictionStiffness;
 
 		/*
 		 * Share the lateral cancel across wheels ONLY at rest.
