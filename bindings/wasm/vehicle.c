@@ -1245,11 +1245,29 @@ static void UpdateFriction( Vehicle* v, float dt )
 				// the brake for thruster-driven craft (`hasActiveThruster`), and
 				// that zero is what keeps a free wheel from becoming an immovable
 				// anchor and pinning them in place.
-				float maxImpulse = w->brake;
+				/*
+				 * A tyre can never deliver more than its grip, braking included.
+				 *
+				 * This took the LARGER of the brake and the grip, so any brake
+				 * number above the tyre's budget let the wheel cancel the car's
+				 * whole forward velocity outright — braking was a constraint, not
+				 * a force. Measured on the builtin Car from 24 m/s: stopped in
+				 * 0.21 s over 2.2 m, peaking at 16.6 g. A real car manages about
+				 * 1 g and these tyres about 1.5; 16.6 is not a value physics can
+				 * produce, and it is why braking felt like hitting a wall.
+				 *
+				 * A STATIONARY anchored tyre is still held by its full grip —
+				 * that is what stops a parked car sliding downhill, and it is a
+				 * limit rather than a licence, so it stays.
+				 */
+				// dt is the SUBSTEP, not the tick. This budget caps an impulse
+				// applied on every one of the 32 substeps, so charging it a whole
+				// tick's worth each time let a tyre deliver 32 times its own grip.
+				float grip = w->wheelSuspensionForce * dt * w->frictionSlip * w->surfaceFriction;
+				float maxImpulse = w->brake < grip ? w->brake : grip;
 				if ( w->hasAnchor && w->brake > 0.0f )
 				{
-					float grip = w->wheelSuspensionForce * v->stepDt * w->frictionSlip;
-					maxImpulse = maxImpulse > grip ? maxImpulse : grip;
+					maxImpulse = grip;
 				}
 
 				float biasVelocity = 0.0f;
@@ -1273,7 +1291,12 @@ static void UpdateFriction( Vehicle* v, float dt )
 				}
 				else
 				{
-					rollingFriction = ( demand < 0.0f ? -1.0f : 1.0f ) * w->brake;
+					// The tyre has broken traction, so what it still delivers is the
+					// CLAMPED impulse — never the raw brake number. Using w->brake
+					// here meant exceeding the limit applied more force than the
+					// limit allowed, so tightening the cap made braking harsher
+					// instead of gentler: 16.6 g became 28.1 g.
+					rollingFriction = ( demand < 0.0f ? -1.0f : 1.0f ) * maxImpulse;
 					w->hasAnchor = false;
 				}
 			}
