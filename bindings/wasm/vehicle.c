@@ -225,6 +225,8 @@ typedef struct
 	float suspensionRelativeVelocity;
 	float wheelSuspensionForce;
 	float skidInfo;
+	/** Did the friction circle bind for this tyre this tick? */
+	bool isSliding;
 	/**
 	 * The friction of the ground under this tyre, from the shape it is standing
 	 * on. 1.0 when it is not standing on anything.
@@ -1088,6 +1090,7 @@ static void UpdateFriction( Vehicle* v, float dt )
 
 		w->sideImpulse = 0.0f;
 		w->forwardImpulse = 0.0f;
+		w->isSliding = false;
 	}
 
 	for ( int i = 0; i < numWheels; i++ )
@@ -1294,6 +1297,7 @@ static void UpdateFriction( Vehicle* v, float dt )
 			if ( impulseSquared > maxImpSquared )
 			{
 				sliding = true;
+				w->isSliding = true;
 				float factor = maxImp * SafeInv( sqrtf( impulseSquared ) );
 				w->skidInfo *= factor;
 			}
@@ -1570,10 +1574,28 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 
 		if ( w->info.isInContact )
 		{
-			b3Quat rot = b3Body_GetRotation( v->chassis );
-			b3Vec3 fwd = b3RotateVector( rot, AxisVector( v->indexForwardAxis ) );
-			float proj = b3Dot( fwd, w->info.contactNormalWs );
-			fwd = Sub3( fwd, Scale( w->info.contactNormalWs, proj ) );
+			/*
+			 * The direction this tyre actually rolls: perpendicular to both the
+			 * surface and its own axle.
+			 *
+			 * NOT `indexForwardAxis`. That is set to 0 — the X axis — when a
+			 * vehicle is created and there is no API to configure it, while the
+			 * axle on a normal car IS X. So the "forward" it named was the axle,
+			 * dot(forward, velocity) was ~0 whenever the car drove forward, and
+			 * the wheel's rolling speed came out as zero at 50 m/s. Engine RPM
+			 * reads the fastest wheel, so the whole drivetrain silently sat at
+			 * idle, the rev limiter never engaged, and top speed doubled from
+			 * 23.8 to 50.3 m/s.
+			 *
+			 * The cross product needs no configuration, and it follows steering
+			 * for free because the axle already has.
+			 */
+			// Axle-cross-normal, not the reverse: this is the order that makes a
+			// wheel rolling the way the vehicle drives report a POSITIVE spin, so
+			// it shares a sign convention with the drive torque that accelerates
+			// it. Reversed, the two fight every time a tyre slips.
+			b3Vec3 fwd = TryNormalize( b3Cross( w->wheelAxleWs, w->info.contactNormalWs ),
+									   B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f } );
 
 			// The spin a rolling tyre would have at this ground speed.
 			float rollingOmega = b3Dot( fwd, vel ) * SafeInv( w->radius );
@@ -1585,8 +1607,26 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 			// left, so it is how hard that coupling pulls — at full grip the
 			// wheel is dragged onto the rolling speed within the tick, and a tyre
 			// that has broken traction is left to spin.
+			// A tyre that has NOT broken traction is locked to the ground — the
+			// talk's "with the clutch applied, the wheels and motor are directly
+			// linked". Relaxing toward the rolling speed instead of onto it left
+			// the wheel permanently a little slow, and since the engine takes its
+			// revs from the fastest wheel, the whole drivetrain under-read: the
+			// limiter stopped biting and top speed on a flat plane went from 23.8
+			// to 50.3 m/s. A gripping wheel does not lag the road.
+			//
+			// Only once the friction circle has been exceeded is the wheel allowed
+			// to run away from the ground, and then by exactly how much grip it
+			// has lost.
 			float grip = w->skidInfo > 1.0f ? 1.0f : ( w->skidInfo < 0.0f ? 0.0f : w->skidInfo );
-			w->angularVelocity += ( rollingOmega - w->angularVelocity ) * grip;
+			if ( !w->isSliding )
+			{
+				w->angularVelocity = rollingOmega;
+			}
+			else
+			{
+				w->angularVelocity += ( rollingOmega - w->angularVelocity ) * grip;
+			}
 		}
 
 		w->deltaRotation = w->angularVelocity * dt;
