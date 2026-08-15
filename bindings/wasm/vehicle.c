@@ -33,7 +33,8 @@
 
 #define B3W_MAX_WHEELS 32
 /** Bodies a vehicle may be told to ignore: its own, plus the player. */
-#define B3W_MAX_EXCLUDE 64
+/** Owner id reserved for bodies that are never ground for any vehicle. */
+#define B3W_OWNER_NEVER_GROUND 0xFFFFFFFFu
 /** Points per cap of the cast prism. See the header note on tread geometry. */
 #define TREAD_SEGMENTS 8
 /** Contact points a single wheel may rest on. Uncharted 4's number, and for
@@ -202,6 +203,8 @@ typedef struct
 	 */
 	bool armed;
 	b3WorldId world;
+	/** The shim's world handle, for the body-owner table. */
+	int worldHandle;
 	b3BodyId chassis;
 	int wheelCount;
 	Wheel wheels[B3W_MAX_WHEELS];
@@ -226,8 +229,18 @@ typedef struct
 	 * floor. The set is a handful of entries; scanning it is nothing next to the
 	 * cast it guards.
 	 */
-	int excludeCount;
-	int exclude[B3W_MAX_EXCLUDE];
+	/**
+	 * Who this vehicle belongs to. A wheel may not stand on any body carrying
+	 * the same owner, nor on a body the host has marked non-drivable.
+	 *
+	 * This replaces a copied list of body indices with a capped size. The list
+	 * was uploaded every tick and silently truncated past 64 bodies, so a large
+	 * enough structure quietly started treating its OWN bodies as ground —
+	 * exactly the failure a cap without a report produces. Ownership is a fact
+	 * about a body, so it lives on the body (`b3Body_SetUserData`) and is
+	 * compared in O(1) here.
+	 */
+	uint32_t owner;
 } Vehicle;
 
 static b3Vec3 AxisVector( int index )
@@ -352,8 +365,8 @@ typedef struct
 {
 	/** The vehicle's own chassis, which can never be its own ground. */
 	b3BodyId chassis;
-	const int* exclude;
-	int excludeCount;
+	uint32_t owner;
+	int worldHandle;
 	/** The surface filter, applied here rather than after the cast: a hit on a
 	 *  wall must not occupy a slot a drivable surface behind it could use. */
 	b3Vec3 worldUp;
@@ -417,6 +430,9 @@ static void KeepWheelHit( WheelCast* ctx, WheelHit hit )
 	}
 }
 
+/** Defined in shim.c — the body-owner table lives with the body table. */
+uint32_t b3w_owner_of_body( int handle, int body );
+
 static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction, uint64_t userMaterialId,
 						 int triangleIndex, int childIndex, void* context )
 {
@@ -439,14 +455,16 @@ static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fr
 
 	// The vehicle's own structure and the player are not ground either. Return
 	// -1 so the cast keeps looking past them rather than stopping.
+	//
+	// Owner 0 means "unowned" — terrain and loose world geometry — and is always
+	// drivable. B3W_OWNER_NEVER_GROUND is the host's way of saying a body is
+	// never ground for anyone, which is what the player is.
 	if ( body >= 0 )
 	{
-		for ( int i = 0; i < ctx->excludeCount; i++ )
+		uint32_t owner = b3w_owner_of_body( ctx->worldHandle, body );
+		if ( owner != 0 && ( owner == ctx->owner || owner == B3W_OWNER_NEVER_GROUND ) )
 		{
-			if ( ctx->exclude[i] == body )
-			{
-				return -1.0f;
-			}
+			return -1.0f;
 		}
 	}
 
@@ -530,8 +548,8 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 	proxy.radius = 0.0f;
 
 	WheelCast cast = { .chassis = v->chassis,
-					   .exclude = v->exclude,
-					   .excludeCount = v->excludeCount,
+					   .owner = v->owner,
+					   .worldHandle = v->worldHandle,
 					   .worldUp = worldUp,
 					   .minSurfaceUpFacing = cosf( w->surfaceRejectAngle ),
 					   .count = 0 };
@@ -964,30 +982,53 @@ static void UpdateFriction( Vehicle* v, float dt )
 
 		w->sideImpulse *= w->sideFrictionStiffness;
 
-		// Side friction is solved Jacobi-style — every grounded wheel computes
-		// against the same pre-impulse velocity — so N wheels over-correct the
-		// shared lateral/roll DOF by ~N×. Share the cancel across wheels, as the
-		// longitudinal axis already does, so the summed impulse stays critical
-		// for any wheel count without changing peak grip.
-		w->sideImpulse /= (float)numWheelsOnGround;
+		/*
+		 * Share the lateral cancel across wheels ONLY at rest.
+		 *
+		 * Side friction is solved Jacobi-style — every grounded wheel computes
+		 * against the same pre-impulse velocity — so N wheels over-correct the
+		 * shared lateral DOF by ~N. Dividing always is the safe answer and it is
+		 * what shipped, but it also makes the tyre STIFFNESS-limited: the summed
+		 * impulse is small enough that the friction circle rarely binds, and a
+		 * long machine feels like it is on ice. Nick reported exactly that, on
+		 * both the car and the tank.
+		 *
+		 * Left undivided while moving, the impulses saturate against the circle
+		 * instead, so the tyre is GRIP-limited — it holds everything mu*N allows
+		 * and slides past it. That is the behaviour he tested and kept, and it
+		 * leaves a tank's differential steering intact: more engine speed turns
+		 * faster, and lifting the throttle pivots it.
+		 *
+		 * At rest there is no circle to clamp against, and the over-correction
+		 * shows up as creep — a parked tank walked 7.3 cm against a 5 cm limit.
+		 * So the share is applied below the same speed the static-friction
+		 * anchor already uses to decide a wheel is standing still, rather than
+		 * introducing a second idea of "stopped".
+		 */
+		if ( vehicleSpeed < STATIC_FRICTION_MAX_SPEED )
+		{
+			w->sideImpulse /= (float)numWheelsOnGround;
+		}
 	}
 
 	float sideFactor = 1.0f;
 	/*
-	 * DELIBERATE DIVERGENCE from Bullet/Rapier, which both use 0.5 here.
+	 * 0.5, as Bullet and Rapier both have it, and REVERTED here after trying 1.0.
 	 *
-	 * This factor weights the longitudinal term when the tyre's total impulse is
-	 * tested against the friction circle. At 0.5 a purely forward impulse has to
-	 * reach TWICE the circle's radius before it counts as sliding, so a wheel
-	 * driving in a straight line transmits up to 2*mu*N — twice what the surface
-	 * can hold. Measured on the game's Car template: 24.9 m/s^2 against a
-	 * mu*g ceiling of 22.5, with the code's own limit sitting at 45.
+	 * 1.0 is the physically honest number — the circle bounds the tyre's total
+	 * force at mu*N whichever way it points. But the game's drive force is
+	 * larger than its own grip (4000 N against mu*N of about 3015 on the Car),
+	 * so an honest circle leaves the tyre permanently SATURATED, and a saturated
+	 * tyre scales `sideImpulse` down by skidInfo along with the forward one.
+	 * Accelerating then eats the lateral grip: Nick reported the car sliding
+	 * "like I'm on ice" and unable to hold a straight line, within minutes.
 	 *
-	 * The circle bounds the tyre's TOTAL force at mu*N, and a force that is
-	 * entirely longitudinal is bounded by exactly the same number, so the two
-	 * axes are weighted alike.
+	 * The honest fix is not this constant — it is that full throttle should not
+	 * ask for more than the tyres can deliver, which is a tuning decision about
+	 * VEHICLE_ENGINE_FORCE and not mine to take. Until then 0.5 keeps the circle
+	 * off the everyday case, and the top-speed taper is what stops the rollover.
 	 */
-	float fwdFactor = 1.0f;
+	float fwdFactor = 0.5f;
 	bool sliding = false;
 
 	for ( int i = 0; i < numWheels; i++ )
@@ -1615,7 +1656,7 @@ Vehicle* b3w_vehicle_get( int handle )
 	return &g_vehicles[handle];
 }
 
-int b3w_vehicle_create( b3WorldId world, b3BodyId chassis )
+int b3w_vehicle_create( b3WorldId world, int worldHandle, b3BodyId chassis )
 {
 	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
 	{
@@ -1628,10 +1669,11 @@ int b3w_vehicle_create( b3WorldId world, b3BodyId chassis )
 		memset( v, 0, sizeof( Vehicle ) );
 		v->used = true;
 		v->world = world;
+		v->worldHandle = worldHandle;
 		v->chassis = chassis;
 		v->indexUpAxis = 1;
 		v->indexForwardAxis = 0;
-		v->excludeCount = 0;
+		v->owner = 0;
 		return i;
 	}
 	return -1;
@@ -1646,7 +1688,7 @@ void b3w_vehicle_destroy( int handle )
 	}
 }
 
-void b3w_vehicle_set_exclusion( int handle, int bodiesPtr, int count )
+void b3w_vehicle_set_owner( int handle, unsigned int owner )
 {
 	Vehicle* v = b3w_vehicle_get( handle );
 	if ( v == NULL )
@@ -1654,17 +1696,7 @@ void b3w_vehicle_set_exclusion( int handle, int bodiesPtr, int count )
 		return;
 	}
 
-	if ( count > B3W_MAX_EXCLUDE )
-	{
-		count = B3W_MAX_EXCLUDE;
-	}
-	if ( count < 0 )
-	{
-		count = 0;
-	}
-
-	memcpy( v->exclude, (const void*)(intptr_t)bodiesPtr, sizeof( int ) * (size_t)count );
-	v->excludeCount = count;
+	v->owner = (uint32_t)owner;
 }
 
 void b3w_vehicle_set_up_axis( int handle, int axis )

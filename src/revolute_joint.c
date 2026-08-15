@@ -417,7 +417,22 @@ void b3SolveRevoluteJoint( b3JointSim* base, b3StepContext* context, bool useBia
 		// Get the substep relative rotation
 		float targetAngle = joint->targetAngle;
 		float angle = b3GetTwistAngle( relQ );
-		float c = angle - targetAngle;
+
+		// The SHORTEST arc to the target, never the raw difference.
+		//
+		// Both terms live on a circle: `b3GetTwistAngle` returns (-pi, pi] and the
+		// target is asserted into the same range, so their difference reaches 2*pi
+		// and the spring then drives the joint the LONG way round. A servo tracking
+		// a continuously rotating command crosses the +/-pi seam every revolution,
+		// where the target flips sign and the error jumps from ~0 to ~2*pi.
+		//
+		// Found on the game's mouse-look tank turret: sweeping the camera spun the
+		// chassis at 53 rad/s — eight revolutions a second — because every seam
+		// crossing asked the turret for a full extra turn and the reaction torque
+		// went into the vehicle. It only became visible once the servo was strong
+		// enough to obey (its damping ratio had been wrong by ~150x), which is why
+		// a correct spring made a quiet bug violent.
+		float c = b3UnwindAngle( angle - targetAngle );
 
 		float bias = joint->springSoftness.biasRate * c;
 		float massScale = joint->springSoftness.massScale;

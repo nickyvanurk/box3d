@@ -40,6 +40,15 @@ typedef struct World
 	bool inUse;
 
 	b3BodyId* bodies;
+	/**
+	 * Which structure owns each body, parallel to `bodies`.
+	 *
+	 * NOT in the body's userData: that slot already holds the body INDEX, which
+	 * every raycast reads back to say what it hit. Storing the owner there
+	 * silently rewrote every query result — four raycast suites went red at
+	 * once. One slot, one meaning.
+	 */
+	uint32_t* bodyOwner;
 	int bodyCount;
 	int bodyCapacity;
 
@@ -87,6 +96,8 @@ static void ReserveBodies( World* world, int needed )
 
 	world->bodies = (b3BodyId*)realloc( world->bodies, sizeof( b3BodyId ) * capacity );
 	world->transforms = (float*)realloc( world->transforms, sizeof( float ) * 7 * capacity );
+	world->bodyOwner = (uint32_t*)realloc( world->bodyOwner, sizeof( uint32_t ) * capacity );
+	memset( world->bodyOwner + world->bodyCapacity, 0, sizeof( uint32_t ) * (size_t)( capacity - world->bodyCapacity ) );
 	world->bodyCapacity = capacity;
 }
 
@@ -227,6 +238,7 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
 
 	int body = world->bodyCount++;
 	world->bodies[body] = b3CreateBody( world->id, &def );
+	world->bodyOwner[body] = 0;
 
 	// The handle rides ON the body, so a query result can name it without a
 	// reverse scan of the table. Offset by one so that a body whose user data
@@ -1295,6 +1307,41 @@ void b3w_set_revolute_servo( int handle, int joint, float targetRadians, float h
 
 }
 
+/**
+ * Tag a body with the structure that owns it.
+ *
+ * A vehicle's wheels may not stand on bodies sharing their owner. This replaced
+ * a per-tick upload of a capped list of body indices — the cap silently dropped
+ * exclusions past 64 bodies, so a big enough structure started using its own
+ * bodies as ground. Ownership is a property of the body, so it is stored on the
+ * body and compared in O(1) during the wheel cast.
+ *
+ * 0 means unowned and always drivable (terrain). 0xFFFFFFFF means never ground
+ * for anyone, which is what the player is.
+ */
+void b3w_body_set_owner( int handle, int body, unsigned int owner )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+
+	world->bodyOwner[body] = (uint32_t)owner;
+}
+
+/** The owner of a body, by index. 0 when unowned. Read by the wheel cast. */
+uint32_t b3w_owner_of_body( int handle, int body )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return 0;
+	}
+
+	return world->bodyOwner[body];
+}
+
 /// Current joint angle in radians, which the servo and the game's readouts need.
 float b3w_revolute_angle( int handle, int joint )
 {
@@ -1396,7 +1443,7 @@ float b3w_prismatic_translation( int handle, int joint )
 // JavaScript's world handle and body index into the ids it works in.
 // ---------------------------------------------------------------------------
 
-int b3w_vehicle_create( b3WorldId world, b3BodyId chassis );
+int b3w_vehicle_create( b3WorldId world, int worldHandle, b3BodyId chassis );
 void b3w_vehicle_prepare( void* vehicle, float dt );
 void b3w_vehicle_substep( float h, void* context );
 void* b3w_vehicle_get( int handle );
@@ -1408,7 +1455,7 @@ int b3w_create_vehicle( int handle, int chassis )
 	{
 		return -1;
 	}
-	return b3w_vehicle_create( world->id, world->bodies[chassis] );
+	return b3w_vehicle_create( world->id, handle, world->bodies[chassis] );
 }
 
 /**
