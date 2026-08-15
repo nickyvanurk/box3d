@@ -1005,10 +1005,27 @@ static void UpdateFriction( Vehicle* v, float dt )
 		 * anchor already uses to decide a wheel is standing still, rather than
 		 * introducing a second idea of "stopped".
 		 */
-		if ( vehicleSpeed < STATIC_FRICTION_MAX_SPEED )
-		{
-			w->sideImpulse /= (float)numWheelsOnGround;
-		}
+		/*
+		 * Side friction is solved Jacobi-style — every grounded wheel computes
+		 * against the same pre-impulse velocity — so N wheels over-correct the
+		 * shared lateral DOF by ~N. Sharing the cancel is what keeps the summed
+		 * impulse right for any wheel count.
+		 *
+		 * Tried and REVERTED: leaving them undivided while moving, on the theory
+		 * that saturating the friction circle would feel grippier. It does, and
+		 * it also inflates the LATERAL term of that same circle by ~N — so a
+		 * sustained turn spends the entire grip budget sideways and starves the
+		 * drive. Holding W and D, a car settled to 1.1 m/s and stayed there;
+		 * with the share restored it circles at 16.1. Nick reported it as tight
+		 * loops slowly coming to a halt.
+		 *
+		 * Grip belongs in the tuning constants, not in an over-correction:
+		 * VEHICLE_SIDE_FRICTION_STIFFNESS_CAR / _TANK are the knobs. This also
+		 * matches what the coupled dense solve produced when it was tried — the
+		 * share is a good approximation of solving the wheels together, not a
+		 * fudge around it.
+		 */
+		w->sideImpulse /= (float)numWheelsOnGround;
 	}
 
 	float sideFactor = 1.0f;
