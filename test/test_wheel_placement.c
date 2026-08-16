@@ -239,7 +239,11 @@ int WheelPlacementTest( void )
 // box, and a single wheel. Whatever depth it reports belongs to the contact
 // machinery and nothing else.
 
-#define RIG_TICK ( 1.0f / 24.0f )
+#define RIG_TICK g_rigTick
+
+/** The tick the rig steps at. 24 Hz is the game's; the sweep varies it because
+ *  a penetration that is a per-TICK distance must shrink as the tick does. */
+static float g_rigTick = 1.0f / 24.0f;
 #define RIG_SUBSTEPS 32
 /** The ground's own collision category, so the depth probe can ask for it by
  *  name rather than hitting the machine on the way down. */
@@ -1852,6 +1856,103 @@ static int DroppedOnFlatGround( void )
 }
 
 /**
+ * The same ramp at every tick rate and substep count the engine might run.
+ *
+ * The drop bug turned out to be a per-TICK distance: the wheel moved further in
+ * one tick than the cast looked ahead. If what is left on a ramp is the same kind
+ * of quantity, halving the tick must roughly halve it, and cutting the tick finer
+ * without changing its length must do nothing. That is a sharper question than
+ * any single number, and it says whether tick rate is a lever here or a red
+ * herring.
+ */
+static int PenetrationAcrossTickRates( void )
+{
+	float rates[4] = { 24.0f, 48.0f, 60.0f, 120.0f };
+	int substeps[2] = { 8, 32 };
+	float angle = 0.61f;
+	float speed = 12.0f;
+
+	for ( int r = 0; r < 4; r++ )
+	{
+		for ( int sIdx = 0; sIdx < 2; sIdx++ )
+		{
+			g_rigTick = 1.0f / rates[r];
+			g_rigSubsteps = substeps[sIdx];
+			g_rigMeshGround = true;
+
+			WheelRig rig = CreateRig( 0.0f, 4 );
+			b3DestroyBody( rig.ground );
+
+			{
+				b3BodyDef def = b3DefaultBodyDef();
+				def.type = b3_staticBody;
+				rig.ground = b3CreateBody( rig.world, &def );
+
+				float h = 8.0f;
+				float run = h / tanf( angle );
+				float e = 80.0f;
+				b3Vec3 verts[6] = {
+					{ -e, 0.0f, -e },	{ -e, 0.0f, e },	   { 6.0f, 0.0f, -e },
+					{ 6.0f, 0.0f, e },	{ 6.0f + run, h, -e }, { 6.0f + run, h, e },
+				};
+				int32_t indices[12] = { 0, 1, 2, 2, 1, 3, 2, 3, 4, 4, 3, 5 };
+
+				b3MeshDef meshDef = { 0 };
+				meshDef.vertices = verts;
+				meshDef.indices = indices;
+				meshDef.weldTolerance = 1e-4f;
+				meshDef.vertexCount = 6;
+				meshDef.triangleCount = 4;
+
+				b3MeshData* mesh = b3CreateMesh( &meshDef, NULL, 0 );
+				b3ShapeDef shapeDef = b3DefaultShapeDef();
+				shapeDef.enableSpeculativeContact = false;
+				shapeDef.filter.categoryBits = GROUND_CATEGORY;
+				b3CreateMeshShape( rig.ground, &shapeDef, mesh, B3_LITERAL( b3Vec3 ){ 1.0f, 1.0f, 1.0f } );
+			}
+
+			TeleportRig( &rig, B3_LITERAL( b3Pos ){ -6.0f, 1.0f, 0.0f }, b3Quat_identity, b3Vec3_zero );
+			StepRig( &rig, (int)( 2.5f * rates[r] ) );
+
+			Vehicle* v = b3w_vehicle_get( rig.vehicle );
+			float worst = 0.0f;
+
+			for ( int i = 0; i < (int)( 5.0f * rates[r] ); i++ )
+			{
+				b3Vec3 along = { 1.0f, 0.0f, 0.0f };
+				if ( b3Dot( b3Body_GetLinearVelocity( rig.chassis ), along ) < speed )
+				{
+					b3Body_ApplyForceToCenter( rig.chassis, b3MulSV( b3Body_GetMass( rig.chassis ) * 12.0f, along ),
+											   true );
+				}
+
+				b3w_vehicle_prepare( v, RIG_TICK );
+				b3World_Step( rig.world, RIG_TICK, g_rigSubsteps );
+				b3w_vehicle_place_wheels( 0 );
+				v->armed = false;
+
+				for ( int k = 0; k < v->wheelCount; k++ )
+				{
+					float d = TyreDepthFor( &rig, k );
+					worst = d > worst ? d : worst;
+				}
+			}
+
+			printf( "    35 deg ramp at 12 m/s, %3.0f Hz x %2d substeps: worst %.1f mm (tick travel %.0f mm)\n",
+					rates[r], substeps[sIdx], worst * 1000.0f, speed * g_rigTick * 1000.0f );
+
+			b3w_vehicle_destroy_world( rig.world );
+			b3DestroyWorld( rig.world );
+			g_rigMeshGround = false;
+		}
+	}
+
+	g_rigTick = 1.0f / 24.0f;
+	g_rigSubsteps = RIG_SUBSTEPS;
+	return 0;
+}
+
+/**
  * Build and tear a vehicle down again and again inside ONE world.
  *
  * Every other subtest here creates a world, drives, and destroys the world —
@@ -1942,6 +2043,7 @@ static int RebuildingAVehicleManyTimes( void )
 int WheelRigTest( void )
 {
 	RUN_SUBTEST( DroppedOnFlatGround );
+	RUN_SUBTEST( PenetrationAcrossTickRates );
 	RUN_SUBTEST( HittingASuddenSlope );
 	RUN_SUBTEST( DrivingIntoASteepFace );
 	// The driven case first: it is the one reproducing a reported symptom, and a
