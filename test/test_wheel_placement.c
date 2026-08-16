@@ -1742,7 +1742,7 @@ static int HittingASuddenSlope( void )
 				}
 
 				float depth = (float)( hit.point.y - ( centre.y - rig.radius ) );
-				if ( g_rigTrace && ( i % 4 == 0 ) && i <= 44 && k == 0 )
+				if ( g_rigTrace && i >= 38 && i <= 43 && k == 0 )
 				{
 					b3Pos hp = AddPosVec( b3Body_GetTransform( rig.chassis ).p,
 										  b3RotateVector( b3Body_GetRotation( rig.chassis ), w->chassisConnectionPointCs ) );
