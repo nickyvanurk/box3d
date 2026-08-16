@@ -126,6 +126,11 @@ static const float WHEEL_SHAPE_CLEARANCE = 0.06f;
 /** Furthest a stuck contact may drift before the tyre is treated as having slipped. */
 static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
 
+/** What is left of a tyre's sideways grip under a brake that has asked for
+ *  everything the tyre can give. `ArcadeCarPhysics` uses 0.01 for its handbrake;
+ *  this is the same idea, reached by how hard the brake is pulled. */
+static const float BRAKE_SIDE_GRIP = 0.5f;
+
 /**
  * One place a wheel touches the world.
  *
@@ -1225,6 +1230,33 @@ static void UpdateFriction( Vehicle* v, float dt )
 		}
 
 		w->sideImpulse *= w->sideFrictionStiffness;
+
+		/*
+		 * A braked tyre loses SIDEWAYS grip, which is what a handbrake is.
+		 *
+		 * The talk lists it — "handbrake = reduced rear tyre friction" — and it
+		 * was dropped here for measuring 0.8 degrees, because the reduction was
+		 * mild. The arcade controller in ~/dev/ArcadeCarPhysics shows what the
+		 * number wants to be: `handBrakeSlipperyK = 0.01`, a NINETY-NINE percent
+		 * cut to lateral friction, ramped in over a couple of seconds. Nothing
+		 * about slip angles or friction circles; the sideways force is simply
+		 * mostly gone while the brake is held.
+		 *
+		 * Scaled by how hard the brake is asked for against what the tyre could
+		 * hold, so a coasting car's token brake does nothing and a real one
+		 * unsticks the back of the car.
+		 */
+		float hold = w->wheelSuspensionForce * v->stepDt * w->frictionSlip * w->surfaceFriction;
+		if ( w->brake > 0.0f && hold > 0.0f )
+		{
+			float demandRatio = w->brake * SafeInv( hold );
+			if ( demandRatio > 1.0f )
+			{
+				demandRatio = 1.0f;
+			}
+
+			w->sideImpulse *= 1.0f + demandRatio * ( BRAKE_SIDE_GRIP - 1.0f );
+		}
 
 		/*
 		 * Share the lateral cancel across wheels ONLY at rest.
