@@ -1148,12 +1148,36 @@ static bool PreSolveDetectOnly( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos po
 	bool aDetect = a >= 0 && a < world->bodyCapacity && world->detectOnly[a] != 0;
 	bool bDetect = b >= 0 && b < world->bodyCapacity && world->detectOnly[b] != 0;
 
-	if ( aDetect && bDetect )
+	if ( !aDetect && !bDetect )
 	{
 		return true;
 	}
 
-	return !( aDetect || bDetect );
+	/*
+	 * Detect-only applies to the WORLD, not to other machines.
+	 *
+	 * It exists so a chassis clipping a hillside slides along it instead of
+	 * stopping dead: the solver leaves that contact alone and the game resolves
+	 * it by translating the chassis out. Applied to every pair, it also switched
+	 * off collision between a car and every other machine — and returning false
+	 * here does not merely skip the impulse, it drops the manifold, so the
+	 * positional pass that was supposed to cover it saw nothing at all. Measured:
+	 * a car driven at a parked machine reported ZERO manifolds and passed clean
+	 * through it, 110 m past where it should have stopped. Rapier keeps the
+	 * manifold in the same situation, which is why the engine that shipped
+	 * before did not do this.
+	 *
+	 * Terrain has no owner; every machine's bodies carry their structure's id.
+	 */
+	uint32_t ownerA = ( a >= 0 && a < world->bodyCount ) ? world->bodyOwner[a] : 0;
+	uint32_t ownerB = ( b >= 0 && b < world->bodyCount ) ? world->bodyOwner[b] : 0;
+
+	if ( ownerA != 0 && ownerB != 0 )
+	{
+		return true;
+	}
+
+	return false;
 }
 
 /**
