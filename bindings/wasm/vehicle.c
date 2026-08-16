@@ -278,6 +278,9 @@ typedef struct
 	 *  point to do, so a probe can see which of the two is carrying the car. */
 	float placementNeeded;
 	float hardPointForce;
+	float springForce;
+	float springRate;
+	float springSpringTerm;
 	/**
 	 * The tyre's mass, taken OFF the chassis when the wheel became a body.
 	 *
@@ -1754,9 +1757,44 @@ static void ApplySuspensionForce( Vehicle* v, Wheel* w, float chassisMass, float
 		force = w->maxSuspensionForce;
 	}
 
+	w->springForce = force;
+	w->springRate = compressionRate;
+	w->springSpringTerm = chassisMass * w->suspensionStiffness * compression;
+
 	b3Vec3 impulse = Scale( up, force * h );
 	b3Body_ApplyLinearImpulse( v->chassis, impulse, hardPoint, false );
-	b3Body_ApplyLinearImpulse( w->body, Scale( impulse, -1.0f ), wheelPos, false );
+
+	/*
+	 * The chassis only. The reaction does NOT go on the wheel.
+	 *
+	 * A tyre is placed on the surface, not simulated into it — the talk holds it
+	 * there with a constraint — so pushing it down with the chassis-scaled
+	 * suspension force only gives the placement something to undo. It undid it
+	 * every tick: a PARKED 1763 kg car reported a 0.53 m/s suspension velocity
+	 * and a 16 mm-per-tick placement, and the damper, reading that phantom
+	 * motion, cancelled 7.3 kN of a 9.6 kN spring. The car then rested on its
+	 * bump stop with no travel left, which is why a heavy machine sank into the
+	 * terrain and a light one did not.
+	 *
+	 * The reaction is not discarded, it is passed THROUGH the tyre to whatever
+	 * the tyre is standing on. Static terrain absorbs it and there is nothing to
+	 * apply; another machine must feel the weight, or a car parked on a platform
+	 * would be weightless to it.
+	 */
+	b3Vec3 reaction = Scale( impulse, -1.0f );
+
+	if ( !w->info.isInContact )
+	{
+		// In the air there is nothing under the tyre to take it, and the spring's
+		// whole job is to push the wheel DOWN into droop. Skipping it here left a
+		// leaping machine with its wheels tucked under it.
+		b3Body_ApplyLinearImpulse( w->body, reaction, wheelPos, false );
+	}
+	else if ( B3_IS_NON_NULL( w->info.groundBodyId ) && b3Body_IsValid( w->info.groundBodyId ) &&
+			  b3Body_GetType( w->info.groundBodyId ) == b3_dynamicBody )
+	{
+		b3Body_ApplyLinearImpulse( w->info.groundBodyId, reaction, w->info.contactPointWs, false );
+	}
 }
 
 /**
