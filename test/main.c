@@ -39,6 +39,8 @@ extern int HullTest( void );
 extern int IdTest( void );
 extern int JointTest( void );
 extern int PistonChainTest( void );
+extern int WheelPlacementTest( void );
+extern int WheelRigTest( void );
 extern int LargeWorldTest( void );
 extern int ManifoldTest( void );
 extern int MathTest( void );
@@ -105,6 +107,8 @@ int main( int argc, char** argv )
 	MAYBE_RUN_TEST( BodyQueryTest );
 	MAYBE_RUN_TEST( CollisionTest );
 	MAYBE_RUN_TEST( PistonChainTest );
+	MAYBE_RUN_TEST( WheelPlacementTest );
+	MAYBE_RUN_TEST( WheelRigTest );
 	MAYBE_RUN_TEST( CompoundTest );
 	MAYBE_RUN_TEST( ContainerTest );
 	MAYBE_RUN_TEST( DeterminismTest );

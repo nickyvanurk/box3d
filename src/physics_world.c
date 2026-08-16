@@ -3089,6 +3089,133 @@ static float b3ShapeCastCallback( const b3BoxCastInput* input, int proxyId, uint
 	return input->maxFraction;
 }
 
+/** How many hits one mesh shape may contribute to a multi-hit cast. Three is
+ *  what a wheel wants (see the Uncharted 4 controller); a few more costs
+ *  nothing and lets the caller do its own dedup. */
+#define B3_MAX_SHAPE_CAST_HITS 8
+
+static float b3ShapeCastAllCallback( const b3BoxCastInput* input, int proxyId, uint64_t userData, void* context )
+{
+	B3_UNUSED( proxyId );
+
+	int shapeId = (int)userData;
+	WorldShapeCastContext* worldContext = (WorldShapeCastContext*)context;
+	b3World* world = worldContext->world;
+
+	b3Shape* shape = b3Array_Get( world->shapes, shapeId );
+	b3Filter shapeFilter = shape->filter;
+	b3QueryFilter queryFilter = worldContext->filter;
+
+	if ( b3ShouldQueryCollide( &shapeFilter, &queryFilter ) == false )
+	{
+		return input->maxFraction;
+	}
+
+	b3ShapeCastInput localInput = worldContext->input;
+	localInput.maxFraction = input->maxFraction;
+
+	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
+	b3Transform transform = b3ToRelativeTransform( b3GetBodyTransformQuick( world, body ), worldContext->origin );
+
+	b3CastOutput outputs[B3_MAX_SHAPE_CAST_HITS];
+	int count = 0;
+
+	if ( shape->type == b3_meshShape )
+	{
+		// The whole point of this variant: a mesh is ONE shape holding thousands
+		// of triangles, so the ordinary cast's single answer hides every facet
+		// but the nearest.
+		b3ShapeCastInput meshInput = localInput;
+		b3Vec3 localPoints[B3_MAX_SHAPE_CAST_POINTS];
+		meshInput.proxy.count = b3MinInt( localInput.proxy.count, B3_MAX_SHAPE_CAST_POINTS );
+		for ( int i = 0; i < meshInput.proxy.count; ++i )
+		{
+			localPoints[i] = b3InvTransformPoint( transform, localInput.proxy.points[i] );
+		}
+		meshInput.proxy.points = localPoints;
+		meshInput.translation = b3InvRotateVector( transform.q, localInput.translation );
+
+		count = b3ShapeCastMeshAll( &shape->mesh, &meshInput, outputs, B3_MAX_SHAPE_CAST_HITS );
+
+		for ( int i = 0; i < count; ++i )
+		{
+			outputs[i].point = b3TransformPoint( transform, outputs[i].point );
+			outputs[i].normal = b3RotateVector( transform.q, outputs[i].normal );
+		}
+	}
+	else
+	{
+		outputs[0] = b3ShapeCastShape( shape, transform, &localInput );
+		count = outputs[0].hit ? 1 : 0;
+	}
+
+	for ( int i = 0; i < count; ++i )
+	{
+		b3ShapeId id = { shapeId + 1, world->worldId, shape->generation };
+		int materialIndex = b3ClampInt( outputs[i].materialIndex, 0, shape->materialCount - 1 );
+		uint64_t userMaterialId = b3GetShapeMaterials( shape )[materialIndex].userMaterialId;
+
+		worldContext->fcn( id, b3OffsetPos( worldContext->origin, outputs[i].point ), outputs[i].normal,
+						   outputs[i].fraction, userMaterialId, outputs[i].triangleIndex, outputs[i].childIndex,
+						   worldContext->userContext );
+	}
+
+	// Never narrow the sweep: a caller asking for every hit wants the ones beyond
+	// the nearest as well, and shrinking here would prune exactly those.
+	return input->maxFraction;
+}
+
+/**
+ * Cast a shape and report EVERY hit, including several from the same mesh.
+ *
+ * `b3World_CastShape` reports the earliest hit per shape and lets the callback
+ * narrow the sweep, which is right for "what do I hit first". A wheel needs the
+ * planks it is about to sit on — plural — and terrain is a single mesh shape, so
+ * that query cannot express it. This one does not narrow, and expands a mesh
+ * into its individual triangle hits.
+ *
+ * The callback's return value is ignored: there is no sweep to shorten.
+ */
+b3TreeStats b3World_CastShapeAll( b3WorldId worldId, b3Pos origin, const b3ShapeProxy* proxy, b3Vec3 translation,
+								  b3QueryFilter filter, b3CastResultFcn* fcn, void* context )
+{
+	b3TreeStats treeStats = { 0 };
+
+	b3World* world = b3GetUnlockedWorldFromId( worldId );
+	if ( world == NULL )
+	{
+		return treeStats;
+	}
+
+	B3_ASSERT( b3IsValidPosition( origin ) );
+	B3_ASSERT( b3IsValidVec3( translation ) );
+
+	WorldShapeCastContext worldContext = { 0 };
+	worldContext.world = world;
+	worldContext.fcn = fcn;
+	worldContext.filter = filter;
+	worldContext.fraction = 1.0f;
+	worldContext.origin = origin;
+	worldContext.input.proxy = *proxy;
+	worldContext.input.translation = translation;
+	worldContext.input.maxFraction = 1.0f;
+	worldContext.input.canEncroach = false;
+	worldContext.userContext = context;
+
+	b3AABB localBox = b3MakeAABB( proxy->points, proxy->count, proxy->radius );
+	b3BoxCastInput treeInput = { b3OffsetAABB( localBox, origin ), translation, 1.0f };
+
+	for ( int i = 0; i < b3_bodyTypeCount; ++i )
+	{
+		b3TreeStats treeResult = b3DynamicTree_BoxCast( world->broadPhase.trees + i, &treeInput, filter.maskBits, false,
+														b3ShapeCastAllCallback, &worldContext );
+		treeStats.nodeVisits += treeResult.nodeVisits;
+		treeStats.leafVisits += treeResult.leafVisits;
+	}
+
+	return treeStats;
+}
+
 b3TreeStats b3World_CastShape( b3WorldId worldId, b3Pos origin, const b3ShapeProxy* proxy, b3Vec3 translation,
 							   b3QueryFilter filter, b3CastResultFcn* fcn, void* context )
 {

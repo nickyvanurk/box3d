@@ -564,6 +564,15 @@ B3_API b3CastOutput b3ShapeCastHull( const b3HullData* shape, const b3ShapeCastI
 /// Shape cast versus a mesh. Initial overlap is treated as a miss.
 B3_API b3CastOutput b3ShapeCastMesh( const b3Mesh* shape, const b3ShapeCastInput* input );
 
+/// Cast a shape against a mesh and report EVERY triangle it hits, nearest first,
+/// up to `maxOutputs`. Returns how many were written.
+///
+/// `b3ShapeCastMesh` answers "what do I hit first" and shrinks its ray to do so,
+/// which means a caller can never see a second facet of the same mesh — and a
+/// wheel bridging a crease rests on two.
+B3_API int b3ShapeCastMeshAll( const b3Mesh* shape, const b3ShapeCastInput* input, b3CastOutput* outputs,
+							   int maxOutputs );
+
 /// Shape cast versus a height field. Initial overlap is treated as a miss.
 B3_API b3CastOutput b3ShapeCastHeightField( const b3HeightFieldData* shape, const b3ShapeCastInput* input );
 

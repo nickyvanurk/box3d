@@ -2161,6 +2161,196 @@ b3CastOutput b3ShapeCastMesh( const b3Mesh* mesh, const b3ShapeCastInput* input 
 	return bestOutput;
 }
 
+/**
+ * Every triangle the swept shape hits, not just the nearest one.
+ *
+ * `b3ShapeCastMesh` keeps one `bestOutput` and SHRINKS the ray each time it
+ * finds something closer, which is the right answer for "what do I hit first"
+ * and the wrong one for a wheel: a tyre bridging a crease, or sitting in a
+ * valley, touches two facets of the same mesh and a caller cannot see the
+ * second — the mesh is one shape, so one hit is all the world query can ever
+ * report.
+ *
+ * This runs the same traversal without shrinking, and keeps the `maxOutputs`
+ * nearest hits in fraction order. It costs more triangle tests, because the
+ * narrowing that the shrinking ray buys is exactly what has to be given up.
+ *
+ * Returns how many were written.
+ */
+int b3ShapeCastMeshAll( const b3Mesh* mesh, const b3ShapeCastInput* input, b3CastOutput* outputs, int maxOutputs )
+{
+	const b3MeshData* data = mesh->data;
+	b3Vec3 meshScale = mesh->scale;
+
+	int outputCount = 0;
+	if ( outputs == NULL || maxOutputs <= 0 )
+	{
+		return 0;
+	}
+
+	b3CastOutput bestOutput = { 0 };
+	bestOutput.fraction = input->maxFraction;
+	bestOutput.triangleIndex = B3_NULL_INDEX;
+
+	b3V32 lambda = b3SplatV( input->maxFraction );
+
+	b3AABB shapeBounds = b3MakeAABB( input->proxy.points, input->proxy.count, input->proxy.radius );
+	b3Vec3 center = b3AABB_Center( shapeBounds );
+	b3Vec3 extents = b3AABB_Extents( shapeBounds );
+	b3V32 shapeExtent = b3LoadV( &extents.x );
+
+	b3V32 rayStart = b3LoadV( &center.x );
+	b3V32 rayDelta = b3LoadV( &input->translation.x );
+	b3V32 rayEnd = b3AddV( rayStart, b3MulV( lambda, rayDelta ) );
+	b3V32 rayMin = b3MinV( rayStart, rayEnd );
+	b3V32 rayMax = b3MaxV( rayStart, rayEnd );
+
+	b3V32 scale = b3LoadV( &meshScale.x );
+	b3V32 invScale = b3DivV( b3_oneV, scale );
+	b3V32 absInvScale = b3AbsV( invScale );
+	bool clockwise = meshScale.x * meshScale.y * meshScale.z < 0.0f;
+
+	// Use the inverse scaled shape cast for traversal of the BVH
+	b3V32 invScaledRayStart = b3MulV( invScale, rayStart );
+	b3V32 invScaledRayDelta = b3MulV( invScale, rayDelta );
+	b3V32 invScaledRayEnd = b3AddV( invScaledRayStart, b3MulV( lambda, invScaledRayDelta ) );
+	b3V32 invScaledRayMin = b3MinV( invScaledRayStart, invScaledRayEnd );
+	b3V32 invScaledRayMax = b3MaxV( invScaledRayStart, invScaledRayEnd );
+	b3V32 invScaledShapeExtent = b3MulV( absInvScale, shapeExtent );
+
+	int count = 0;
+	const b3MeshNode* stack[B3_MESH_STACK_SIZE];
+	const b3MeshNode* node = b3GetRoot( data );
+	const b3MeshTriangle* triangles = b3GetMeshTriangles( data );
+	const b3Vec3* vertices = b3GetMeshVertices( data );
+	const uint8_t* materialIndices = b3GetMeshMaterialIndices( data );
+
+	while ( true )
+	{
+		// Test node/ray overlap using SAT in unscaled space
+		b3V32 nodeMin = b3SubV( b3LoadV( &node->lowerBound.x ), invScaledShapeExtent );
+		b3V32 nodeMax = b3AddV( b3LoadV( &node->upperBound.x ), invScaledShapeExtent );
+
+		if ( b3TestBoundsOverlap( nodeMin, nodeMax, invScaledRayMin, invScaledRayMax ) &&
+			 b3TestBoundsRayOverlap( nodeMin, nodeMax, invScaledRayStart, invScaledRayDelta ) )
+		{
+			// SAT: The node and ray overlap - process leaf node or recurse
+			if ( b3IsLeaf( node ) )
+			{
+				int triangleCount = node->data.asLeaf.triangleCount;
+				int triangleOffset = node->triangleOffset;
+
+				for ( int index = 0; index < triangleCount; ++index )
+				{
+					int triangleIndex = triangleOffset + index;
+					b3MeshTriangle triangle = triangles[triangleIndex];
+
+					// Collide ray with triangle in scaled space
+					b3Vec3 vertex1 = b3Mul( meshScale, vertices[triangle.index1] );
+					b3Vec3 vertex2, vertex3;
+
+					// The CPU should predict this branch
+					if ( clockwise )
+					{
+						vertex2 = b3Mul( meshScale, vertices[triangle.index3] );
+						vertex3 = b3Mul( meshScale, vertices[triangle.index2] );
+					}
+					else
+					{
+						vertex2 = b3Mul( meshScale, vertices[triangle.index2] );
+						vertex3 = b3Mul( meshScale, vertices[triangle.index3] );
+					}
+
+					b3V32 v1 = b3LoadV( &vertex1.x );
+					b3V32 v2 = b3LoadV( &vertex2.x );
+					b3V32 v3 = b3LoadV( &vertex3.x );
+
+					b3V32 triangleMin = b3SubV( b3MinV( v1, b3MinV( v2, v3 ) ), shapeExtent );
+					b3V32 triangleMax = b3AddV( b3MaxV( v1, b3MaxV( v2, v3 ) ), shapeExtent );
+
+					// Test triangle-ray overlap in scaled space
+					if ( b3TestBoundsOverlap( triangleMin, triangleMax, rayMin, rayMax ) )
+					{
+						// Collide shape with triangle in scaled space
+						b3Vec3 origin = vertex1;
+						b3Vec3 triangleVertices[] = { b3Vec3_zero, b3Sub( vertex2, origin ), b3Sub( vertex3, origin ) };
+						b3Transform shiftedOrigin = { b3Neg( origin ), b3Quat_identity };
+
+						b3ShapeCastPairInput pairInput;
+						pairInput.proxyA = (b3ShapeProxy){ triangleVertices, 3, 0.0f };
+						pairInput.proxyB = input->proxy;
+						pairInput.transform = shiftedOrigin;
+						// The FULL sweep every time: narrowing to the nearest hit so
+						// far is what hides the second plank.
+						pairInput.maxFraction = input->maxFraction;
+						pairInput.translationB = input->translation;
+						pairInput.canEncroach = input->canEncroach;
+
+						b3CastOutput pairOutput = b3ShapeCast( &pairInput );
+
+						if ( pairOutput.hit )
+						{
+							pairOutput.point = b3Add( pairOutput.point, origin );
+							pairOutput.triangleIndex = triangleIndex;
+							pairOutput.materialIndex = materialIndices[triangleIndex];
+
+							// Insert in fraction order, keeping the nearest
+							// `maxOutputs`. The caller wants the planks the tyre is
+							// about to rest on, which are the earliest ones.
+							int at = outputCount < maxOutputs ? outputCount : maxOutputs - 1;
+							if ( outputCount == maxOutputs && pairOutput.fraction >= outputs[at].fraction )
+							{
+								continue;
+							}
+
+							while ( at > 0 && pairOutput.fraction < outputs[at - 1].fraction )
+							{
+								outputs[at] = outputs[at - 1];
+								at--;
+							}
+							outputs[at] = pairOutput;
+							if ( outputCount < maxOutputs )
+							{
+								outputCount++;
+							}
+						}
+					}
+				}
+			}
+			else
+			{
+				// Determine traversal order (front -> back) and recurse
+				int axis = node->data.asNode.axis;
+				if ( b3GetV( invScaledRayDelta, axis ) > 0.0f )
+				{
+					B3_ASSERT( count <= B3_MESH_STACK_SIZE - 1 );
+					stack[count++] = b3GetRightChild( node );
+					node = b3GetLeftChild( node );
+				}
+				else
+				{
+					B3_ASSERT( count <= B3_MESH_STACK_SIZE - 1 );
+					stack[count++] = b3GetLeftChild( node );
+					node = b3GetRightChild( node );
+				}
+
+				continue;
+			}
+		}
+
+		if ( count == 0 )
+		{
+			break;
+		}
+		node = stack[--count];
+	}
+
+	B3_UNUSED( bestOutput );
+	B3_UNUSED( lambda );
+	return outputCount;
+}
+
+
 b3Triangle b3GetMeshTriangle( const b3Mesh* mesh, int triangleIndex )
 {
 	B3_ASSERT( 0 <= triangleIndex && triangleIndex < mesh->data->triangleCount );

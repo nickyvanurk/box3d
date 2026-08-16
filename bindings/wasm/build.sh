@@ -53,7 +53,9 @@ EXPORTS='[
 	"_b3w_vehicle_set_suspension_stiffness","_b3w_vehicle_set_suspension_compression",
 	"_b3w_vehicle_set_suspension_relaxation","_b3w_vehicle_set_suspension_rest_length",
 	"_b3w_vehicle_set_max_suspension_travel","_b3w_vehicle_set_max_suspension_force",
-	"_b3w_vehicle_set_wheel_inertia",
+	"_b3w_vehicle_set_wheel_inertia","_b3w_vehicle_set_wheel_mass",
+	"_b3w_vehicle_debug_draw","_b3w_vehicle_awake_wheels","_b3w_vehicle_wheel_speeds",
+	"_b3w_vehicle_set_sleep_threshold","_b3w_vehicle_place_wheels",
 	"_b3w_vehicle_set_anti_squat",
 	"_malloc","_free"
 ]'

@@ -104,6 +104,16 @@ B3_API b3RayResult b3World_CastRayClosest( b3WorldId worldId, b3Pos origin, b3Ve
 B3_API b3TreeStats b3World_CastShape( b3WorldId worldId, b3Pos origin, const b3ShapeProxy* proxy, b3Vec3 translation,
 									  b3QueryFilter filter, b3CastResultFcn* fcn, void* context );
 
+/// Cast a shape and report EVERY hit, including several triangles of the same
+/// mesh, nearest first. Unlike b3World_CastShape this never narrows the sweep
+/// and ignores the callback's return value.
+///
+/// A wheel resting across a crease touches two facets of one mesh shape, and the
+/// ordinary cast can only ever report the nearest.
+B3_API b3TreeStats b3World_CastShapeAll( b3WorldId worldId, b3Pos origin, const b3ShapeProxy* proxy,
+										 b3Vec3 translation, b3QueryFilter filter, b3CastResultFcn* fcn,
+										 void* context );
+
 /// Cast a capsule mover through the world. This is a special shape cast that handles sliding along other shapes while reducing
 /// clipping. This is not a good source of information about what the mover is touching. Instead use the planes returned by
 /// b3World_CollideMover.
