@@ -2333,7 +2333,30 @@ b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* swee
 		return context.toiOutput;
 	}
 
-	B3_ASSERT( shapeB->type != b3_compoundShape && shapeB->type != b3_meshShape && shapeB->type != b3_heightShape );
+	/*
+	 * A shape this cannot make a proxy for gets NO continuous test, rather than a
+	 * garbage one.
+	 *
+	 * The assert that stood here said the same thing, and `-DNDEBUG` deletes it:
+	 * `b3MakeShapeProxy` handles capsule, sphere and hull and returns a ZEROED
+	 * proxy for anything else — a null point list with a count of zero — which
+	 * `b3TimeOfImpact` then walks. In a release build that is a jump through
+	 * whatever the memory held, and it surfaced as "null function or function
+	 * signature mismatch" inside `b3ContinuousQueryCallback`.
+	 *
+	 * The A side is handled above for compound and mesh. The B side is the fast
+	 * body's own shape, and a machine built out of compound colliders puts one
+	 * there routinely. Falling back to no impact costs that pair its swept test
+	 * and leaves it to discrete contacts, which is what it had before the shape
+	 * type ever reached here.
+	 */
+	if ( shapeB->type == b3_compoundShape || shapeB->type == b3_meshShape || shapeB->type == b3_heightShape )
+	{
+		b3TOIOutput none = { 0 };
+		none.fraction = maxFraction;
+		none.state = b3_toiStateSeparated;
+		return none;
+	}
 
 	b3TOIInput input;
 	input.proxyA = b3MakeShapeProxy( shapeA );

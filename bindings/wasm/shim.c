@@ -1195,12 +1195,20 @@ void b3w_set_detect_only( int handle, int bodiesPtr, int count )
 		return;
 	}
 
-	static bool callbackRegistered = false;
-	if ( callbackRegistered == false )
-	{
-		b3World_SetPreSolveCallback( world->id, PreSolveDetectOnly, world );
-		callbackRegistered = true;
-	}
+	/*
+	 * Per WORLD, every time.
+	 *
+	 * This was a process-wide `static bool`: the first world to ask registered
+	 * the callback and every later world silently got none, while the callback
+	 * that WAS registered kept a pointer to a world that may since have been
+	 * destroyed and its arrays freed. A second world is not exotic — the game
+	 * makes one per reload, the tests make one per case — and reading a freed
+	 * context is how a solver ends up calling through a pointer that was never a
+	 * function.
+	 *
+	 * Registering is idempotent and costs a store, so there is nothing to guard.
+	 */
+	b3World_SetPreSolveCallback( world->id, PreSolveDetectOnly, world );
 
 	const int32_t* src = (const int32_t*)(intptr_t)bodiesPtr;
 

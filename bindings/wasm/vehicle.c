@@ -117,6 +117,11 @@ static const float MAX_RECOVERY_SPEED = 30.0f;
  *  just "faster than the machine will ever go" and the torque does the talking. */
 static const float REAL_WHEEL_MOTOR_SPEED = 200.0f;
 
+/** The joint carries the machine in real-wheel mode, so it needs a real spring:
+ *  a car's body frequency is about 1.5 Hz, damped a bit under critical. */
+static const float REAL_WHEEL_SUSPENSION_HERTZ = 1.5f;
+static const float REAL_WHEEL_SUSPENSION_DAMPING = 0.7f;
+
 /** Furthest a stuck contact may drift before the tyre is treated as having slipped. */
 static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
 
@@ -2205,8 +2210,15 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 	// single damping ratio where this game authors compression and rebound
 	// separately — so the suspension is applied as a force instead.
 	// And sprung by the joint, for the same reason: our spring is applied to a
-	// tyre the placement owns, and here nothing places it.
+	// tyre the placement owns, and here nothing places it. A spring needs a
+	// frequency — enabled with the default zero it drives the solver into a
+	// division by nothing and traps the world.
 	jd.enableSuspensionSpring = v->realWheels;
+	if ( v->realWheels )
+	{
+		jd.suspensionHertz = REAL_WHEEL_SUSPENSION_HERTZ;
+		jd.suspensionDampingRatio = REAL_WHEEL_SUSPENSION_DAMPING;
+	}
 
 	// Steering is the JOINT's, so the body turns with it. Left disabled, the
 	// controller steered only the axle it hands to the cast and to friction, and
@@ -2340,7 +2352,11 @@ static void PrepareRealWheels( Vehicle* v, float dt )
 		}
 		else if ( torque > 0.0f )
 		{
-			float sign = w->engineForce >= 0.0f ? 1.0f : -1.0f;
+			// NEGATED. The joint spins about frame B's local Z, and that axis is
+			// built from the wheel's axle — whose positive sense points the
+			// opposite way to a forward roll, the same sign the steering setter
+			// already has to undo.
+			float sign = w->engineForce >= 0.0f ? -1.0f : 1.0f;
 			b3WheelJoint_SetSpinMotorSpeed( w->joint, sign * REAL_WHEEL_MOTOR_SPEED );
 			b3WheelJoint_SetMaxSpinTorque( w->joint, torque );
 		}
