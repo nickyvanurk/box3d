@@ -2284,11 +2284,19 @@ static void SolveWheelContacts( Vehicle* v, Wheel* w, float h )
 	 * slid 314 m down a 10 degree slope parked and delivered a fifth of the
 	 * acceleration its engine force commanded.
 	 *
-	 * The load is on the other side of the same equation. What the suspension
-	 * pushed the chassis up with is what it pushed the tyre down with, and the
-	 * contact carries the wheel's own weight on top.
+	 * The load is on the other side of the same equation: what the suspension
+	 * pushed the chassis up with is what it pushed the tyre down with, plus the
+	 * tyre's own weight.
+	 *
+	 * NOT the contact solve's own total. That number is whatever it took to stop
+	 * the wheel this substep, so it spikes on every bump — and friction is a
+	 * coefficient times it, so grip spiked with it. On a light machine carrying a
+	 * heavy wheel the spikes were larger than anything the machine weighs: a
+	 * one-block chassis with a single wheel left at 292 m/s. Load is a steady
+	 * quantity and this is its steady form.
 	 */
-	w->wheelSuspensionForce = total + w->springForce;
+	float gravity = b3Length( b3World_GetGravity( v->world ) );
+	w->wheelSuspensionForce = w->springForce + b3Body_GetMass( w->body ) * gravity;
 }
 
 

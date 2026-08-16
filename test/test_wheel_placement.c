@@ -394,6 +394,8 @@ static float g_rigChassisDensity = 400.0f;
 
 /** The wheels and their tuning, so a rebuild can hang a fresh set under a fresh
  *  chassis without a second copy of the game's numbers. */
+static bool g_rigSidewaysWheel = false;
+
 static void AddRigWheels( WheelRig* rig, int wheelCount )
 {
 	// The wheels, hung under the chassis: suspension straight down, axle across.
@@ -401,8 +403,18 @@ static void AddRigWheels( WheelRig* rig, int wheelCount )
 	// when its corners disagree, which is where pitching and flipping live.
 	if ( wheelCount == 1 )
 	{
-		b3w_vehicle_add_wheel( rig->vehicle, 0.0f, -0.3f, 0.0f, 0.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.25f, rig->radius,
-							   0.3f );
+		// Suspension down and axle across, unless the caller wants the SIDEWAYS
+		// mount a player can build and the game's own fixtures produce by default.
+		if ( g_rigSidewaysWheel )
+		{
+			b3w_vehicle_add_wheel( rig->vehicle, 0.0f, -0.3f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.25f,
+								   rig->radius, 0.3f );
+		}
+		else
+		{
+			b3w_vehicle_add_wheel( rig->vehicle, 0.0f, -0.3f, 0.0f, 0.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.25f,
+								   rig->radius, 0.3f );
+		}
 	}
 	else
 	{
@@ -1244,6 +1256,67 @@ static int AHighMountedWheelStaysOffTheGround( void )
 
 	b3w_vehicle_destroy( rig.vehicle );
 	b3DestroyWorld( rig.world );
+	return 0;
+}
+
+/*
+ * A LIGHT machine rests as still as a heavy one.
+ *
+ * The game's smallest builds are a block and a wheel, and the wheel is heavier
+ * than the block: on a one-block chassis the machine bounced for as long as it
+ * was watched and never fell asleep, which in the game means the auto-unstuck
+ * assist never fires and a shaken camera never settles.
+ */
+static int ALightMachineRests( void )
+{
+	float densities[] = { 400.0f, 20.0f, 5.0f };
+	int failures = 0;
+
+	for ( int d = 0; d < 3; d++ )
+	{
+		g_rigChassisDensity = densities[d];
+		WheelRig rig = CreateRig( 0.0f, 1 );
+		Vehicle* v = b3w_vehicle_get( rig.vehicle );
+		b3w_vehicle_set_wheel_mass( rig.vehicle, 0, 20.0f );
+
+
+		StepRig( &rig, 240 );
+
+		float lowest = 1.0e9f;
+		float highest = -1.0e9f;
+		float worstSpeed = 0.0f;
+
+		for ( int i = 0; i < 48; i++ )
+		{
+			b3w_vehicle_prepare( v, RIG_TICK );
+			b3World_Step( rig.world, RIG_TICK, RIG_SUBSTEPS );
+			b3w_vehicle_place_wheels( 0 );
+			v->armed = false;
+
+			float y = (float)b3Body_GetPosition( rig.chassis ).y;
+			lowest = y < lowest ? y : lowest;
+			highest = y > highest ? y : highest;
+
+			b3Vec3 lv = b3Body_GetLinearVelocity( rig.chassis );
+			float speed = b3Length( lv );
+			worstSpeed = speed > worstSpeed ? speed : worstSpeed;
+		}
+
+		printf( "    chassis %.0f kg%s: rests within %.1f mm, worst speed %.2f m/s, asleep %d, wheel contact %d\n",
+				b3Body_GetMass( rig.chassis ), g_rigSidewaysWheel ? " (wheel sideways)" : "",
+				( highest - lowest ) * 1000.0f, worstSpeed, b3Body_IsAwake( rig.chassis ) ? 0 : 1,
+				v->wheels[0].info.isInContact ? 1 : 0 );
+		if ( ( highest - lowest ) > 0.01f || worstSpeed > 0.1f )
+		{
+			failures++;
+		}
+
+		b3w_vehicle_destroy( rig.vehicle );
+		b3DestroyWorld( rig.world );
+	}
+
+	g_rigChassisDensity = 400.0f;
+	ENSURE( failures == 0 );
 	return 0;
 }
 
@@ -2172,6 +2245,10 @@ static int RebuildingAVehicleManyTimes( void )
 
 int WheelRigTest( void )
 {
+	RUN_SUBTEST( ALightMachineRests );
+	g_rigSidewaysWheel = true;
+	RUN_SUBTEST( ALightMachineRests );
+	g_rigSidewaysWheel = false;
 	RUN_SUBTEST( AHighMountedWheelStaysOffTheGround );
 	RUN_SUBTEST( DrivenBothWaysRidesTheSame );
 	RUN_SUBTEST( DroppedOnFlatGround );
