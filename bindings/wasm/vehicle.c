@@ -745,6 +745,31 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 	 * wheel RADIUS, which is not a suspension quantity at all.
 	 */
 	float raylen = w->suspensionRestLength + w->maxSuspensionTravel;
+
+	/*
+	 * Plus how far this wheel will TRAVEL toward the ground this tick.
+	 *
+	 * The suspension's reach is the right length for a car that is driving: the
+	 * wheel cannot go further than that, so nothing beyond it matters. It is the
+	 * wrong length for one that is falling. At 22 m/s a tick moves the wheel
+	 * 0.9 m while the cast looks 0.5 m ahead, so it reports NOTHING, the point
+	 * constraint has no contact to hold, and the tyre travels the whole tick
+	 * unopposed and arrives a quarter of a metre inside the terrain. The next
+	 * tick's cast finds it already buried, which is when a player sees it.
+	 *
+	 * Measured across drop heights and impact speeds: penetration tracked impact
+	 * speed almost exactly, which is the signature of a per-tick distance rather
+	 * than of any force or rate. The talk casts the suspension's reach because at
+	 * their tick rate that already covers a tick of falling; at 24 Hz it does not,
+	 * so the distance the wheel is about to cover is added explicitly.
+	 */
+	b3Vec3 wheelVel = B3_IS_NULL( w->body ) ? b3Body_GetLinearVelocity( v->chassis )
+											: b3Body_GetLinearVelocity( w->body );
+	float closing = b3Dot( direction, wheelVel ) * dt;
+	if ( closing > 0.0f )
+	{
+		raylen += closing;
+	}
 	float offset = 2.0f * r + w->maxSuspensionTravel;
 
 	b3Pos castStart = AddPosVec( source, Scale( direction, -offset ) );
