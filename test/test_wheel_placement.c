@@ -1754,6 +1754,26 @@ static int RebuildingAVehicleManyTimes( void )
 	WheelRig rig = CreateRig( 0.0f, 4 );
 	StepRig( &rig, 10 );
 
+	// A SECOND machine, never torn down. It is the one that makes recycling
+	// dangerous: every id the rebuilt vehicle frees is handed straight to this
+	// one's bodies, shapes and joints, so a teardown that frees "its" handles by
+	// id frees somebody else's. With only one machine in the world a stale id
+	// tends to land on nothing and the bug hides.
+	WheelRig other = rig;
+	b3BodyDef otherDef = b3DefaultBodyDef();
+	otherDef.type = b3_dynamicBody;
+	otherDef.position = B3_LITERAL( b3Pos ){ 6.0f, 1.2f, 0.0f };
+	other.chassis = b3CreateBody( rig.world, &otherDef );
+
+	b3ShapeDef otherShape = b3DefaultShapeDef();
+	otherShape.density = 400.0f;
+	otherShape.filter.categoryBits = MACHINE_CATEGORY;
+	b3BoxHull otherBox = b3MakeBoxHull( 0.6f, 0.3f, 0.4f );
+	b3CreateHullShape( other.chassis, &otherShape, &otherBox.base );
+
+	other.vehicle = b3w_vehicle_create( rig.world, 0, other.chassis );
+	AddRigWheels( &other, 4 );
+
 	for ( int round = 0; round < 200; round++ )
 	{
 		// The game's order: every body first, the controller after.
@@ -1777,6 +1797,19 @@ static int RebuildingAVehicleManyTimes( void )
 		b3World_SetSubStepCallback( rig.world, RigSubstep, (void*)(intptr_t)rig.vehicle );
 
 		StepRig( &rig, 4 );
+
+		// The untouched machine keeps being driven through every recycle.
+		Vehicle* ov = b3w_vehicle_get( other.vehicle );
+		b3w_vehicle_prepare( ov, RIG_TICK );
+		CastAndPlaceWheels( ov );
+		ov->armed = false;
+
+		ENSURE( b3Body_IsValid( other.chassis ) );
+		for ( int k = 0; k < ov->wheelCount; k++ )
+		{
+			ENSURE( b3Joint_IsValid( ov->wheels[k].joint ) );
+			ENSURE( b3Body_IsValid( ov->wheels[k].body ) );
+		}
 	}
 
 	ENSURE( b3Body_IsValid( rig.chassis ) );
