@@ -111,11 +111,6 @@ static const float HARD_POINT_FORCE_SCALE = 3.0f;
 /** Penetration a tyre is left to the constraint to resolve rather than being
  *  placed out of. Box3D's own linear slop. */
 static const float PLACEMENT_DEADBAND = 0.005f;
-
-/** How much smaller than the tyre the bottomed-out collider is — "make sure this
- *  extra cylinder is smaller than the actual wheel, so it doesn't hit the ground
- *  during normal driving". It is the travel the suspension keeps to itself. */
-static const float BUMP_STOP_CLEARANCE = 0.035f;
 static const float MAX_RECOVERY_SPEED = 30.0f;
 
 /** Furthest a stuck contact may drift before the tyre is treated as having slipped. */
@@ -284,8 +279,6 @@ typedef struct
 	float placementNeeded;
 	float hardPointForce;
 	float springForce;
-	/** The bottomed-out collider on the chassis — see `CreateWheelBody`. */
-	b3ShapeId bumpStop;
 	float springRate;
 	float springSpringTerm;
 	/**
@@ -2142,42 +2135,6 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 	tyre.center2 = B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.5f * w->width };
 	tyre.radius = w->radius;
 	b3CreateCapsuleShape( w->body, &sd, &tyre );
-
-	/*
-	 * The bump stop, as a real collider on the CHASSIS.
-	 *
-	 * Erwin Coumans' answer to this exact symptom, and the piece the talk leaves
-	 * to a force: "add a small cylinder shape for each wheel in the bottomed out
-	 * position to the car rigid body, so the physics takes over once the ground
-	 * is hit too hard — make it smaller than the actual wheel so it does not hit
-	 * the ground during normal driving."
-	 *
-	 * It sits AT the hard point with a radius a hair under the tyre's, so it
-	 * touches nothing until the wheel has run out of travel — and from there the
-	 * engine's own contact solver stops the machine, with the chassis's real
-	 * mass, its substep handling and its speculative contacts. Everything this
-	 * controller could do at that moment is either a force that arrives a tick
-	 * late or a hand-rolled row that knows about 20 kg of tyre.
-	 */
-	b3ShapeDef stopDef = b3DefaultShapeDef();
-	stopDef.density = 0.0f;
-	stopDef.enableContactEvents = false;
-
-	b3ShapeId chassisShapes[1];
-	if ( b3Body_GetShapes( v->chassis, chassisShapes, 1 ) == 1 )
-	{
-		// The machine's own filter, so a bump stop collides with exactly what the
-		// chassis collides with and never with the machine itself.
-		stopDef.filter = b3Shape_GetFilter( chassisShapes[0] );
-	}
-
-	b3Sphere stop;
-	stop.center = w->chassisConnectionPointCs;
-	stop.radius = w->radius - BUMP_STOP_CLEARANCE;
-	if ( stop.radius > 0.0f )
-	{
-		w->bumpStop = b3CreateSphereShape( v->chassis, &stopDef, &stop );
-	}
 
 	ApplyWheelMass( v, w );
 
