@@ -113,11 +113,6 @@ static const float HARD_POINT_FORCE_SCALE = 3.0f;
 static const float PLACEMENT_DEADBAND = 0.005f;
 static const float MAX_RECOVERY_SPEED = 30.0f;
 
-/** How far past its hard point a tyre may be found and still count as resting on
- *  that surface. A bottomed wheel is a little past; a block top half a metre up
- *  is not this wheel's ground at all. */
-static const float BOTTOMED_ALLOWANCE = 0.10f;
-
 /** Furthest a stuck contact may drift before the tyre is treated as having slipped. */
 static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
 
@@ -815,40 +810,6 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 	// heightfield's always-outward normal would mislead a normal-only test. The
 	// surface filter is applied per hit, inside the cast callback.
 	float suspensionDownward = -b3Dot( direction, worldUp );
-	/*
-	 * A surface the wheel cannot reach is not this wheel's ground.
-	 *
-	 * The cast starts well above the hard point — the talk's step 4, so a wheel
-	 * already in collision is never stuck — and that start is 2r plus the travel,
-	 * roughly a wheel diameter. Anything found up there comes back as a NEGATIVE
-	 * suspension length: a contact the wheel would have to pass its hard point to
-	 * touch, which step 9 forbids. On smooth terrain those hits are millimetres
-	 * and harmless. On a machine built out of blocks they are the tops of blocks
-	 * most of a diameter above the tyre, and the placement lifts the wheel onto
-	 * each one in turn — a car driven into another blueprint climbed it like a
-	 * ladder, 4.4 m up a Rocket, whatever the surface angle said. Upside down it
-	 * is worse: "above the hard point" then points at the ground, so the cast
-	 * reports terrain the car is nowhere near.
-	 *
-	 * Dropped here rather than in the loop below so an all-unreachable cast falls
-	 * through to the airborne branch, which is what it is.
-	 */
-	{
-		float offsetHere = offset;
-		int keep = 0;
-		for ( int c = 0; c < cast.count; c++ )
-		{
-			if ( cast.hits[c].fraction * maxToi - offsetHere < -BOTTOMED_ALLOWANCE )
-			{
-				continue;
-			}
-
-			cast.hits[keep] = cast.hits[c];
-			keep++;
-		}
-		cast.count = keep;
-	}
-
 	bool accepted = cast.count > 0 && suspensionDownward > cosf( w->suspensionRejectAngle );
 
 	w->info.groundBody = -1;
@@ -890,8 +851,6 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 			contact->normalWs = axial;
 
 			float rawLength = hit->fraction * maxToi - offset;
-
-
 			StoreSuspensionLength( contact, rawLength, maxSuspensionLength );
 			contact->force = 0.0f;
 
