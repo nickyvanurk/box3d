@@ -370,6 +370,9 @@ typedef struct
 	float skidInfo;
 	/** Did the friction circle bind for this tyre this tick? */
 	bool isSliding;
+	/** How much of this wheel's mass is already off the chassis, so a repeat call
+	 *  moves the difference instead of the whole thing again. */
+	float massTakenFromChassis;
 	/** Seconds left of the two transient slippery states — see `UpdateFriction`. */
 	float landedSlipperyTime;
 	float brakePressSlipperyTime;
@@ -2208,14 +2211,41 @@ static void ApplyWheelMass( Vehicle* v, Wheel* w )
 		return;
 	}
 
+	/*
+	 * ONCE per wheel, and never more than the wheels' share of the machine.
+	 *
+	 * A wheel becoming a body must not make the machine heavier, so its mass
+	 * comes off the chassis. Two things were wrong with doing that here.
+	 *
+	 * It was not idempotent: this runs again every time the game sets a wheel's
+	 * mass, and each call subtracted afresh. And it was unbounded: a tank's
+	 * twelve tracked wheels want more than the whole machine, so the chassis
+	 * ended at the 0.1 kg floor — a paper hull carrying twelve heavy wheels on
+	 * joints, suspensions slammed to their stops, wheels pushing seven times the
+	 * machine's weight.
+	 *
+	 * Removing the transfer entirely was tried and is worse: the machine then
+	 * weighs its wheels twice and the Car stops turning.
+	 *
+	 * `massTakenFromChassis` is what this wheel has already moved, so a repeat
+	 * call moves only the difference. The share is half the machine between all
+	 * the wheels, because a chassis lighter than the wheels hanging off it is not
+	 * a vehicle any solver can hold together.
+	 */
+	int n = v->wheelCount > 0 ? v->wheelCount : 1;
 	b3MassData chassis = b3Body_GetMassData( v->chassis );
-	float remaining = chassis.mass - w->mass;
+
+	float whole = chassis.mass + w->massTakenFromChassis;
+	float budget = whole / (float)( 2 * n );
+	float want = w->mass < budget ? w->mass : budget;
+
+	float remaining = whole - want;
 	if ( remaining < 0.1f )
 	{
-		// A machine whose wheels outweigh it. Keep something on the chassis
-		// rather than handing the solver a zero or negative mass.
 		remaining = 0.1f;
 	}
+
+	w->massTakenFromChassis = want;
 	chassis.mass = remaining;
 	b3Body_SetMassData( v->chassis, chassis );
 
