@@ -1189,6 +1189,65 @@ static int DrivenUpASlopeStaysOnIt( void )
 // speed; the game is not, and the differences are four corners, a chassis free
 // to pitch, and terrain that curves. This adds the first two.
 /*
+ * A wheel mounted high enough that the ground is out of its reach stays where
+ * its suspension holds it.
+ *
+ * A tank's end idlers are mounted a quarter of a metre above the road wheels
+ * deliberately, so that they never touch flat ground. Placing a hanging tyre
+ * down onto the surface has to respect that: a spring extends to its rest
+ * length, and the travel past it is compression room, not reach. Bounding the
+ * placement by rest PLUS travel put those idlers on the floor.
+ */
+static int AHighMountedWheelStaysOffTheGround( void )
+{
+	WheelRig rig = CreateRig( 0.0f, 1 );
+
+	// A second wheel on the same chassis, mounted 250 mm higher than the first —
+	// the tank's own geometry.
+	b3w_vehicle_add_wheel( rig.vehicle, 0.5f, -0.05f, 0.0f, 0.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.25f, rig.radius,
+						   0.3f );
+
+	Vehicle* v = b3w_vehicle_get( rig.vehicle );
+	float stiffness = 9.81f / ( 0.4f * 0.25f );
+	float critical = 2.0f * sqrtf( stiffness / (float)v->wheelCount );
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		b3w_vehicle_set_wheel_mass( rig.vehicle, i, 20.0f );
+		b3w_vehicle_set_suspension_stiffness( rig.vehicle, i, stiffness / (float)v->wheelCount );
+		b3w_vehicle_set_suspension_compression( rig.vehicle, i, 0.55f * critical );
+		b3w_vehicle_set_suspension_relaxation( rig.vehicle, i, 0.8f * critical );
+		b3w_vehicle_set_max_suspension_travel( rig.vehicle, i, g_rigTravel );
+		b3w_vehicle_set_max_suspension_force( rig.vehicle, i, 20000.0f );
+	}
+
+	StepRig( &rig, 240 );
+
+	Wheel* high = &v->wheels[1];
+	float wheelY = (float)b3Body_GetPosition( high->body ).y;
+	float clearance = wheelY - rig.radius;
+
+	// Where the wheel actually hangs, not the length the cast reported: the cast
+	// answers "how far away is the ground", which for this wheel is its whole
+	// reach and says nothing about where the tyre was put.
+	b3WorldTransform chassisT = b3Body_GetTransform( rig.chassis );
+	b3Pos hardPoint = AddPosVec( chassisT.p, b3RotateVector( chassisT.q, high->chassisConnectionPointCs ) );
+	float travel = b3Dot( high->wheelDirectionWs, SubPos( b3Body_GetPosition( high->body ), hardPoint ) );
+
+	printf( "    high-mounted wheel: y %.3f, %.1f mm clear of the ground, hangs %.3f below a rest of %.3f\n", wheelY,
+			clearance * 1000.0f, travel, high->suspensionRestLength );
+	(void)travel;
+
+	// Only the clearance is asserted. How far the JOINT lets an unloaded wheel
+	// droop — rest plus travel, everywhere in this controller — is a separate
+	// question from how far a placement may drag one, and this covers the second.
+	ENSURE( clearance > 0.05f );
+
+	b3w_vehicle_destroy( rig.vehicle );
+	b3DestroyWorld( rig.world );
+	return 0;
+}
+
+/*
  * Driving one way and the other, on flat ground, should ride the same height.
  *
  * Reported as "riding backward does not raise my chassis, riding forward does".
@@ -2113,6 +2172,7 @@ static int RebuildingAVehicleManyTimes( void )
 
 int WheelRigTest( void )
 {
+	RUN_SUBTEST( AHighMountedWheelStaysOffTheGround );
 	RUN_SUBTEST( DrivenBothWaysRidesTheSame );
 	RUN_SUBTEST( DroppedOnFlatGround );
 	RUN_SUBTEST( PenetrationAcrossTickRates );

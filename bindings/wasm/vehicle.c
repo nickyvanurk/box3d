@@ -1847,13 +1847,15 @@ static void PlaceWheels( Vehicle* v )
 		 * because the damper was reading its own placement sawtooth. A tyre is
 		 * placed where the ground is, in both directions.
 		 *
-		 * Down is bounded by the suspension's own reach, so a wheel over a drop
-		 * extends to full droop and no further.
+		 * Down is bounded by the REST length, which is as far as a spring extends:
+		 * travel past it is compression room, not reach. Bounding by rest plus
+		 * travel instead let a wheel a builder mounted high — a tank's raised
+		 * idlers, which are meant never to touch flat ground — be dragged a whole
+		 * extra travel down onto the floor.
 		 */
 		if ( needed <= 0.0f )
 		{
-			float maxSuspensionLength = w->suspensionRestLength + w->maxSuspensionTravel;
-			float droop = maxSuspensionLength - travel;
+			float droop = w->suspensionRestLength - travel;
 			if ( droop <= 0.0f )
 			{
 				continue;
