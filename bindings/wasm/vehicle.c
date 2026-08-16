@@ -2812,10 +2812,31 @@ void b3w_vehicle_solve( Vehicle* v, float h )
 	 */
 	UpdateContacts( v, h );
 
-	float chassisMass = b3Body_GetMass( v->chassis );
+	/*
+	 * The spring is sized against the MACHINE, not against the hull alone.
+	 *
+	 * `computeSuspensionRates` derives a rate from the ride height a player
+	 * authors — `k = |g| / (n * sag)` — and the force is that rate times the mass
+	 * it carries. Passing only the chassis's mass forgot the wheels, which stopped
+	 * being part of the chassis the moment each one became a body: the suspension
+	 * was then sized for a load lighter than the machine and settled below its own
+	 * sag. On a tank, whose wheels are a third of it, the inner wheels sat 94% of
+	 * the way to their stops while parked on flat ground, with nothing left to
+	 * absorb anything.
+	 *
+	 * A wheel resting on the ground carries itself, so this is a small correction
+	 * for a car and a large one for a machine that is mostly wheels — which is
+	 * exactly the difference between the two that kept showing up.
+	 */
+	float machineMass = b3Body_GetMass( v->chassis );
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
-		ApplySuspensionForce( v, &v->wheels[i], chassisMass, h );
+		machineMass += v->wheels[i].massTakenFromChassis;
+	}
+
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		ApplySuspensionForce( v, &v->wheels[i], machineMass, h );
 	}
 
 	for ( int i = 0; i < v->wheelCount; i++ )
@@ -2823,6 +2844,17 @@ void b3w_vehicle_solve( Vehicle* v, float h )
 		Wheel* w = &v->wheels[i];
 		if ( B3_IS_NULL( w->body ) || w->info.contactCount == 0 )
 		{
+			/*
+			 * A wheel touching nothing pushes on nothing.
+			 *
+			 * `SolveWheelContacts` clears this when it finds no rows, but skipping
+			 * the call skipped the clearing too, so a wheel that left the ground
+			 * kept the last normal force it ever had — for as long as it stayed in
+			 * the air. A tank's raised idlers, which never touch at all, reported
+			 * six kilonewtons apiece on a machine that weighs one. Friction grip is
+			 * a coefficient times this number, so they carried the grip to match.
+			 */
+			w->wheelSuspensionForce = 0.0f;
 			continue;
 		}
 
