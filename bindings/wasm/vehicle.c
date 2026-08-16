@@ -836,6 +836,19 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 	// heightfield's always-outward normal would mislead a normal-only test. The
 	// surface filter is applied per hit, inside the cast callback.
 	float suspensionDownward = -b3Dot( direction, worldUp );
+	/*
+	 * Where the cast WENT, recorded whether or not it found anything.
+	 *
+	 * These three only exist for the debug view, and they were written inside the
+	 * accepted branch — so a wheel that found no ground kept the last values it
+	 * had and its prism stayed at a stale angle while the machine turned. On a
+	 * tank the corner wheels are off the ground most of the time, so most of the
+	 * casts on screen were frozen.
+	 */
+	w->info.lastCastStart = castStart;
+	w->info.lastAxleWs = axle;
+	w->info.lastToi = maxToi;
+
 	bool accepted = cast.count > 0 && suspensionDownward > cosf( w->suspensionRejectAngle );
 
 	w->info.groundBody = -1;
