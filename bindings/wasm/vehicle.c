@@ -2189,7 +2189,20 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 	stop.radius = w->radius - BUMP_STOP_CLEARANCE;
 	if ( stop.radius > 0.0f )
 	{
+		/*
+		 * Adding a shape RE-DERIVES the body's mass from its shapes, and the
+		 * game's chassis mass is authored, not derived — so creating this sphere
+		 * silently replaced it. What was left after `ApplyWheelMass` took the
+		 * wheels off it was the 0.1 kg floor, and a machine that weighs 0.1 kg
+		 * answers its first real impact with a velocity of 1e13 and then NaN.
+		 *
+		 * So the mass is put back exactly as it was. The stop is a collider, not
+		 * a part of the machine, and it has no business changing what the machine
+		 * weighs.
+		 */
+		b3MassData before = b3Body_GetMassData( v->chassis );
 		b3CreateSphereShape( v->chassis, &stopDef, &stop );
+		b3Body_SetMassData( v->chassis, before );
 	}
 
 	ApplyWheelMass( v, w );
