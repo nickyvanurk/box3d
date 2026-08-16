@@ -1984,6 +1984,7 @@ static void ApplySuspensionForce( Vehicle* v, Wheel* w, float chassisMass, float
 {
 	if ( B3_IS_NULL( w->body ) )
 	{
+		w->springForce = 0.0f;
 		return;
 	}
 
@@ -2034,6 +2035,7 @@ static void ApplySuspensionForce( Vehicle* v, Wheel* w, float chassisMass, float
 	// A suspension pushes apart and never pulls together, and it has a ceiling.
 	if ( force <= 0.0f )
 	{
+		w->springForce = 0.0f;
 		return;
 	}
 	if ( force > w->maxSuspensionForce )
@@ -2269,10 +2271,24 @@ static void SolveWheelContacts( Vehicle* v, Wheel* w, float h )
 	// The upward force on the hard point, on what the placement could not absorb.
 	ApplyHardPointForce( v, w, h );
 
-	// THE normal force, read out of the constraint rather than computed by us.
-	// Friction is a coefficient times this number, which is the whole reason the
-	// talk introduces the point constraint before it talks about tyres.
-	w->wheelSuspensionForce = total;
+	/*
+	 * THE normal force: what the tyre presses on the ground with.
+	 *
+	 * The talk reads it straight out of the constraint, because in their build the
+	 * constraint carries the machine — the suspension pushes the chassis up and
+	 * the wheel down, and the ground answers the pair. Here the suspension's
+	 * reaction is deliberately NOT put on the wheel (a placed tyre would only have
+	 * to undo it), so this constraint holds up the WHEEL and nothing else, and on
+	 * a car with 1 kg wheels it read 10 N. Friction is a coefficient times this
+	 * number: an 800 kg car had the grip of a shopping trolley, which is why it
+	 * slid 314 m down a 10 degree slope parked and delivered a fifth of the
+	 * acceleration its engine force commanded.
+	 *
+	 * The load is on the other side of the same equation. What the suspension
+	 * pushed the chassis up with is what it pushed the tyre down with, and the
+	 * contact carries the wheel's own weight on top.
+	 */
+	w->wheelSuspensionForce = total + w->springForce;
 }
 
 
