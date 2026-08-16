@@ -131,6 +131,13 @@ static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
  *  this is the same idea, reached by how hard the brake is pulled. */
 static const float BRAKE_SIDE_GRIP = 0.5f;
 
+/** The other two transient states, from the same source: a stab of brake, and
+ *  the moment after a landing. The arcade numbers are 0.5 and 0.02. */
+static const float BRAKE_PRESS_SIDE_GRIP = 0.5f;
+static const float BRAKE_PRESS_SLIPPERY_SECONDS = 0.4f;
+static const float LANDING_SIDE_GRIP = 0.1f;
+static const float LANDING_SLIPPERY_SECONDS = 0.5f;
+
 /**
  * One place a wheel touches the world.
  *
@@ -363,6 +370,10 @@ typedef struct
 	float skidInfo;
 	/** Did the friction circle bind for this tyre this tick? */
 	bool isSliding;
+	/** Seconds left of the two transient slippery states — see `UpdateFriction`. */
+	float landedSlipperyTime;
+	float brakePressSlipperyTime;
+	bool brakeWasHeld;
 	/**
 	 * The friction of the ground under this tyre, from the shape it is standing
 	 * on. 1.0 when it is not standing on anything.
@@ -1246,6 +1257,21 @@ static void UpdateFriction( Vehicle* v, float dt )
 		 * hold, so a coasting car's token brake does nothing and a real one
 		 * unsticks the back of the car.
 		 */
+		/*
+		 * Transient slippery states, the way `ArcadeCarPhysics` does it.
+		 *
+		 * Three of them, each a coefficient on the sideways force that decays on
+		 * its own clock, and the SMALLEST wins — held brake, the moment a brake is
+		 * first pressed, and the moment after a landing. None of them is a slip
+		 * angle or a friction circle; they are the arcade admission that a tyre's
+		 * grip is a story about what just happened to it, not only about the load
+		 * on it right now.
+		 */
+		float sideGrip = 1.0f;
+
+		// Held brake: the handbrake. Scaled by how hard the brake is asked for
+		// against what the tyre can hold, so a coasting car's token brake does
+		// nothing and a real one unsticks the back of the car.
 		float hold = w->wheelSuspensionForce * v->stepDt * w->frictionSlip * w->surfaceFriction;
 		if ( w->brake > 0.0f && hold > 0.0f )
 		{
@@ -1255,8 +1281,48 @@ static void UpdateFriction( Vehicle* v, float dt )
 				demandRatio = 1.0f;
 			}
 
-			w->sideImpulse *= 1.0f + demandRatio * ( BRAKE_SIDE_GRIP - 1.0f );
+			float braked = 1.0f + demandRatio * ( BRAKE_SIDE_GRIP - 1.0f );
+			sideGrip = braked < sideGrip ? braked : sideGrip;
 		}
+
+		// The moment a brake is FIRST pressed: a short, milder loss, so a stab of
+		// brake mid-corner steps the car out before the held-brake term takes
+		// over. `brakeSlipperyK` in the arcade controller, on a rising edge.
+		bool braking = w->brake > 0.0f;
+		if ( braking && !w->brakeWasHeld )
+		{
+			w->brakePressSlipperyTime = BRAKE_PRESS_SLIPPERY_SECONDS;
+		}
+		w->brakeWasHeld = braking;
+
+		if ( w->brakePressSlipperyTime > 0.0f )
+		{
+			w->brakePressSlipperyTime -= v->stepDt;
+			float t = w->brakePressSlipperyTime * SafeInv( BRAKE_PRESS_SLIPPERY_SECONDS );
+			t = t < 0.0f ? 0.0f : t;
+			float pressed = 1.0f + t * ( BRAKE_PRESS_SIDE_GRIP - 1.0f );
+			sideGrip = pressed < sideGrip ? pressed : sideGrip;
+		}
+
+		// And after a landing: full sideways grip the instant a wheel touches is a
+		// constraint appearing under a moving machine, which is what snaps a car
+		// sideways when it comes down on one corner.
+		if ( !w->info.isInContact )
+		{
+			w->landedSlipperyTime = LANDING_SLIPPERY_SECONDS;
+		}
+		else if ( w->landedSlipperyTime > 0.0f )
+		{
+			w->landedSlipperyTime -= v->stepDt;
+			float t = w->landedSlipperyTime * SafeInv( LANDING_SLIPPERY_SECONDS );
+			t = t < 0.0f ? 0.0f : t;
+			// Smoothstep, so grip returns without a step in it.
+			t = t * t * t * ( t * ( t * 6.0f - 15.0f ) + 10.0f );
+			float landed = 1.0f + t * ( LANDING_SIDE_GRIP - 1.0f );
+			sideGrip = landed < sideGrip ? landed : sideGrip;
+		}
+
+		w->sideImpulse *= sideGrip;
 
 		/*
 		 * Share the lateral cancel across wheels ONLY at rest.
