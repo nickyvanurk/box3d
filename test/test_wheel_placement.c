@@ -515,7 +515,7 @@ static void StepRig( WheelRig* rig, int ticks )
 		// the pose everything downstream reads — the drawn tyre included — is the
 		// sunk one. Placing again after the step is the same operation applied to
 		// the pose that actually leaves the tick.
-		PlaceWheels( v );
+		CastAndPlaceWheels( v );
 		v->armed = false;
 
 		if ( g_rigTrace && i >= ticks - 4 )

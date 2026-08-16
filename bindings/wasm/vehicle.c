@@ -2289,12 +2289,16 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 		v->currentVehicleSpeed *= -1.0f;
 	}
 
+	// The cast, but NOT the placement. The substeps need contacts to push
+	// against; the wheel's POSE is corrected once, after the solver has moved the
+	// machine — see `CastAndPlaceWheels`. Placing here as well meant two
+	// corrections per tick, and the second one had to undo the first: measured on
+	// a slope climb, the extra shove added 20 mm of depth and half a metre per
+	// second of speed the driver never asked for.
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
 		ShapeCastWheel( v, i, dt );
 	}
-
-	PlaceWheels( v );
 
 	// Wheel spin, once per TICK. It is odometry — how far the tyre rolled — not a
 	// force, so it advances with the tick, not with each substep.
@@ -3022,6 +3026,28 @@ int b3w_vehicle_debug_draw( int worldHandle, float* verts, float* colors, int ca
 }
 
 /**
+ * Look, then fix the wheels — the post-step half of the tick.
+ *
+ * The cast in `prepare` describes the world as it was BEFORE the solver
+ * integrated anything, so placing against it afterwards corrects the wheel
+ * toward a surface the chassis has already left. At 12 m/s a tick is half a
+ * metre, which is most of a wheel, and the faster the approach to a rise the
+ * deeper the tyre ends up buried in it. Casting again here costs a second cast
+ * per wheel per tick and answers the question the placement is actually asking:
+ * where is the ground under the wheel NOW.
+ */
+static void CastAndPlaceWheels( Vehicle* v )
+{
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		UpdateWheelTransforms( v, i );
+		ShapeCastWheel( v, i, v->stepDt );
+	}
+
+	PlaceWheels( v );
+}
+
+/**
  * Place every armed vehicle's wheels, after the world has stepped.
  *
  * The talk's step 7 is a POSE assignment, and doing it only before the solve
@@ -3045,7 +3071,7 @@ void b3w_vehicle_place_wheels( int worldHandle )
 			continue;
 		}
 
-		PlaceWheels( v );
+		CastAndPlaceWheels( v );
 	}
 }
 
