@@ -1744,12 +1744,34 @@ static void PlaceWheels( Vehicle* v )
 		Wheel* w = &v->wheels[i];
 		w->hardPointPenetration = 0.0f;
 
-		if ( B3_IS_NULL( w->body ) || !w->info.isInContact )
+		if ( B3_IS_NULL( w->body ) )
 		{
 			continue;
 		}
 
 		b3Pos hardPoint = AddPosVec( chassisT.p, b3RotateVector( chassisT.q, w->chassisConnectionPointCs ) );
+
+		if ( !w->info.isInContact )
+		{
+			/*
+			 * A wheel touching nothing still belongs to the machine.
+			 *
+			 * This skipped it entirely, so an airborne wheel's body kept whatever
+			 * pose it last had while the machine turned and pitched underneath
+			 * it — and the joint, with nothing pressing on the wheel, is in no
+			 * hurry to correct it. On a tank the corner wheels spend most of
+			 * their time off the ground, so their casts and bodies sat at stale
+			 * angles while the tracks they belong to moved.
+			 *
+			 * Only its ORIENTATION is taken back. Where it hangs is the joint's
+			 * business and the suspension's: moving it here as well put a parked
+			 * car's tyre 234 mm above the ground, because a cast that misses for
+			 * one tick would then yank the wheel out to full droop.
+			 */
+			b3Quat frame = b3MulQuat( chassisT.q, WheelFrameRotation( w->directionCs, w->axleCs ) );
+			b3Body_SetTransform( w->body, b3Body_GetPosition( w->body ), frame );
+			continue;
+		}
 		b3Pos now = b3Body_GetPosition( w->body );
 
 		// Every contact this tyre found, not just the nearest: it has to clear the
