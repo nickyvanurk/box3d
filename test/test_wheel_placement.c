@@ -413,7 +413,13 @@ static void AddRigWheels( WheelRig* rig, int wheelCount )
 	// length, damping a fraction of critical (`wheel-config.ts`).
 	float sag = 0.4f * 0.25f;
 	float stiffness = 9.81f / sag;
-	float critical = 2.0f * sqrtf( stiffness );
+	// Per WHEEL, exactly as `wheel-config.ts:125` derives it: the stiffness each
+	// wheel carries is `k / n`, so its critical damping is `2 * sqrt(k / n)`.
+	// Without the divide a four-wheeled rig runs at twice critical, and an
+	// over-damped suspension cannot hold the car up while it is moving — it sank
+	// onto its bump stops within a second and every ramp number measured that
+	// instead of the controller.
+	float critical = 2.0f * sqrtf( stiffness / (float)( wheelCount > 0 ? wheelCount : 1 ) );
 
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
@@ -494,6 +500,7 @@ static WheelRig CreateRig( float slopeRadians, int wheelCount )
 }
 
 static bool g_rigTrace = false;
+int g_traceWheel = 0;
 
 static void StepRig( WheelRig* rig, int ticks )
 {
@@ -611,6 +618,17 @@ static int RestsOnFlatGround( void )
 	printf( "    chassis y %.3f  wheel y %.3f  contact %d  contacts %d  suspLen %.3f  hardPointPen %.3f\n",
 			(float)chassisPos.y, (float)wheelPos.y, dw->info.isInContact ? 1 : 0, dw->info.contactCount,
 			dw->info.suspensionLength, dw->hardPointPenetration );
+
+	{
+		b3Pos hp = AddPosVec( b3Body_GetTransform( rig.chassis ).p,
+							  b3RotateVector( b3Body_GetRotation( rig.chassis ), dw->chassisConnectionPointCs ) );
+		float travel = b3Dot( dw->wheelDirectionWs, SubPos( b3Body_GetPosition( dw->body ), hp ) );
+		float sag = dw->suspensionRestLength - travel;
+		float chassisMass = b3Body_GetMass( rig.chassis );
+		printf( "    parked: travel %.1f mm of rest %.0f + travel %.0f, sag %.1f mm, spring %.0f N vs weight %.0f N\n",
+				travel * 1000.0f, dw->suspensionRestLength * 1000.0f, dw->maxSuspensionTravel * 1000.0f, sag * 1000.0f,
+				chassisMass * dw->suspensionStiffness * sag, chassisMass * 9.81f );
+	}
 
 	float depth = TyreDepth( &rig );
 	printf( "    flat ground: tyre %.2f mm below the surface\n", depth * 1000.0f );
@@ -1708,10 +1726,14 @@ static int HittingASuddenSlope( void )
 				}
 
 				float depth = (float)( hit.point.y - ( centre.y - rig.radius ) );
-				if ( a == 1 && i >= 38 && i <= 44 && k == 0 )
+				if ( g_rigTrace && ( i % 4 == 0 ) && i <= 44 && k == 0 )
 				{
-					printf( "        tick %3d: depth %6.1f mm, contacts %d, suspLen %.3f, leftover %.1f mm, vy %6.2f\n",
-							i, depth * 1000.0f, w->info.contactCount, w->info.suspensionLength,
+					b3Pos hp = AddPosVec( b3Body_GetTransform( rig.chassis ).p,
+										  b3RotateVector( b3Body_GetRotation( rig.chassis ), w->chassisConnectionPointCs ) );
+					float travel = b3Dot( w->wheelDirectionWs, SubPos( b3Body_GetPosition( w->body ), hp ) );
+					printf( "        tick %3d w%d: depth %6.1f mm, contacts %d, travel %5.1f/%.0f mm, leftover %.1f mm, vy %6.2f\n",
+							i, k, depth * 1000.0f, w->info.contactCount, travel * 1000.0f,
+							( w->suspensionRestLength + w->maxSuspensionTravel ) * 1000.0f,
 							w->hardPointPenetration * 1000.0f, b3Body_GetLinearVelocity( rig.chassis ).y );
 				}
 				if ( depth > worst )
@@ -1728,6 +1750,76 @@ static int HittingASuddenSlope( void )
 		b3w_vehicle_destroy_world( rig.world );
 		b3DestroyWorld( rig.world );
 		g_rigMeshGround = false;
+	}
+
+	return 0;
+}
+
+/**
+ * Dropped flat onto flat ground, which is the plainest way to see a tyre in the
+ * terrain: no slope, no throttle, no steering, nothing to blame but the landing.
+ *
+ * Reported from the game as a car spawned from a height sitting with its wheels
+ * visibly buried once it settles.
+ */
+static int DroppedOnFlatGround( void )
+{
+	float heights[3] = { 1.0f, 3.0f, 6.0f };
+
+	for ( int h = 0; h < 3; h++ )
+	{
+		WheelRig rig = CreateRig( 0.0f, 4 );
+		TeleportRig( &rig, B3_LITERAL( b3Pos ){ 0.0f, heights[h], 0.0f }, b3Quat_identity, b3Vec3_zero );
+
+		Vehicle* v = b3w_vehicle_get( rig.vehicle );
+		float worst = 0.0f;
+		int worstTick = -1;
+
+		for ( int i = 0; i < 200; i++ )
+		{
+			b3w_vehicle_prepare( v, RIG_TICK );
+			b3World_Step( rig.world, RIG_TICK, g_rigSubsteps );
+			b3w_vehicle_place_wheels( 0 );
+			v->armed = false;
+
+			for ( int k = 0; k < v->wheelCount; k++ )
+			{
+				Wheel* w = &v->wheels[k];
+				if ( B3_IS_NULL( w->body ) )
+				{
+					continue;
+				}
+
+				// Ground is the plane y = 0, so the tyre's lowest point is its
+				// centre minus a radius. No cast needed and nothing to mis-read.
+				float depth = -(float)( b3Body_GetPosition( w->body ).y - w->radius );
+				if ( depth > worst )
+				{
+					worst = depth;
+					worstTick = i;
+				}
+			}
+		}
+
+		// And where it ended up, which is what a player looks at.
+		float settled = 0.0f;
+		float travel = 0.0f;
+		for ( int k = 0; k < v->wheelCount; k++ )
+		{
+			Wheel* w = &v->wheels[k];
+			float depth = -(float)( b3Body_GetPosition( w->body ).y - w->radius );
+			settled = depth > settled ? depth : settled;
+
+			b3Pos hp = AddPosVec( b3Body_GetTransform( rig.chassis ).p,
+								  b3RotateVector( b3Body_GetRotation( rig.chassis ), w->chassisConnectionPointCs ) );
+			travel += b3Dot( w->wheelDirectionWs, SubPos( b3Body_GetPosition( w->body ), hp ) ) / (float)v->wheelCount;
+		}
+
+		printf( "    dropped from %.0f m: worst %.1f mm at tick %d, settled %.1f mm, travel %.1f mm\n", heights[h],
+				worst * 1000.0f, worstTick, settled * 1000.0f, travel * 1000.0f );
+
+		b3w_vehicle_destroy_world( rig.world );
+		b3DestroyWorld( rig.world );
 	}
 
 	return 0;
@@ -1823,6 +1915,7 @@ static int RebuildingAVehicleManyTimes( void )
 
 int WheelRigTest( void )
 {
+	RUN_SUBTEST( DroppedOnFlatGround );
 	RUN_SUBTEST( HittingASuddenSlope );
 	RUN_SUBTEST( DrivingIntoASteepFace );
 	// The driven case first: it is the one reproducing a reported symptom, and a
