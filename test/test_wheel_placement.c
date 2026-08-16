@@ -384,6 +384,49 @@ static void CreateCreasedGround( WheelRig* rig, float angle )
 	b3CreateMeshShape( rig->ground, &shapeDef, mesh, B3_LITERAL( b3Vec3 ){ 1.0f, 1.0f, 1.0f } );
 }
 
+/** The wheels and their tuning, so a rebuild can hang a fresh set under a fresh
+ *  chassis without a second copy of the game's numbers. */
+static void AddRigWheels( WheelRig* rig, int wheelCount )
+{
+	// The wheels, hung under the chassis: suspension straight down, axle across.
+	// One wheel isolates the contact machinery; four bring in what a chassis does
+	// when its corners disagree, which is where pitching and flipping live.
+	if ( wheelCount == 1 )
+	{
+		b3w_vehicle_add_wheel( rig->vehicle, 0.0f, -0.3f, 0.0f, 0.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.25f, rig->radius,
+							   0.3f );
+	}
+	else
+	{
+		for ( int i = 0; i < 4; i++ )
+		{
+			float x = ( i < 2 ) ? 0.5f : -0.5f;
+			float z = ( i % 2 == 0 ) ? 0.35f : -0.35f;
+			b3w_vehicle_add_wheel( rig->vehicle, x, -0.3f, z, 0.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.25f, rig->radius,
+								   0.3f );
+		}
+	}
+
+	Vehicle* v = b3w_vehicle_get( rig->vehicle );
+
+	// The game's own numbers for a single-wheel machine: sag is 40% of rest
+	// length, damping a fraction of critical (`wheel-config.ts`).
+	float sag = 0.4f * 0.25f;
+	float stiffness = 9.81f / sag;
+	float critical = 2.0f * sqrtf( stiffness );
+
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		b3w_vehicle_set_wheel_mass( rig->vehicle, i, 20.0f );
+		b3w_vehicle_set_suspension_stiffness( rig->vehicle, i, stiffness / (float)v->wheelCount );
+		b3w_vehicle_set_suspension_compression( rig->vehicle, i, 0.55f * critical );
+		b3w_vehicle_set_suspension_relaxation( rig->vehicle, i, 0.8f * critical );
+		b3w_vehicle_set_max_suspension_travel( rig->vehicle, i, g_rigTravel );
+		b3w_vehicle_set_max_suspension_force( rig->vehicle, i, 20000.0f );
+	}
+
+}
+
 static WheelRig CreateRig( float slopeRadians, int wheelCount )
 {
 	WheelRig rig;
@@ -444,42 +487,7 @@ static WheelRig CreateRig( float slopeRadians, int wheelCount )
 
 	rig.vehicle = b3w_vehicle_create( rig.world, 0, rig.chassis );
 
-	// The wheels, hung under the chassis: suspension straight down, axle across.
-	// One wheel isolates the contact machinery; four bring in what a chassis does
-	// when its corners disagree, which is where pitching and flipping live.
-	if ( wheelCount == 1 )
-	{
-		b3w_vehicle_add_wheel( rig.vehicle, 0.0f, -0.3f, 0.0f, 0.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.25f, rig.radius,
-							   0.3f );
-	}
-	else
-	{
-		for ( int i = 0; i < 4; i++ )
-		{
-			float x = ( i < 2 ) ? 0.5f : -0.5f;
-			float z = ( i % 2 == 0 ) ? 0.35f : -0.35f;
-			b3w_vehicle_add_wheel( rig.vehicle, x, -0.3f, z, 0.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.25f, rig.radius,
-								   0.3f );
-		}
-	}
-
-	Vehicle* v = b3w_vehicle_get( rig.vehicle );
-
-	// The game's own numbers for a single-wheel machine: sag is 40% of rest
-	// length, damping a fraction of critical (`wheel-config.ts`).
-	float sag = 0.4f * 0.25f;
-	float stiffness = 9.81f / sag;
-	float critical = 2.0f * sqrtf( stiffness );
-
-	for ( int i = 0; i < v->wheelCount; i++ )
-	{
-		b3w_vehicle_set_wheel_mass( rig.vehicle, i, 20.0f );
-		b3w_vehicle_set_suspension_stiffness( rig.vehicle, i, stiffness / (float)v->wheelCount );
-		b3w_vehicle_set_suspension_compression( rig.vehicle, i, 0.55f * critical );
-		b3w_vehicle_set_suspension_relaxation( rig.vehicle, i, 0.8f * critical );
-		b3w_vehicle_set_max_suspension_travel( rig.vehicle, i, g_rigTravel );
-		b3w_vehicle_set_max_suspension_force( rig.vehicle, i, 20000.0f );
-	}
+	AddRigWheels( &rig, wheelCount );
 
 	b3World_SetSubStepCallback( rig.world, RigSubstep, (void*)(intptr_t)rig.vehicle );
 	return rig;
@@ -1725,6 +1733,61 @@ static int HittingASuddenSlope( void )
 	return 0;
 }
 
+/**
+ * Build and tear a vehicle down again and again inside ONE world.
+ *
+ * Every other subtest here creates a world, drives, and destroys the world —
+ * which is exactly the case the game never runs. The game keeps one world for
+ * the session and rebuilds a machine on every edit, destroying the chassis
+ * BEFORE it frees the controller, and Box3D recycles body, shape and joint ids
+ * as it goes. A stale id is then not null and not obviously wrong: it addresses
+ * somebody else's body.
+ *
+ * That is where a wheel joint into a shapeless body trapped the continuous
+ * solver after fifty-odd rebuilds, with nothing visible in any single one.
+ */
+static int RebuildingAVehicleManyTimes( void )
+{
+	// Mesh ground, because that is what the game drives on and because the
+	// continuous solver reaches its mesh path only here.
+	g_rigMeshGround = true;
+	WheelRig rig = CreateRig( 0.0f, 4 );
+	StepRig( &rig, 10 );
+
+	for ( int round = 0; round < 200; round++ )
+	{
+		// The game's order: every body first, the controller after.
+		b3DestroyBody( rig.chassis );
+		b3w_vehicle_destroy( rig.vehicle );
+
+		b3BodyDef chassisDef = b3DefaultBodyDef();
+		chassisDef.type = b3_dynamicBody;
+		chassisDef.position = B3_LITERAL( b3Pos ){ 0.0f, 1.0f, 0.0f };
+		chassisDef.isBullet = true;
+		rig.chassis = b3CreateBody( rig.world, &chassisDef );
+
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.density = 400.0f;
+		shapeDef.filter.categoryBits = MACHINE_CATEGORY;
+		b3BoxHull box = b3MakeBoxHull( 0.6f, 0.3f, 0.4f );
+		b3CreateHullShape( rig.chassis, &shapeDef, &box.base );
+
+		rig.vehicle = b3w_vehicle_create( rig.world, 0, rig.chassis );
+		AddRigWheels( &rig, 4 );
+		b3World_SetSubStepCallback( rig.world, RigSubstep, (void*)(intptr_t)rig.vehicle );
+
+		StepRig( &rig, 4 );
+	}
+
+	ENSURE( b3Body_IsValid( rig.chassis ) );
+	printf( "    200 rebuilds in one world: still standing\n" );
+
+	b3w_vehicle_destroy_world( rig.world );
+	b3DestroyWorld( rig.world );
+	g_rigMeshGround = false;
+	return 0;
+}
+
 int WheelRigTest( void )
 {
 	RUN_SUBTEST( HittingASuddenSlope );
@@ -1742,5 +1805,6 @@ int WheelRigTest( void )
 	RUN_SUBTEST( RestsOnFlatGround );
 	RUN_SUBTEST( RestsOnASlope );
 	RUN_SUBTEST( PenetrationAgainstSpeed );
+	RUN_SUBTEST( RebuildingAVehicleManyTimes );
 	return 0;
 }

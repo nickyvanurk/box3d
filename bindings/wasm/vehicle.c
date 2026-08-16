@@ -2046,6 +2046,24 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 	def.rotation = b3MulQuat( chassisT.q, frame );
 	w->body = b3CreateBody( v->world, &def );
 
+	// A tyre-shaped collider with its collision OFF, which is what the talk
+	// describes — "the wheels are rigid bodies with their collision disabled" —
+	// and not the same thing as no collider at all. A shapeless dynamic body has
+	// no extent, so the solver cannot decide whether it moved far enough this
+	// step to need a swept test, and a joint into one corrupted the continuous
+	// pass badly enough to trap.
+	b3ShapeDef sd = b3DefaultShapeDef();
+	sd.filter.categoryBits = 0;
+	sd.filter.maskBits = 0;
+	sd.enableContactEvents = false;
+	sd.density = 0.0f;
+
+	b3Capsule tyre;
+	tyre.center1 = B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, -0.5f * w->width };
+	tyre.center2 = B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.5f * w->width };
+	tyre.radius = w->radius;
+	b3CreateCapsuleShape( w->body, &sd, &tyre );
+
 	ApplyWheelMass( v, w );
 
 	if ( v->sleepThreshold > 0.0f )
@@ -2114,6 +2132,21 @@ static void UpdateWheelTransforms( Vehicle* v, int wheelId )
 }
 
 /**
+ * Is this vehicle still something we may drive?
+ *
+ * The chassis belongs to the CALLER, not to us, and the game's teardown destroys
+ * every body before it frees the controllers — so between those two moments a
+ * tick can arrive for a vehicle whose chassis is already gone. Body ids are
+ * recycled, so a stale one is not null and not obviously wrong: it either reads
+ * another machine's body or trips the validity check deep inside the solver,
+ * which is where this surfaced.
+ */
+static bool IsVehicleLive( const Vehicle* v )
+{
+	return v->used && !B3_IS_NULL( v->chassis ) && b3Body_IsValid( v->chassis );
+}
+
+/**
  * Everything that must happen ONCE per full step: where the wheels are, how
  * fast the chassis is going, and the shape casts that find the ground.
  *
@@ -2123,6 +2156,15 @@ static void UpdateWheelTransforms( Vehicle* v, int wheelId )
  */
 void b3w_vehicle_prepare( Vehicle* v, float dt )
 {
+	// Nothing to prepare against a chassis the caller has already destroyed, and
+	// arming one would hand the substep solver a stale body id — see
+	// `IsVehicleLive`.
+	if ( !IsVehicleLive( v ) )
+	{
+		v->armed = false;
+		return;
+	}
+
 	v->stepDt = dt > 0.0f ? dt : 1.0f / 60.0f;
 	v->armed = true;
 
@@ -2461,7 +2503,7 @@ void b3w_vehicle_substep( float h, void* context )
 
 	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
 	{
-		if ( g_vehicles[i].used && g_vehicles[i].armed && b3StoreWorldId( g_vehicles[i].world ) == stepping )
+		if ( IsVehicleLive( &g_vehicles[i] ) && g_vehicles[i].armed && b3StoreWorldId( g_vehicles[i].world ) == stepping )
 		{
 			b3w_vehicle_solve( &g_vehicles[i], h );
 		}
@@ -2551,21 +2593,27 @@ void b3w_vehicle_destroy( int handle )
 
 	// Only here, never in `b3w_vehicle_destroy_world`: a world takes its bodies
 	// with it, so destroying them afterwards would be a free of freed memory.
+	bool chassisLives = !B3_IS_NULL( v->chassis ) && b3Body_IsValid( v->chassis );
+
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
-		// The joint first: destroying a body invalidates the joints attached to
-		// it, and freeing one afterwards is a use-after-free.
+		// Only what we still own. The game's teardown destroys every body before
+		// it frees the controllers, and Box3D takes a body's joints with it — so
+		// by the time we get here our joint may already be gone.
 		//
-		// Validity-checked rather than null-checked, because the caller may
-		// already have destroyed the chassis — the game's teardown removes every
-		// body before it frees the controllers — and Box3D takes the joints
-		// attached to it with it. A stale id is not a null one.
-		if ( !B3_IS_NULL( v->wheels[i].joint ) && b3Joint_IsValid( v->wheels[i].joint ) )
+		// Validity is NOT the test for that. Ids are recycled, so a freed joint
+		// id becomes a live id belonging to another machine within a few
+		// rebuilds, and destroying it on that machine's behalf corrupts a solver
+		// that has no idea it happened. The chassis is the honest witness: while
+		// it lives, our joints live; once it is gone, so are they.
+		if ( chassisLives && !B3_IS_NULL( v->wheels[i].joint ) )
 		{
 			b3DestroyJoint( v->wheels[i].joint, false );
 		}
 		v->wheels[i].joint = b3_nullJointId;
 
+		// The wheel BODY is ours alone — nothing else destroys it — so it is
+		// still here whatever became of the chassis.
 		if ( !B3_IS_NULL( v->wheels[i].body ) && b3Body_IsValid( v->wheels[i].body ) )
 		{
 			b3DestroyBody( v->wheels[i].body );
@@ -2987,7 +3035,7 @@ void b3w_vehicle_place_wheels( int worldHandle )
 	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
 	{
 		Vehicle* v = &g_vehicles[i];
-		if ( !v->used || v->worldHandle != worldHandle )
+		if ( !IsVehicleLive( v ) || v->worldHandle != worldHandle )
 		{
 			continue;
 		}
