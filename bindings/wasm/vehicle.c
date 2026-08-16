@@ -113,6 +113,12 @@ static const float HARD_POINT_FORCE_SCALE = 3.0f;
 static const float PLACEMENT_DEADBAND = 0.005f;
 static const float MAX_RECOVERY_SPEED = 30.0f;
 
+/** How close the tyre's lowest corner must be to a surface to count as standing
+ *  on it. A tyre that hangs above the ground carries no load, and the spring it
+ *  hangs from has nothing to push off: applying the reaction to the ground
+ *  anyway levitated a parked machine 235 mm into the air. */
+static const float TYRE_TOUCH_CLEARANCE = 0.01f;
+
 
 /** How far under the tyre's radius the bump stop sits. Measured: at 5 mm it
  *  carries a parked car, at 20 mm it levers a machine over on a climb, at 50 mm
@@ -295,7 +301,6 @@ typedef struct
 	 * of reading velocities was tried and left a parked car undamped, drifting
 	 * 4.89 m.
 	 */
-	float placementRate;
 	/** Diagnostics only — what the last tick asked the placement and the hard
 	 *  point to do, so a probe can see which of the two is carrying the car. */
 	float placementNeeded;
@@ -303,6 +308,7 @@ typedef struct
 	float springForce;
 	float springRate;
 	float springSpringTerm;
+	float springCompression;
 	/**
 	 * The tyre's mass, taken OFF the chassis when the wheel became a body.
 	 *
@@ -1751,6 +1757,32 @@ static float PlacementAlongSuspension( const Wheel* w, const WheelContact* conta
  * copies body state into its solver sets for the duration of a step, so a
  * `SetTransform` from inside one is overwritten by the solver's integration.
  */
+/**
+ * How far the tyre's deepest corner is ABOVE the surface it found, along the
+ * surface normal. Negative means it is in the ground.
+ *
+ * `isInContact` only says the cast found ground somewhere within the
+ * suspension's reach, which is up to a whole rest length plus travel away. That
+ * is the right question for the friction budget and the wrong one for "is the
+ * tyre standing on anything", and the two were being answered by the same flag.
+ */
+static float SurfaceClearance( const Wheel* w, const WheelContact* contact, b3Pos center )
+{
+	b3Vec3 n = contact->surfaceNormalWs;
+
+	b3Vec3 up = Scale( w->wheelDirectionWs, -1.0f );
+	b3Vec3 right = TryNormalize( w->wheelAxleWs, w->wheelAxleWs );
+
+	b3Pos p1 = AddPosVec( center, Add3( Scale( up, -w->radius ), Scale( right, w->width * 0.5f ) ) );
+	b3Pos p2 = AddPosVec( center, Sub3( Scale( up, -w->radius ), Scale( right, w->width * 0.5f ) ) );
+
+	float s1 = b3Dot( n, SubPos( p1, center ) );
+	float s2 = b3Dot( n, SubPos( p2, center ) );
+	b3Pos deepest = s1 < s2 ? p1 : p2;
+
+	return b3Dot( n, SubPos( deepest, contact->pointWs ) );
+}
+
 static void PlaceWheels( Vehicle* v )
 {
 	b3WorldTransform chassisT = b3Body_GetTransform( v->chassis );
@@ -1759,6 +1791,7 @@ static void PlaceWheels( Vehicle* v )
 	{
 		Wheel* w = &v->wheels[i];
 		w->hardPointPenetration = 0.0f;
+
 
 		if ( B3_IS_NULL( w->body ) )
 		{
@@ -1799,24 +1832,57 @@ static void PlaceWheels( Vehicle* v )
 			needed = move > needed ? move : needed;
 		}
 
+		b3Vec3 up = Scale( w->wheelDirectionWs, -1.0f );
+		float travel = b3Dot( w->wheelDirectionWs, SubPos( now, hardPoint ) );
+
+		/*
+		 * A tyre HANGING above the surface is placed down onto it, the same way one
+		 * standing in it is placed out of it.
+		 *
+		 * The placement only ever lifted, so a wheel that ended a tick clear of the
+		 * ground stayed clear — and `isInContact` is true for anything the cast can
+		 * reach, which is a whole rest length plus travel away. The suspension then
+		 * pushed the chassis up off a tyre touching nothing and the machine
+		 * levitated: 105 mm on the game's own Car, parked, and it sagged back only
+		 * because the damper was reading its own placement sawtooth. A tyre is
+		 * placed where the ground is, in both directions.
+		 *
+		 * Down is bounded by the suspension's own reach, so a wheel over a drop
+		 * extends to full droop and no further.
+		 */
 		if ( needed <= 0.0f )
 		{
+			float maxSuspensionLength = w->suspensionRestLength + w->maxSuspensionTravel;
+			float droop = maxSuspensionLength - travel;
+			if ( droop <= 0.0f )
+			{
+				continue;
+			}
+
+			float clearance = SurfaceClearance( w, &w->info.contacts[0], now );
+			for ( int c = 1; c < w->info.contactCount && c < B3W_MAX_CONTACTS; c++ )
+			{
+				float other = SurfaceClearance( w, &w->info.contacts[c], now );
+				clearance = other < clearance ? other : clearance;
+			}
+
+			if ( clearance <= TYRE_TOUCH_CLEARANCE )
+			{
+				continue;
+			}
+
+			float down = clearance < droop ? clearance : droop;
+			b3Body_SetTransform( w->body, AddPosVec( now, Scale( up, -down ) ), b3Body_GetRotation( w->body ) );
 			continue;
 		}
 
 		// Never past the hard point.
-		b3Vec3 up = Scale( w->wheelDirectionWs, -1.0f );
-		float travel = b3Dot( w->wheelDirectionWs, SubPos( now, hardPoint ) );
 		float allowed = travel > 0.0f ? travel : 0.0f;
 		float move = needed < allowed ? needed : allowed;
 
 		if ( move > 0.0f )
 		{
 			b3Body_SetTransform( w->body, AddPosVec( now, Scale( up, move ) ), b3Body_GetRotation( w->body ) );
-
-			// Lifting the tyre toward its mount compresses the suspension by the
-			// same distance, and the damper has no other way to know.
-			w->placementRate += move * SafeInv( v->stepDt );
 		}
 
 		w->hardPointPenetration = needed - move;
@@ -1891,6 +1957,27 @@ static void ApplyHardPointForce( Vehicle* v, Wheel* w, float h )
  * and asymmetric between compression and rebound, which a joint's single damping
  * ratio cannot express.
  */
+/** Whether the tyre is actually standing on the surface it found, rather than
+ *  hanging somewhere above it with the cast still able to see it. */
+static bool IsTyreOnSurface( const Wheel* w )
+{
+	if ( !w->info.isInContact || w->info.contactCount == 0 || B3_IS_NULL( w->body ) )
+	{
+		return false;
+	}
+
+	b3Pos center = b3Body_GetPosition( w->body );
+	float best = SurfaceClearance( w, &w->info.contacts[0], center );
+
+	for ( int c = 1; c < w->info.contactCount && c < B3W_MAX_CONTACTS; c++ )
+	{
+		float clearance = SurfaceClearance( w, &w->info.contacts[c], center );
+		best = clearance < best ? clearance : best;
+	}
+
+	return best <= TYRE_TOUCH_CLEARANCE;
+}
+
 static void ApplySuspensionForce( Vehicle* v, Wheel* w, float chassisMass, float h )
 {
 	if ( B3_IS_NULL( w->body ) )
@@ -1906,12 +1993,36 @@ static void ApplySuspensionForce( Vehicle* v, Wheel* w, float chassisMass, float
 	float travel = b3Dot( w->wheelDirectionWs, SubPos( wheelPos, hardPoint ) );
 	float compression = w->suspensionRestLength - travel;
 
-	// What the bodies are doing, plus what the placement did: a teleport carries
-	// no velocity, and without the second term the spring jumps against a damper
-	// that cannot see the jump.
-	b3Vec3 wheelVel = b3Body_GetLinearVelocity( w->body );
+	/*
+	 * How fast the suspension is compressing — measured against the GROUND while
+	 * the tyre is on it, and against the wheel only while it is not.
+	 *
+	 * A grounded tyre is placed, held by a constraint and stood up by a contact
+	 * solve, and its body's velocity is an artefact of those three rather than a
+	 * fact about the suspension: between placements it falls, and the fall is
+	 * undone by a teleport that carries no velocity. The damper read that
+	 * sawtooth as real extension — 0.36 m/s on dead flat ground — and cancelled
+	 * 500 N of an 817 N spring, so the machine sagged the faster it went and by
+	 * different amounts in each direction. It is what the placement-rate term
+	 * was added to cancel, and that term never reached a substep: the placement
+	 * runs after the world steps and `prepare` zeroed the rate before the next
+	 * one.
+	 *
+	 * While the tyre is on the ground the suspension closes at exactly the speed
+	 * the mount approaches the contact, and the mount is the chassis, which is
+	 * simulated honestly. In the air there is no contact to measure against and
+	 * the wheel's own motion IS the suspension's.
+	 */
 	b3Vec3 mountVel = b3Body_GetWorldPointVelocity( v->chassis, hardPoint );
-	float compressionRate = -b3Dot( w->wheelDirectionWs, Sub3( wheelVel, mountVel ) ) + w->placementRate;
+	float compressionRate = b3Dot( w->wheelDirectionWs, mountVel );
+
+	bool onSurface = IsTyreOnSurface( w );
+
+	if ( !onSurface )
+	{
+		b3Vec3 wheelVel = b3Body_GetLinearVelocity( w->body );
+		compressionRate = -b3Dot( w->wheelDirectionWs, Sub3( wheelVel, mountVel ) );
+	}
 
 	float damping = compressionRate > 0.0f ? w->dampingCompression : w->dampingRelaxation;
 	float implicit = 1.0f / ( 1.0f + h * damping );
@@ -1930,6 +2041,7 @@ static void ApplySuspensionForce( Vehicle* v, Wheel* w, float chassisMass, float
 
 	w->springForce = force;
 	w->springRate = compressionRate;
+	w->springCompression = compression;
 	w->springSpringTerm = chassisMass * w->suspensionStiffness * compression;
 
 	b3Vec3 impulse = Scale( up, force * h );
@@ -2527,7 +2639,6 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 	{
 		v->wheels[i].accumForward = 0.0f;
 		v->wheels[i].accumSide = 0.0f;
-		v->wheels[i].placementRate = 0.0f;
 		for ( int c = 0; c < B3W_MAX_CONTACTS; c++ )
 		{
 			// The accumulation MUST be reset. Left running across ticks it is a

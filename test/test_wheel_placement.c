@@ -1188,6 +1188,77 @@ static int DrivenUpASlopeStaysOnIt( void )
 // FOUR wheels, driven up a slope. The single-wheel case above is clean at every
 // speed; the game is not, and the differences are four corners, a chassis free
 // to pitch, and terrain that curves. This adds the first two.
+/*
+ * Driving one way and the other, on flat ground, should ride the same height.
+ *
+ * Reported as "riding backward does not raise my chassis, riding forward does".
+ * The rig reproduces it with no engine force at all — a shove on the chassis is
+ * enough — which is what ruled out the drive path, the friction and the
+ * anti-squat point, and left the suspension force itself.
+ */
+static int DrivenBothWaysRidesTheSame( void )
+{
+	float settled[2];
+
+	for ( int pass = 0; pass < 2; pass++ )
+	{
+		float sign = pass == 0 ? 1.0f : -1.0f;
+
+		g_rigChassisDensity = 163.0f;
+		WheelRig rig = CreateRig( 0.0f, 4 );
+		Vehicle* v = b3w_vehicle_get( rig.vehicle );
+		for ( int k = 0; k < v->wheelCount; k++ )
+		{
+			b3w_vehicle_set_wheel_mass( rig.vehicle, k, 10.0f );
+		}
+		StepRig( &rig, 120 );
+
+		float rest = (float)b3Body_GetPosition( rig.chassis ).y;
+		float total = 0.0f;
+		int samples = 0;
+
+		for ( int i = 0; i < 200; i++ )
+		{
+			// A shove on the chassis, not a drive torque: the fault shows up with
+			// no engine force at all, so the wheels' own drive path is not what is
+			// being measured here.
+			b3Body_ApplyLinearImpulseToCenter( rig.chassis, B3_LITERAL( b3Vec3 ){ sign * 20.0f, 0.0f, 0.0f }, true );
+
+			b3w_vehicle_prepare( v, RIG_TICK );
+			b3World_Step( rig.world, RIG_TICK, RIG_SUBSTEPS );
+			b3w_vehicle_place_wheels( 0 );
+			v->armed = false;
+
+			// The last quarter only: settled, and up to speed.
+			if ( i < 150 )
+			{
+				continue;
+			}
+
+			total += (float)b3Body_GetPosition( rig.chassis ).y - rest;
+			samples++;
+		}
+
+		settled[pass] = total / (float)samples;
+		b3w_vehicle_destroy( rig.vehicle );
+		b3DestroyWorld( rig.world );
+	}
+
+	g_rigChassisDensity = 400.0f;
+
+	float difference = fabsf( settled[0] - settled[1] );
+	printf( "    driven +x %.1f mm and -x %.1f mm from rest, difference %.1f mm\n", settled[0] * 1000.0f,
+			settled[1] * 1000.0f, difference * 1000.0f );
+
+	// Flat ground takes no travel, so a machine crossing it belongs at the height
+	// it parks at. It rode 277 mm lower than that while the damper was reading the
+	// wheel's placement sawtooth as suspension travel.
+	ENSURE( settled[0] > -0.15f );
+	ENSURE( settled[1] > -0.15f );
+	ENSURE( difference < 0.05f );
+	return 0;
+}
+
 static int FourWheelsDrivenUpASlope( void )
 {
 	float slope = 0.5235988f;
@@ -1844,7 +1915,7 @@ static int DroppedOnFlatGround( void )
 		printf( "    %5.0f kg dropped from %.0f m: worst %.1f mm at tick %d, settled %.1f mm, travel %.1f mm"
 				" | spring %.0f N (k-term %.0f N, rate %+.3f m/s, placement %+.3f), share %.0f N\n",
 				b3Body_GetMass( rig.chassis ), heights[h], worst * 1000.0f, worstTick, settled * 1000.0f,
-				travel * 1000.0f, w0->springForce, w0->springSpringTerm, w0->springRate, w0->placementRate,
+				travel * 1000.0f, w0->springForce, w0->springSpringTerm, w0->springRate, w0->placementNeeded,
 				b3Body_GetMass( rig.chassis ) * 9.81f / (float)v->wheelCount );
 
 		b3w_vehicle_destroy_world( rig.world );
@@ -2042,6 +2113,7 @@ static int RebuildingAVehicleManyTimes( void )
 
 int WheelRigTest( void )
 {
+	RUN_SUBTEST( DrivenBothWaysRidesTheSame );
 	RUN_SUBTEST( DroppedOnFlatGround );
 	RUN_SUBTEST( PenetrationAcrossTickRates );
 	RUN_SUBTEST( HittingASuddenSlope );
