@@ -117,6 +117,11 @@ static const float MAX_RECOVERY_SPEED = 30.0f;
  *  just "faster than the machine will ever go" and the torque does the talking. */
 static const float REAL_WHEEL_MOTOR_SPEED = 200.0f;
 
+/** How far under the tyre's radius the bump stop sits. Measured: at 5 mm it
+ *  carries a parked car, at 20 mm it levers a machine over on a climb, at 50 mm
+ *  most of its value is gone. */
+static const float BUMP_STOP_CLEARANCE = 0.035f;
+
 /** The joint carries the machine in real-wheel mode, so it needs a real spring:
  *  a car's body frequency is about 1.5 Hz, damped a bit under critical. */
 static const float REAL_WHEEL_SUSPENSION_HERTZ = 1.5f;
@@ -2175,6 +2180,43 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 	tyre.center2 = B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.5f * w->width };
 	tyre.radius = w->radius;
 	b3CreateCapsuleShape( w->body, &sd, &tyre );
+
+	/*
+	 * The bump stop: a small collider on the CHASSIS, at the hard point.
+	 *
+	 * It cannot live on the wheel. The placement teleports that body onto the
+	 * surface every tick, and a teleport that lands a collider inside something
+	 * is a depenetration impulse — measured at 293 KILOMETRES of altitude driving
+	 * into a Rocket, whatever size the collider was. The chassis is never
+	 * teleported, so a shape hung there is safe.
+	 *
+	 * Erwin Coumans' answer to this symptom: "add a small cylinder shape for each
+	 * wheel in the bottomed out position to the car rigid body, so the physics
+	 * takes over once the ground is hit too hard — make it smaller than the
+	 * actual wheel so it does not hit the ground during normal driving." It sits
+	 * at the hard point, under the tread, so it meets nothing until either the
+	 * suspension is out of travel or something is genuinely inside the wheel —
+	 * which is what driving at another blueprint wheels-first does.
+	 */
+	b3ShapeDef stopDef = b3DefaultShapeDef();
+	stopDef.density = 0.0f;
+	stopDef.enableContactEvents = false;
+
+	b3ShapeId chassisShapes[1];
+	if ( b3Body_GetShapes( v->chassis, chassisShapes, 1 ) == 1 )
+	{
+		// The machine's own filter, so it collides with exactly what the chassis
+		// collides with and never with the machine itself.
+		stopDef.filter = b3Shape_GetFilter( chassisShapes[0] );
+	}
+
+	b3Sphere stop;
+	stop.center = w->chassisConnectionPointCs;
+	stop.radius = w->radius - BUMP_STOP_CLEARANCE;
+	if ( !v->realWheels && stop.radius > 0.0f )
+	{
+		b3CreateSphereShape( v->chassis, &stopDef, &stop );
+	}
 
 	ApplyWheelMass( v, w );
 
