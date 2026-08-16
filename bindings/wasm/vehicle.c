@@ -1977,9 +1977,18 @@ static void ApplyWheelMass( Vehicle* v, Wheel* w )
 	md.inertia = b3Mat3_zero;
 	// A disc about its axle (local Z), and across it on the other two.
 	float across = 0.25f * mass * r * r + ( 1.0f / 3.0f ) * mass * halfWidth * halfWidth;
+	float spin = 0.5f * mass * r * r;
+
+	// Floored for the same reason the mass is, and it matters more: a body with
+	// mass but no inertia is only singular once something applies a torque to it,
+	// which for a free wheel is never and for a JOINTED one is every step.
+	float floorInertia = 1.0e-4f * mass;
+	across = across > floorInertia ? across : floorInertia;
+	spin = spin > floorInertia ? spin : floorInertia;
+
 	md.inertia.cx.x = across;
 	md.inertia.cy.y = across;
-	md.inertia.cz.z = 0.5f * mass * r * r;
+	md.inertia.cz.z = spin;
 	b3Body_SetMassData( w->body, md );
 
 	// The spin integrator upstream reads this; one definition of the tyre's
@@ -2147,6 +2156,42 @@ static bool IsVehicleLive( const Vehicle* v )
 }
 
 /**
+ * Forget every handle that is no longer ours.
+ *
+ * The substep solve only checked for null, and a destroyed body's id is not
+ * null. Reading one drives a stale index into the body array, and the garbage
+ * that comes back reaches the continuous solver as a shape — which then calls
+ * through a function pointer that was never a function.
+ *
+ * Two kinds go stale: the wheel body and its joint, if the caller tore the
+ * machine down; and the body the wheel was resting ON, which belongs to someone
+ * else entirely. That second one bites hardest for a SLEEPING machine, because
+ * `prepare` arms the vehicle and returns before casting, so the substeps go on
+ * pushing against a contact found before the thing under it was deleted.
+ */
+static void DropDeadHandles( Vehicle* v )
+{
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		Wheel* w = &v->wheels[i];
+		if ( !B3_IS_NULL( w->body ) && !b3Body_IsValid( w->body ) )
+		{
+			w->body = b3_nullBodyId;
+			w->joint = b3_nullJointId;
+		}
+
+		if ( B3_IS_NON_NULL( w->info.groundBodyId ) && !b3Body_IsValid( w->info.groundBodyId ) )
+		{
+			w->info.groundBodyId = b3_nullBodyId;
+			w->info.groundBody = -1;
+			w->info.isInContact = false;
+			w->info.contactCount = 0;
+		}
+	}
+}
+
+
+/**
  * Everything that must happen ONCE per full step: where the wheels are, how
  * fast the chassis is going, and the shape casts that find the ground.
  *
@@ -2167,6 +2212,20 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 
 	v->stepDt = dt > 0.0f ? dt : 1.0f / 60.0f;
 	v->armed = true;
+
+	/*
+	 * Drop any wheel whose body is no longer ours, ONCE for the tick.
+	 *
+	 * The substep solve only checked for null, and a destroyed body's id is not
+	 * null — it is recycled, so within a few rebuilds it addresses somebody
+	 * else's body. Reading one drove a stale index into the body array, and the
+	 * garbage that came back reached the continuous solver as a shape, which
+	 * called through a function pointer that was never a function.
+	 *
+	 * Checked here rather than per substep because validity cannot change during
+	 * a step: nothing destroys a body while the solver is running.
+	 */
+	DropDeadHandles( v );
 
 	// A fresh friction budget for the tick the substeps are about to share.
 	for ( int i = 0; i < v->wheelCount; i++ )
@@ -2509,6 +2568,7 @@ void b3w_vehicle_substep( float h, void* context )
 	{
 		if ( IsVehicleLive( &g_vehicles[i] ) && g_vehicles[i].armed && b3StoreWorldId( g_vehicles[i].world ) == stepping )
 		{
+			DropDeadHandles( &g_vehicles[i] );
 			b3w_vehicle_solve( &g_vehicles[i], h );
 		}
 	}
