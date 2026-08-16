@@ -79,6 +79,14 @@ typedef struct World
 	float* transforms;
 } World;
 
+/**
+ * Resolve a body slot to a live id, or null. Defined below with the rest of the
+ * per-body operations; declared here because shape creation and the bulk
+ * transform read both sit above it, and both must refuse a destroyed body.
+ */
+static b3BodyId BodyOf( World* world, int body );
+static b3BodyId BodyId( int handle, int body );
+
 static World g_worlds[MAX_WORLDS];
 
 static World* GetWorld( int handle )
@@ -317,7 +325,13 @@ int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float
 	// heap-owned and have to outlive their shape.
 	b3Transform pose = { .p = ( b3Vec3 ){ ox, oy, oz }, .q = ( b3Quat ){ { qx, qy, qz }, qw } };
 	b3BoxHull hull = b3MakeTransformedBoxHull( hx, hy, hz, pose );
-	return RetainShape( world, b3CreateHullShape( world->bodies[body], &def, &hull.base ) );
+	b3BodyId bodyId = BodyOf( world, body );
+	if ( B3_IS_NULL( bodyId ) )
+	{
+		return -1;
+	}
+
+	return RetainShape( world, b3CreateHullShape( bodyId, &def, &hull.base ) );
 }
 
 int b3w_body_count( int handle )
@@ -328,13 +342,13 @@ int b3w_body_count( int handle )
 
 int b3w_is_awake( int handle, int body )
 {
-	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	b3BodyId id = BodyId( handle, body );
+	if ( B3_IS_NULL( id ) )
 	{
 		return 0;
 	}
 
-	return b3Body_IsAwake( world->bodies[body] ) ? 1 : 0;
+	return b3Body_IsAwake( id ) ? 1 : 0;
 }
 
 // --- bulk readback -------------------------------------------------------
@@ -361,7 +375,22 @@ void b3w_read_transforms( int handle )
 	float* out = world->transforms;
 	for ( int i = 0; i < world->bodyCount; ++i )
 	{
-		b3WorldTransform transform = b3Body_GetTransform( world->bodies[i] );
+		// A destroyed body still owns its row. This runs EVERY tick over EVERY
+		// slot, so it is the hottest place a dangling id could be dereferenced —
+		// one destroyed body used to poison the heap here on the very next tick.
+		// Its row is left as a finite identity rather than skipped, so the
+		// buffer's layout never depends on which bodies happen to be alive.
+		b3BodyId id = BodyOf( world, i );
+		if ( B3_IS_NULL( id ) )
+		{
+			out[0] = out[1] = out[2] = 0.0f;
+			out[3] = out[4] = out[5] = 0.0f;
+			out[6] = 1.0f;
+			out += 7;
+			continue;
+		}
+
+		b3WorldTransform transform = b3Body_GetTransform( id );
 
 		out[0] = (float)transform.p.x;
 		out[1] = (float)transform.p.y;
@@ -380,15 +409,44 @@ void b3w_read_transforms( int handle )
 // world and body handle rather than a Box3D id, so nothing about id layout
 // crosses the boundary.
 
-static b3BodyId BodyId( int handle, int body )
+/**
+ * Resolve a body slot, or null if nothing lives there any more.
+ *
+ * A slot's index staying inside `bodyCount` does NOT mean the body exists:
+ * `b3w_destroy_body` frees it and the array keeps its length, so an index the
+ * caller cached before a rebuild still passes a bounds check. Handing that
+ * dangling id to Box3D reads freed memory — and since the shipped wasm is
+ * built `-DNDEBUG`, `b3Body_IsValid` is compiled out and there is no complaint:
+ * the heap is quietly corrupted and the NEXT unrelated query traps. That cost a
+ * flying machine its simulation ~1.5 s after take-off, and the trap always
+ * named the innocent query rather than the stale handle.
+ *
+ * So validity is decided HERE, once, for every entry point that names a body.
+ * Destroy nulls the slot (cheap, exact); this rejects both the nulled slot and
+ * any id Box3D itself no longer recognises.
+ */
+static b3BodyId BodyOf( World* world, int body )
 {
-	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
 	{
 		return b3_nullBodyId;
 	}
 
-	return world->bodies[body];
+	// The ONE place that reads the slot directly. Everything else comes through
+	// here, and this line calling BodyOf instead is not a compile error — it is
+	// an infinite recursion that only a run reveals.
+	b3BodyId id = world->bodies[body];
+	if ( B3_IS_NULL( id ) || b3Body_IsValid( id ) == false )
+	{
+		return b3_nullBodyId;
+	}
+
+	return id;
+}
+
+static b3BodyId BodyId( int handle, int body )
+{
+	return BodyOf( GetWorld( handle ), body );
 }
 
 void b3w_body_transform( int handle, int body, float* out )
@@ -525,13 +583,7 @@ void b3w_wake( int handle, int body )
 
 int b3w_is_valid( int handle, int body )
 {
-	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
-	{
-		return 0;
-	}
-
-	return b3Body_IsValid( world->bodies[body] ) ? 1 : 0;
+	return B3_IS_NULL( BodyId( handle, body ) ) ? 0 : 1;
 }
 
 /// A capsule along local Y, the shape the player uses. `halfHeight` is the
@@ -558,7 +610,13 @@ int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius,
 		.center2 = ( b3Vec3 ){ ox, oy + halfHeight, oz },
 		.radius = radius,
 	};
-	return RetainShape( world, b3CreateCapsuleShape( world->bodies[body], &def, &capsule ) );
+	b3BodyId bodyId = BodyOf( world, body );
+	if ( B3_IS_NULL( bodyId ) )
+	{
+		return -1;
+	}
+
+	return RetainShape( world, b3CreateCapsuleShape( bodyId, &def, &capsule ) );
 }
 
 // --- terrain and queries -------------------------------------------------
@@ -624,7 +682,13 @@ int b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int 
 	shapeDef.baseMaterial.friction = friction;
 	shapeDef.baseMaterial.restitution = restitution;
 
-	return RetainShape( world, b3CreateHeightFieldShape( world->bodies[body], &shapeDef, field ) );
+	b3BodyId bodyId = BodyOf( world, body );
+	if ( B3_IS_NULL( bodyId ) )
+	{
+		return -1;
+	}
+
+	return RetainShape( world, b3CreateHeightFieldShape( bodyId, &shapeDef, field ) );
 }
 
 /// Cast a ray and return the hit's world Y, or `missValue` when nothing is hit.
@@ -793,27 +857,43 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 	shapeDef.filter.groupIndex = group;
 
 	/*
-	 * No speculative contacts against triangles — this is the terrain.
+	 * Speculative contacts against the terrain triangles: ON.
 	 *
 	 * Box3D's own doc for the flag says to leave it on "unless you care about
 	 * reducing ghost collision more than continuous collision under rotation",
 	 * and notes it only affects hulls against triangles. That is exactly this
 	 * shape: every machine in the game is hulls, and it drives on this.
 	 *
-	 * Ghost collisions are the "sudden stop" — a body sliding over a triangle
-	 * mesh catches on the internal edge between two nearly coplanar triangles
-	 * and gets an impulse the surface does not justify. Measured driving the Car
-	 * across real terrain: one-tick losses of forward speed above 1 m/s fell
-	 * from 19 to 11 over 1440 ticks, and the worst single loss from 12.63 m/s to
-	 * 9.95. The other candidate, contact recycling, made no difference at all
-	 * (19 either way), so only this one is touched.
+	 * It was turned OFF to kill ghost collisions — the "sudden stop", where a
+	 * body sliding over the mesh catches on the internal edge between two
+	 * nearly coplanar triangles and takes an impulse the surface does not
+	 * justify. Measured driving the Car across real terrain, one-tick losses of
+	 * forward speed above 1 m/s fell from 19 to 11 over 1440 ticks, worst single
+	 * loss 12.63 m/s -> 9.95.
 	 *
-	 * The trade is continuous collision under rotation, which terrain does not
-	 * do: it never moves.
+	 * What that traded away was not "continuous collision under rotation" — the
+	 * terrain never rotates, so the comment here read as free. It was the
+	 * approach contact: without it a body must OVERLAP the ground before the
+	 * solver has anything to solve, so it visibly sinks and is then pushed back
+	 * out. Measured on a block dropped onto terrain: 62.5 mm of penetration —
+	 * a quarter of a block — at 0.5 m, 2 m and 5 m alike, against 0.0 mm with
+	 * the flag on. Speed-independent, because it is the allowed overlap and not
+	 * a tunnelling failure.
+	 *
+	 * Nick's call, knowing the cost: sinking into the ground is worse to look at
+	 * than the occasional catch, so ghost collisions come back and are somebody
+	 * else's problem to solve properly — with a real fix, not by letting bodies
+	 * interpenetrate.
 	 */
-	shapeDef.enableSpeculativeContact = false;
+	shapeDef.enableSpeculativeContact = true;
 
-	return RetainShape( world, b3CreateMeshShape( world->bodies[body], &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } ) );
+	b3BodyId bodyId = BodyOf( world, body );
+	if ( B3_IS_NULL( bodyId ) )
+	{
+		return -1;
+	}
+
+	return RetainShape( world, b3CreateMeshShape( bodyId, &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } ) );
 }
 
 // --- joint motors and limits ---------------------------------------------
@@ -1015,7 +1095,13 @@ int b3w_add_sphere_shape( int handle, int body, float radius, float ox, float oy
 	def.enableSensorEvents = isSensor != 0;
 
 	b3Sphere sphere = { .center = { ox, oy, oz }, .radius = radius };
-	return RetainShape( world, b3CreateSphereShape( world->bodies[body], &def, &sphere ) );
+	b3BodyId bodyId = BodyOf( world, body );
+	if ( B3_IS_NULL( bodyId ) )
+	{
+		return -1;
+	}
+
+	return RetainShape( world, b3CreateSphereShape( bodyId, &def, &sphere ) );
 }
 
 /// A cylinder about local Y, matching how the game orients wheels.
@@ -1038,7 +1124,13 @@ int b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius
 
 	b3HullData* hull = b3CreateCylinder( 2.0f * halfHeight, radius, -halfHeight, sides );
 	RetainHull( world, hull );
-	return RetainShape( world, b3CreateHullShape( world->bodies[body], &def, hull ) );
+	b3BodyId bodyId = BodyOf( world, body );
+	if ( B3_IS_NULL( bodyId ) )
+	{
+		return -1;
+	}
+
+	return RetainShape( world, b3CreateHullShape( bodyId, &def, hull ) );
 }
 
 /// A convex hull over a point cloud the host uploaded.
@@ -1075,7 +1167,13 @@ int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int
 	def.isSensor = isSensor != 0;
 	def.enableSensorEvents = isSensor != 0;
 
-	return RetainShape( world, b3CreateHullShape( world->bodies[body], &def, hull ) );
+	b3BodyId bodyId = BodyOf( world, body );
+	if ( B3_IS_NULL( bodyId ) )
+	{
+		return -1;
+	}
+
+	return RetainShape( world, b3CreateHullShape( bodyId, &def, hull ) );
 }
 
 // --- lifecycle and world state -------------------------------------------
@@ -1083,6 +1181,10 @@ int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int
 /// Destroy a body and everything attached to it. The handle stays allocated so
 /// that stale references fail a validity check rather than addressing a
 /// recycled body — `b3w_is_valid` is the way to ask.
+///
+/// The slot is NULLED, which is what makes that promise true: a freed
+/// `b3BodyId` left in place is not merely stale, it is unsafe to ask about at
+/// all once Box3D reuses the index behind it. See `BodyOf`.
 void b3w_destroy_body( int handle, int body )
 {
 	World* world = GetWorld( handle );
@@ -1091,7 +1193,14 @@ void b3w_destroy_body( int handle, int body )
 		return;
 	}
 
-	b3DestroyBody( world->bodies[body] );
+	b3BodyId id = BodyOf( world, body );
+	if ( B3_IS_NULL( id ) )
+	{
+		return;
+	}
+
+	world->bodies[body] = b3_nullBodyId;
+	b3DestroyBody( id );
 }
 
 /**
@@ -1200,11 +1309,11 @@ void b3w_set_detect_only( int handle, int bodiesPtr, int count )
 	 *
 	 * This was a process-wide `static bool`: the first world to ask registered
 	 * the callback and every later world silently got none, while the callback
-	 * that WAS registered kept a pointer to a world that may since have been
+	 * that was registered kept a pointer to a world that may since have been
 	 * destroyed and its arrays freed. A second world is not exotic — the game
-	 * makes one per reload, the tests make one per case — and reading a freed
-	 * context is how a solver ends up calling through a pointer that was never a
-	 * function.
+	 * makes one per reload and the tests make one per case — and the dangling
+	 * context read freed memory, which is how a solver ends up calling through a
+	 * pointer that was never a function.
 	 *
 	 * Registering is idempotent and costs a store, so there is nothing to guard.
 	 */
@@ -1219,11 +1328,12 @@ void b3w_set_detect_only( int handle, int bodiesPtr, int count )
 			continue;
 		}
 		world->detectOnly[i] = 0;
-		if ( world->bodies[i].index1 != 0 && b3Body_IsValid( world->bodies[i] ) )
+		b3BodyId clearBody = BodyOf( world, i );
+		if ( B3_IS_NON_NULL( clearBody ) )
 		{
-			int shapeCount = b3Body_GetShapeCount( world->bodies[i] );
+			int shapeCount = b3Body_GetShapeCount( clearBody );
 			b3ShapeId shapes[64];
-			int n = b3Body_GetShapes( world->bodies[i], shapes, shapeCount < 64 ? shapeCount : 64 );
+			int n = b3Body_GetShapes( clearBody, shapes, shapeCount < 64 ? shapeCount : 64 );
 			for ( int k = 0; k < n; ++k )
 			{
 				b3Shape_EnablePreSolveEvents( shapes[k], false );
@@ -1234,15 +1344,16 @@ void b3w_set_detect_only( int handle, int bodiesPtr, int count )
 	for ( int i = 0; i < count; ++i )
 	{
 		int body = src[i];
-		if ( body < 0 || body >= world->bodyCapacity || b3Body_IsValid( world->bodies[body] ) == false )
+		b3BodyId markBody = BodyOf( world, body );
+		if ( B3_IS_NULL( markBody ) )
 		{
 			continue;
 		}
 		world->detectOnly[body] = 1;
 
-		int shapeCount = b3Body_GetShapeCount( world->bodies[body] );
+		int shapeCount = b3Body_GetShapeCount( markBody );
 		b3ShapeId shapes[64];
-		int n = b3Body_GetShapes( world->bodies[body], shapes, shapeCount < 64 ? shapeCount : 64 );
+		int n = b3Body_GetShapes( markBody, shapes, shapeCount < 64 ? shapeCount : 64 );
 		for ( int k = 0; k < n; ++k )
 		{
 			b3Shape_EnablePreSolveEvents( shapes[k], true );
@@ -1288,7 +1399,8 @@ int b3w_shape_count( int handle, int body )
 		return 0;
 	}
 
-	return b3Body_GetShapeCount( world->bodies[body] );
+	b3BodyId id = BodyOf( world, body );
+	return B3_IS_NULL( id ) ? 0 : b3Body_GetShapeCount( id );
 }
 
 /**
@@ -1614,11 +1726,12 @@ void* b3w_vehicle_get( int handle );
 int b3w_create_vehicle( int handle, int chassis )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || chassis < 0 || chassis >= world->bodyCount )
+	b3BodyId chassisBody = BodyOf( world, chassis );
+	if ( B3_IS_NULL( chassisBody ) )
 	{
 		return -1;
 	}
-	return b3w_vehicle_create( world->id, handle, world->bodies[chassis] );
+	return b3w_vehicle_create( world->id, handle, chassisBody );
 }
 
 /**
@@ -1662,7 +1775,13 @@ void b3w_set_sleep_threshold( int handle, int body, float threshold )
 		return;
 	}
 
-	b3Body_SetSleepThreshold( world->bodies[body], threshold );
+	b3BodyId id = BodyOf( world, body );
+	if ( B3_IS_NULL( id ) )
+	{
+		return;
+	}
+
+	b3Body_SetSleepThreshold( id, threshold );
 }
 
 void b3w_set_body_mass( int handle, int body, float mass )
@@ -1673,7 +1792,7 @@ void b3w_set_body_mass( int handle, int body, float mass )
 		return;
 	}
 
-	b3BodyId id = world->bodies[body];
+	b3BodyId id = BodyOf( world, body );
 	b3MassData md = b3Body_GetMassData( id );
 	if ( md.mass <= 0.0f )
 	{
@@ -1707,7 +1826,7 @@ int b3w_body_contacts( int handle, int body, float* out, int capacity )
 		return 0;
 	}
 
-	b3BodyId id = world->bodies[body];
+	b3BodyId id = BodyOf( world, body );
 	int count = b3Body_GetContactCapacity( id );
 	if ( count <= 0 )
 	{
@@ -1770,13 +1889,13 @@ int b3w_body_contacts( int handle, int body, float* out, int capacity )
 /** A body's world AABB, as min xyz then max xyz. */
 void b3w_body_aabb( int handle, int body, float* out )
 {
-	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	b3BodyId aabbBody = BodyId( handle, body );
+	if ( B3_IS_NULL( aabbBody ) )
 	{
 		return;
 	}
 
-	b3AABB aabb = b3Body_ComputeAABB( world->bodies[body] );
+	b3AABB aabb = b3Body_ComputeAABB( aabbBody );
 	out[0] = (float)aabb.lowerBound.x;
 	out[1] = (float)aabb.lowerBound.y;
 	out[2] = (float)aabb.lowerBound.z;
@@ -1794,7 +1913,7 @@ void b3w_body_inertia_tensor( int handle, int body, float* out )
 		return;
 	}
 
-	b3BodyId id = world->bodies[body];
+	b3BodyId id = BodyOf( world, body );
 	b3MassData md = b3Body_GetMassData( id );
 	b3Quat q = b3Body_GetRotation( id );
 
@@ -1819,7 +1938,7 @@ int b3w_body_shape_states( int handle, int body, float* out, int capacity )
 		return 0;
 	}
 
-	b3BodyId id = world->bodies[body];
+	b3BodyId id = BodyOf( world, body );
 	int count = b3Body_GetShapeCount( id );
 	if ( count > capacity )
 	{
@@ -1897,8 +2016,7 @@ int b3w_cast_sphere_filtered( int handle, float cx, float cy, float cz, float ra
 	b3ShapeProxy proxy = { .points = &point, .count = 1, .radius = radius };
 
 	FilteredCastHit ctx = { .closest = { .fraction = 1.0f, .normal = { 0.0f, 1.0f, 0.0f }, .hit = false },
-							.exclude = ( exclude >= 0 && exclude < world->bodyCount ) ? world->bodies[exclude]
-																					 : b3_nullBodyId };
+							.exclude = BodyOf( world, exclude ) };
 
 	b3World_CastShape( world->id, ( b3Pos ){ cx, cy, cz }, &proxy, ( b3Vec3 ){ dx, dy, dz }, b3DefaultQueryFilter(),
 					   OnFilteredCastHit, &ctx );
@@ -2024,8 +2142,8 @@ int b3w_debug_draw( int handle, float* verts, float* colors, int capacityVerts, 
 			continue;
 		}
 
-		b3BodyId bodyId = world->bodies[i];
-		if ( b3Body_IsValid( bodyId ) == false )
+		b3BodyId bodyId = BodyOf( world, i );
+		if ( B3_IS_NULL( bodyId ) )
 		{
 			continue;
 		}
