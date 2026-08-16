@@ -113,19 +113,15 @@ static const float HARD_POINT_FORCE_SCALE = 3.0f;
 static const float PLACEMENT_DEADBAND = 0.005f;
 static const float MAX_RECOVERY_SPEED = 30.0f;
 
-/** A real wheel's motor is a torque limit, not a speed target, so the speed is
- *  just "faster than the machine will ever go" and the torque does the talking. */
-static const float REAL_WHEEL_MOTOR_SPEED = 200.0f;
 
 /** How far under the tyre's radius the bump stop sits. Measured: at 5 mm it
  *  carries a parked car, at 20 mm it levers a machine over on a climb, at 50 mm
  *  most of its value is gone. */
 static const float BUMP_STOP_CLEARANCE = 0.035f;
 
-/** The joint carries the machine in real-wheel mode, so it needs a real spring:
- *  a car's body frequency is about 1.5 Hz, damped a bit under critical. */
-static const float REAL_WHEEL_SUSPENSION_HERTZ = 1.5f;
-static const float REAL_WHEEL_SUSPENSION_DAMPING = 0.7f;
+/** How far inside the tread the wheel body's extent shape sits. */
+static const float WHEEL_SHAPE_CLEARANCE = 0.06f;
+
 
 /** Furthest a stuck contact may drift before the tyre is treated as having slipped. */
 static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
@@ -394,21 +390,6 @@ typedef struct
 	 * good for one step and no more.
 	 */
 	bool armed;
-	/**
-	 * Drive on REAL wheels instead of shape casts.
-	 *
-	 * The talk's controller is a shape cast that places the tyre and fakes every
-	 * normal to the suspension, which is what makes it feel gamey and forgiving
-	 * — and what makes a wheel unable to hit a wall, because it is not a collider
-	 * at all. The other design is the one Scrap Mechanic drives on: the wheel IS
-	 * a colliding rigid body, held by its joint, and the world's own contacts do
-	 * the rest. It costs the forgiveness and buys collision that needs no special
-	 * case.
-	 *
-	 * Which one is better is not a measurable question, so both are here and the
-	 * game picks.
-	 */
-	bool realWheels;
 	b3WorldId world;
 	/** The shim's world handle, for the body-owner table. */
 	int worldHandle;
@@ -2156,29 +2137,22 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 	b3ShapeDef sd = b3DefaultShapeDef();
 	sd.enableContactEvents = false;
 	sd.density = 0.0f;
-
-	if ( v->realWheels )
-	{
-		// The machine's own filter: the tyre collides with everything the chassis
-		// does, terrain included, because here the contact IS the suspension's
-		// ground truth and nothing casts for it.
-		b3ShapeId chassisShapes[1];
-		if ( b3Body_GetShapes( v->chassis, chassisShapes, 1 ) == 1 )
-		{
-			sd.filter = b3Shape_GetFilter( chassisShapes[0] );
-		}
-		sd.baseMaterial.friction = 1.2f;
-	}
-	else
-	{
-		sd.filter.categoryBits = 0;
-		sd.filter.maskBits = 0;
-	}
+	sd.filter.categoryBits = 0;
+	sd.filter.maskBits = 0;
 
 	b3Capsule tyre;
 	tyre.center1 = B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, -0.5f * w->width };
 	tyre.center2 = B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.5f * w->width };
-	tyre.radius = w->radius;
+	// A hair under the tread. This shape exists to give the body an EXTENT — a
+	// shapeless one cannot tell the solver whether it moved far enough to need a
+	// swept test — and it collides with nothing, so its exact size is free;
+	// keeping it inside the tyre keeps it clear of everything the placement puts
+	// the wheel against.
+	tyre.radius = w->radius - WHEEL_SHAPE_CLEARANCE;
+	if ( tyre.radius < 0.02f )
+	{
+		tyre.radius = 0.02f;
+	}
 	b3CreateCapsuleShape( w->body, &sd, &tyre );
 
 	/*
@@ -2213,7 +2187,7 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 	b3Sphere stop;
 	stop.center = w->chassisConnectionPointCs;
 	stop.radius = w->radius - BUMP_STOP_CLEARANCE;
-	if ( !v->realWheels && stop.radius > 0.0f )
+	if ( stop.radius > 0.0f )
 	{
 		b3CreateSphereShape( v->chassis, &stopDef, &stop );
 	}
@@ -2251,16 +2225,7 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 	// frequency over the REDUCED mass of a tyre against a chassis, and it takes a
 	// single damping ratio where this game authors compression and rebound
 	// separately — so the suspension is applied as a force instead.
-	// And sprung by the joint, for the same reason: our spring is applied to a
-	// tyre the placement owns, and here nothing places it. A spring needs a
-	// frequency — enabled with the default zero it drives the solver into a
-	// division by nothing and traps the world.
-	jd.enableSuspensionSpring = v->realWheels;
-	if ( v->realWheels )
-	{
-		jd.suspensionHertz = REAL_WHEEL_SUSPENSION_HERTZ;
-		jd.suspensionDampingRatio = REAL_WHEEL_SUSPENSION_DAMPING;
-	}
+	jd.enableSuspensionSpring = false;
 
 	// Steering is the JOINT's, so the body turns with it. Left disabled, the
 	// controller steered only the axle it hands to the cast and to friction, and
@@ -2270,10 +2235,7 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 	jd.steeringHertz = STEERING_HERTZ;
 	jd.steeringDampingRatio = STEERING_DAMPING_RATIO;
 	jd.maxSteeringTorque = FLT_MAX;
-	// A real wheel is driven through its joint, because there is no friction
-	// model of ours between it and the ground — the contact is Box3D's.
-	jd.enableSpinMotor = v->realWheels;
-	jd.maxSpinTorque = 0.0f;
+	jd.enableSpinMotor = false;
 
 	w->joint = b3CreateWheelJoint( v->world, &jd );
 	ConfigureWheelJoint( v, w );
@@ -2349,73 +2311,6 @@ static void DropDeadHandles( Vehicle* v )
 
 
 /**
- * The other controller: a colliding wheel, driven through its joint.
- *
- * No cast, no placement, no faked normals, no friction model of ours. The tyre
- * is a rigid body with a real collider and the world resolves it; all this has
- * to do is turn the engine force and the brake into a motor on the joint, and
- * let the joint's own spring carry the machine.
- */
-static void PrepareRealWheels( Vehicle* v, float dt )
-{
-	v->stepDt = dt > 0.0f ? dt : 1.0f / 60.0f;
-	v->armed = false;
-
-	b3Vec3 linvel = b3Body_GetLinearVelocity( v->chassis );
-	v->currentVehicleSpeed = b3Length( linvel );
-
-	b3Quat chassisRot = b3Body_GetRotation( v->chassis );
-	b3Vec3 forwardW = b3RotateVector( chassisRot, AxisVector( v->indexForwardAxis ) );
-	if ( b3Dot( forwardW, linvel ) < 0.0f )
-	{
-		v->currentVehicleSpeed *= -1.0f;
-	}
-
-	for ( int i = 0; i < v->wheelCount; i++ )
-	{
-		Wheel* w = &v->wheels[i];
-		if ( B3_IS_NULL( w->joint ) )
-		{
-			continue;
-		}
-
-		UpdateWheelTransforms( v, i );
-		b3WheelJoint_SetTargetSteeringAngle( w->joint, -w->steering );
-
-		// Drive and brake are both a torque about the axle: drive spins it up
-		// toward a speed it will never quite reach, the brake asks for zero.
-		float torque = w->engineForce > 0.0f ? w->engineForce * w->radius : -w->engineForce * w->radius;
-		float brake = w->brake;
-
-		if ( brake > 0.0f )
-		{
-			b3WheelJoint_SetSpinMotorSpeed( w->joint, 0.0f );
-			b3WheelJoint_SetMaxSpinTorque( w->joint, brake );
-		}
-		else if ( torque > 0.0f )
-		{
-			// NEGATED. The joint spins about frame B's local Z, and that axis is
-			// built from the wheel's axle — whose positive sense points the
-			// opposite way to a forward roll, the same sign the steering setter
-			// already has to undo.
-			float sign = w->engineForce >= 0.0f ? -1.0f : 1.0f;
-			b3WheelJoint_SetSpinMotorSpeed( w->joint, sign * REAL_WHEEL_MOTOR_SPEED );
-			b3WheelJoint_SetMaxSpinTorque( w->joint, torque );
-		}
-		else
-		{
-			b3WheelJoint_SetMaxSpinTorque( w->joint, 0.0f );
-		}
-
-		// What the readback and the renderer ask for. There is no cast, so the
-		// wheel's own body answers both.
-		w->info.isInContact = true;
-		w->info.contactCount = 0;
-		w->angularVelocity = b3Dot( b3Body_GetAngularVelocity( w->body ), w->wheelAxleWs );
-	}
-}
-
-/**
  * Everything that must happen ONCE per full step: where the wheels are, how
  * fast the chassis is going, and the shape casts that find the ground.
  *
@@ -2425,12 +2320,6 @@ static void PrepareRealWheels( Vehicle* v, float dt )
  */
 void b3w_vehicle_prepare( Vehicle* v, float dt )
 {
-	if ( v->realWheels )
-	{
-		PrepareRealWheels( v, dt );
-		return;
-	}
-
 	// Nothing to prepare against a chassis the caller has already destroyed, and
 	// arming one would hand the substep solver a stale body id — see
 	// `IsVehicleLive`.
@@ -2721,11 +2610,6 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
  */
 void b3w_vehicle_solve( Vehicle* v, float h )
 {
-	if ( v->realWheels )
-	{
-		return;
-	}
-
 	if ( b3Body_GetType( v->chassis ) == b3_dynamicBody && !b3Body_IsAwake( v->chassis ) )
 	{
 		return;
@@ -2921,17 +2805,6 @@ void b3w_vehicle_destroy( int handle )
 	}
 
 	v->used = false;
-}
-
-/** Pick the controller. Must be called BEFORE any wheel is added: it decides
- *  what collider and what joint each wheel gets. */
-void b3w_vehicle_set_real_wheels( int handle, int enabled )
-{
-	Vehicle* v = b3w_vehicle_get( handle );
-	if ( v != NULL )
-	{
-		v->realWheels = enabled != 0;
-	}
 }
 
 void b3w_vehicle_set_owner( int handle, unsigned int owner )
