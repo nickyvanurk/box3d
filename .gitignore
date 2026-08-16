@@ -15,3 +15,4 @@ CMakeUserPresets.json
 Superluminal/
 build-dp/
 .emcc-tmp/
+bindings/wasm/dist/
