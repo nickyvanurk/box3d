@@ -118,12 +118,6 @@ static const float PLACEMENT_DEADBAND = 0.005f;
 static const float BUMP_STOP_CLEARANCE = 0.035f;
 static const float MAX_RECOVERY_SPEED = 30.0f;
 
-/** A forward sweep is only worth its cast above this much motion in a tick, and
- *  only a surface leaning at least this far from the suspension counts as a face
- *  to be run into rather than ground to roll over. */
-static const float FORWARD_SWEEP_MIN_TRAVEL = 0.05f;
-static const float FORWARD_SWEEP_MIN_ANGLE = 0.20f;
-
 /** Furthest a stuck contact may drift before the tyre is treated as having slipped. */
 static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
 
@@ -906,89 +900,6 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 			contact->clippedInvContactDotSuspension = denominator >= -0.1f ? 1.0f / 0.1f : -1.0f / denominator;
 		}
 		w->info.contactCount = cast.count;
-
-		/*
-		 * A face the tyre is about to run INTO, with its real normal.
-		 *
-		 * Everything above sweeps down the suspension, because that is the only
-		 * direction the placement can correct in. A ramp does not close that way:
-		 * driving flat into a 35 degree face at 12 m/s the wheel moves 500 mm in a
-		 * tick while the face rises 350 mm under it, and the downward cast first
-		 * reports it 100 mm up the slope with the tyre already a third of itself
-		 * inside. No amount of lift clears a horizontal overlap.
-		 *
-		 * So sweep the tyre along its TRAVEL as well, and for that one contact
-		 * keep the surface's own normal. Faking normals to the suspension is what
-		 * stops every crease in the ground from stealing momentum — the talk is
-		 * emphatic — so this stays as narrow as the problem: only a face steep
-		 * enough to be run into rather than rolled over, and only when the tyre
-		 * reaches it within this tick.
-		 */
-		b3Vec3 travel = Scale( b3Body_GetLinearVelocity( v->chassis ), dt );
-		float travelLen = b3Length( travel );
-
-		if ( travelLen > FORWARD_SWEEP_MIN_TRAVEL && w->info.contactCount < B3W_MAX_CONTACTS )
-		{
-			b3Vec3 travelDir = Scale( travel, 1.0f / travelLen );
-
-			WheelCast fwd = { .chassis = v->chassis,
-							  .owner = v->owner,
-							  .worldHandle = v->worldHandle,
-							  .worldUp = worldUp,
-							  .minSurfaceUpFacing = -2.0f,
-							  .considered = 0,
-							  .count = 0 };
-
-			b3World_CastShapeAll( v->world, b3Body_GetPosition( w->body ), &proxy, travel, b3DefaultQueryFilter(),
-								  OnWheelHit, &fwd );
-
-			for ( int c = 0; c < fwd.count; c++ )
-			{
-				const WheelHit* hit = &fwd.hits[c];
-
-				// Initial overlap comes back as fraction 0 with no normal — the
-				// ground the tyre is already on, which the downward cast owns.
-				if ( hit->fraction <= 0.0f || b3LengthSquared( hit->normal ) < 0.5f )
-				{
-					continue;
-				}
-
-				// Only a face, not the ground. A surface whose normal still points
-				// mostly along the suspension is something to roll over, and
-				// giving it a real normal is exactly the momentum theft the talk
-				// warns about.
-				float upness = b3Dot( hit->normal, Scale( w->wheelDirectionWs, -1.0f ) );
-				if ( upness > cosf( FORWARD_SWEEP_MIN_ANGLE ) )
-				{
-					continue;
-				}
-
-				// And only if we are driving into it.
-				if ( b3Dot( hit->normal, travelDir ) > -0.1f )
-				{
-					continue;
-				}
-
-				WheelContact* contact = &w->info.contacts[w->info.contactCount];
-				contact->surfaceNormalWs = hit->normal;
-				contact->normalWs = hit->normal;
-				contact->pointWs = hit->point;
-				contact->force = 0.0f;
-				contact->normalImpulse = 0.0f;
-
-				// How far the wheel's centre stands off this plane. Zero here says
-				// the centre is ON the face, and the solver duly tried to push a
-				// parked car out of ground it was not touching — it floated 234 mm.
-				contact->planeOffset = b3Dot( contact->normalWs, SubPos( b3Body_GetPosition( w->body ), hit->point ) );
-
-				float denom = b3Dot( contact->normalWs, w->wheelDirectionWs );
-				contact->clippedInvContactDotSuspension = denom >= -0.1f ? 1.0f / 0.1f : -1.0f / denom;
-				StoreSuspensionLength( contact, w->info.suspensionLength, maxSuspensionLength );
-
-				w->info.contactCount++;
-				break;
-			}
-		}
 
 		// The nearest contact is the wheel's: it is the surface the tyre rests
 		// on, and what friction, the wheel transform and the readback all mean by
