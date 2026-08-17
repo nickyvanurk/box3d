@@ -351,6 +351,29 @@ int b3w_is_awake( int handle, int body )
 	return b3Body_IsAwake( id ) ? 1 : 0;
 }
 
+/**
+ * Why a body is not sleeping: `out[0]` the velocity the sleep test judged it by
+ * last step, `out[1]` its threshold, `out[2]` how long it has been continuously
+ * sleepy. A body whose sleep time never grows is being woken by something every
+ * step, and the velocity says whether it is moving or being pushed.
+ */
+void b3w_body_sleep_state( int handle, int body, float* out )
+{
+	out[0] = 0.0f;
+	out[1] = 0.0f;
+	out[2] = 0.0f;
+
+	b3BodyId id = BodyId( handle, body );
+	if ( B3_IS_NULL( id ) )
+	{
+		return;
+	}
+
+	out[0] = b3Body_GetSleepVelocity( id );
+	out[1] = b3Body_GetSleepThreshold( id );
+	out[2] = b3Body_GetSleepTime( id );
+}
+
 // --- bulk readback -------------------------------------------------------
 
 /// Pointer to this world's transform buffer, as a byte offset into the WASM

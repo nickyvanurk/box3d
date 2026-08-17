@@ -1918,6 +1918,20 @@ bool b3Body_IsAwake( b3BodyId bodyId )
 	return body->setIndex == b3_awakeSet;
 }
 
+float b3Body_GetSleepVelocity( b3BodyId bodyId )
+{
+	b3World* world = b3GetWorld( bodyId.world0 );
+	b3Body* body = b3GetBodyFullId( world, bodyId );
+	return body->sleepVelocity;
+}
+
+float b3Body_GetSleepTime( b3BodyId bodyId )
+{
+	b3World* world = b3GetWorld( bodyId.world0 );
+	b3Body* body = b3GetBodyFullId( world, bodyId );
+	return body->sleepTime;
+}
+
 void b3Body_SetAwake( b3BodyId bodyId, bool awake )
 {
 	b3World* world = b3GetUnlockedWorld( bodyId.world0 );

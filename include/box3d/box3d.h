@@ -688,6 +688,15 @@ B3_API float b3Body_GetGravityScale( b3BodyId bodyId );
 /// @return true if this body is awake
 B3_API bool b3Body_IsAwake( b3BodyId bodyId );
 
+/// The velocity the sleep test judged this body by on the last step: the larger of
+/// its true speed and its position correction expressed as a speed. Compare against
+/// b3Body_GetSleepThreshold to see WHY a body is not sleeping.
+B3_API float b3Body_GetSleepVelocity( b3BodyId bodyId );
+
+/// How long this body has been continuously sleepy, in seconds. Reset to zero by
+/// anything that wakes it, so a body that never sleeps shows a timer that never grows.
+B3_API float b3Body_GetSleepTime( b3BodyId bodyId );
+
 /// Wake a body from sleep. This wakes the entire island the body is touching.
 /// @warning Putting a body to sleep will put the entire island of bodies touching this body to sleep,
 /// which can be expensive and possibly unintuitive.

@@ -111,7 +111,25 @@ static const float HARD_POINT_FORCE_SCALE = 3.0f;
 /** Penetration a tyre is left to the constraint to resolve rather than being
  *  placed out of. Box3D's own linear slop. */
 static const float PLACEMENT_DEADBAND = 0.005f;
-static const float MAX_RECOVERY_SPEED = 30.0f;
+/**
+ * How fast a tyre may be pushed out of something it is already inside.
+ *
+ * Box3D's own `contactSpeed` — `types.c:19`, `3.0f * lengthUnits` — because a
+ * tyre standing on the ground is a contact and a position error is a position
+ * error. This was 30, ten times every other contact in the world, and no
+ * measurement was recorded for it. A wheel bolted onto a hull that is already
+ * resting starts a tyre deep in the surface, and at 30 m/s the point constraint
+ * ejected it in a single tick and handed that to the chassis through the
+ * suspension's hard limit: a 3x3 plate went 2.8 m into the air at 20 m/s and
+ * tumbled. At the world's own speed it stands up on the wheel in five ticks and
+ * settles at the ride height it would have had if the wheel had always been
+ * there.
+ *
+ * Landings are unaffected: what answers a fast impact is the closing-velocity
+ * term, not this cap, which only governs how quickly a STATIC overlap is
+ * undone. Every drive and mechanical scenario is unchanged.
+ */
+static const float MAX_RECOVERY_SPEED = 3.0f;
 
 /** How close the tyre's lowest corner must be to a surface to count as standing
  *  on it. A tyre that hangs above the ground carries no load, and the spring it
@@ -342,6 +360,24 @@ typedef struct
 	 * is the no-slip behaviour this replaces.
 	 */
 	float inertia;
+	/**
+	 * The bump stop, and whether it has been let into the world yet.
+	 *
+	 * A wheel is not always added to a machine already standing on its wheels.
+	 * Bolt one onto a hull resting on the ground and the stop — a sphere nearly
+	 * a tyre wide, at the hard point — is born inside the surface, and the
+	 * contact solve evicts it in a single tick: 262 mm on a plate with one
+	 * wheel, which the player sees as a pop.
+	 *
+	 * So it enters the world only once a cast says it is clear of it, and never
+	 * leaves again. Nothing is lost by waiting: while the suspension is past its
+	 * hard point the machine is resting on whatever the stop is buried in, and a
+	 * stop cannot catch a bottoming that has already happened.
+	 */
+	b3ShapeId stopShape;
+	b3Filter stopFilter;
+	bool stopArmed;
+
 	float rollInfluence;
 	float antiSquat;
 	float suspensionRejectAngle;
@@ -454,8 +490,6 @@ typedef struct
 	 * compared in O(1) here.
 	 */
 	uint32_t owner;
-	/** The idle threshold the HOST uses, applied to the wheel bodies. */
-	float sleepThreshold;
 } Vehicle;
 
 static b3Vec3 AxisVector( int index )
@@ -2485,6 +2519,14 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 		stopDef.filter = b3Shape_GetFilter( chassisShapes[0] );
 	}
 
+	// Held out of the world until a cast says it is clear of it — see
+	// `stopArmed`. Collision is off both ways: a zero mask cannot match anything,
+	// and a zero group cannot override that.
+	w->stopFilter = stopDef.filter;
+	w->stopArmed = false;
+	stopDef.filter.maskBits = 0;
+	stopDef.filter.groupIndex = 0;
+
 	b3Sphere stop;
 	stop.center = w->chassisConnectionPointCs;
 	stop.radius = w->radius - BUMP_STOP_CLEARANCE;
@@ -2502,16 +2544,34 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 		 * weighs.
 		 */
 		b3MassData before = b3Body_GetMassData( v->chassis );
-		b3CreateSphereShape( v->chassis, &stopDef, &stop );
+		w->stopShape = b3CreateSphereShape( v->chassis, &stopDef, &stop );
 		b3Body_SetMassData( v->chassis, before );
 	}
 
 	ApplyWheelMass( v, w );
 
-	if ( v->sleepThreshold > 0.0f )
-	{
-		b3Body_SetSleepThreshold( w->body, v->sleepThreshold );
-	}
+	/*
+	 * A wheel body does not get a vote on whether its machine is at rest.
+	 *
+	 * Box3D sleeps an island only when EVERY body in it is sleepy —
+	 * "any single body in an island can keep it awake", `solver.c:813` — and it
+	 * judges sleepiness on a body's own velocity. That question is meaningless
+	 * here: this body is a REPRESENTATION. Its pose is authored every tick by the
+	 * placement, its collision is off, and the velocity it carries is whatever it
+	 * gained falling between two placements. Measured on the Car parked on flat
+	 * ground: the chassis reports a sleep velocity of 0.0000 and does not move a
+	 * tenth of a millimetre, while its four wheels report 3.8 to 6.4 against a
+	 * threshold of 0.4 — so no wheeled machine in the world could ever sleep, for
+	 * ever, which is the tick budget of every parked car on a server.
+	 *
+	 * A threshold nothing can exceed makes the wheel permanently sleepy, so the
+	 * island sleeps exactly when the machine does: on the chassis, which is
+	 * simulated honestly and which is what "parked" means. Nothing else changes —
+	 * no force, no constraint, no wake path. A machine standing still with its
+	 * wheels driven still wakes, because `prepare` wakes the chassis on engine
+	 * force before it reads this at all.
+	 */
+	b3Body_SetSleepThreshold( w->body, FLT_MAX );
 
 	b3WheelJointDef jd = b3DefaultWheelJointDef();
 	jd.base.bodyIdA = v->chassis;
@@ -2789,6 +2849,24 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
 		ShapeCastWheel( v, i, dt );
+
+		// The cast has just said how far the ground is from the hard point, which
+		// is the one measurement that says whether the stop is clear of it. See
+		// `stopArmed`. With no contact there is nothing within the tyre's whole
+		// reach, so it is clear by definition.
+		Wheel* wheel = &v->wheels[i];
+		if ( !wheel->stopArmed && B3_IS_NON_NULL( wheel->stopShape ) )
+		{
+			float toGround =
+				wheel->info.isInContact
+					? wheel->info.suspensionLength + wheel->radius - wheel->info.bottomOutOvershoot
+					: FLT_MAX;
+			if ( toGround > wheel->radius - BUMP_STOP_CLEARANCE )
+			{
+				b3Shape_SetFilter( wheel->stopShape, wheel->stopFilter, true );
+				wheel->stopArmed = true;
+			}
+		}
 	}
 
 	// Wheel spin, once per TICK. It is odometry — how far the tyre rolled — not a
@@ -3285,7 +3363,34 @@ void b3w_vehicle_set_wheel_mass( int handle, int index, float mass )
 
 WHEEL_SETTER( b3w_vehicle_set_engine_force, engineForce )
 WHEEL_SETTER( b3w_vehicle_set_brake, brake )
-WHEEL_SETTER( b3w_vehicle_set_steering, steering )
+/**
+ * Steering is a COMMAND, so it wakes what it commands.
+ *
+ * Every other way a seated player can ask a machine to move already wakes it —
+ * engine force in `prepare`, joint motors at their setters, thrusters through
+ * the force accumulator. Steering was the one that only wrote its field, and a
+ * blanket "keep every seated machine awake" in the host was covering for it, at
+ * the cost of sleep for every car a player sits in.
+ *
+ * On CHANGE, not on non-zero: a machine parked with its wheels turned is still
+ * parked, and waking on the standing value would be the same hold under another
+ * name. The host dedups identical commands, so this fires when the player
+ * actually moves the wheel.
+ */
+void b3w_vehicle_set_steering( int handle, int index, float value )
+{
+	Vehicle* v = b3w_vehicle_get( handle );
+	if ( v == NULL || index < 0 || index >= v->wheelCount )
+	{
+		return;
+	}
+
+	if ( v->wheels[index].steering != value )
+	{
+		v->wheels[index].steering = value;
+		b3Body_SetAwake( v->chassis, true );
+	}
+}
 WHEEL_SETTER( b3w_vehicle_set_side_friction, sideFrictionStiffness )
 WHEEL_SETTER( b3w_vehicle_set_friction_slip, frictionSlip )
 /**
@@ -3625,6 +3730,62 @@ int b3w_vehicle_awake_wheels( int worldHandle )
 	return awake;
 }
 
+/**
+ * The worst wheel body's sleep bookkeeping, for the same question the chassis
+ * answers through `b3w_body_sleep_state`: wheel bodies are invisible to the
+ * shim's body walk, so this is the only way to see one holding an island awake.
+ * `out[0]` sleep velocity, `out[1]` threshold, `out[2]` sleep time, `out[3]` how
+ * many wheel bodies are awake.
+ */
+void b3w_vehicle_wheel_sleep( int worldHandle, float* out )
+{
+	out[0] = 0.0f;
+	out[1] = 0.0f;
+	out[2] = 1e9f;
+	out[3] = 0.0f;
+
+	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	{
+		Vehicle* v = &g_vehicles[i];
+		if ( !v->used || v->worldHandle != worldHandle )
+		{
+			continue;
+		}
+
+		for ( int k = 0; k < v->wheelCount; k++ )
+		{
+			Wheel* w = &v->wheels[k];
+			if ( B3_IS_NULL( w->body ) || !b3Body_IsValid( w->body ) )
+			{
+				continue;
+			}
+
+			float velocity = b3Body_GetSleepVelocity( w->body );
+			if ( velocity > out[0] )
+			{
+				out[0] = velocity;
+				out[1] = b3Body_GetSleepThreshold( w->body );
+			}
+
+			float time = b3Body_GetSleepTime( w->body );
+			if ( time < out[2] )
+			{
+				out[2] = time;
+			}
+
+			if ( b3Body_IsAwake( w->body ) )
+			{
+				out[3] += 1.0f;
+			}
+		}
+	}
+
+	if ( out[2] > 1e8f )
+	{
+		out[2] = 0.0f;
+	}
+}
+
 /** Worst |v|, |w|, placement distance and hard-point force across every wheel
  *  body. Diagnostic only — four floats, written to `out`. */
 void b3w_vehicle_wheel_speeds( int worldHandle, float* out )
@@ -3661,30 +3822,3 @@ void b3w_vehicle_wheel_speeds( int worldHandle, float* out )
 	}
 }
 
-/**
- * The idle threshold for this vehicle's wheel bodies.
- *
- * Box3D's default is 0.05 m/s and this game settles its own bodies at 0.4, so a
- * wheel body created here kept a threshold eight times stricter than everything
- * it is bolted to. A resting tyre buzzes at about 0.11 m/s — between the two —
- * so the wheels alone stayed awake and held the machine's island awake with
- * them.
- */
-void b3w_vehicle_set_sleep_threshold( int handle, float threshold )
-{
-	Vehicle* v = b3w_vehicle_get( handle );
-	if ( v == NULL )
-	{
-		return;
-	}
-
-	v->sleepThreshold = threshold;
-
-	for ( int i = 0; i < v->wheelCount; i++ )
-	{
-		if ( !B3_IS_NULL( v->wheels[i].body ) )
-		{
-			b3Body_SetSleepThreshold( v->wheels[i].body, threshold );
-		}
-	}
-}
