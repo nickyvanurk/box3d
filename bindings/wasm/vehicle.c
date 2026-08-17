@@ -2857,10 +2857,22 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 		Wheel* wheel = &v->wheels[i];
 		if ( !wheel->stopArmed && B3_IS_NON_NULL( wheel->stopShape ) )
 		{
-			float toGround =
-				wheel->info.isInContact
-					? wheel->info.suspensionLength + wheel->radius - wheel->info.bottomOutOvershoot
-					: FLT_MAX;
+			/*
+			 * A tyre that has never stood on anything keeps its stop out of the
+			 * world, and that is the half I got wrong first time: arming while the
+			 * wheel was AIRBORNE let a machine whose wheels spawn level with its
+			 * hull land on the stops instead of the tyres. The stop then carries
+			 * the weight, the tyre stays under the surface reporting bottomed, and
+			 * it never gets out — a machine resting 240 mm high on nothing, with
+			 * no contact and no traction, for ever. Measured on a four-wheeled rig
+			 * built from blocks: 4 of 4 wheels in contact became 0 of 4.
+			 *
+			 * The stop exists to catch a suspension that has run out of travel, so
+			 * a suspension that has never worked yet has nothing for it to catch.
+			 */
+			float toGround = wheel->info.isInContact
+								 ? wheel->info.suspensionLength + wheel->radius - wheel->info.bottomOutOvershoot
+								 : -1.0f;
 			if ( toGround > wheel->radius - BUMP_STOP_CLEARANCE )
 			{
 				b3Shape_SetFilter( wheel->stopShape, wheel->stopFilter, true );
