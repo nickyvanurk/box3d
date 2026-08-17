@@ -472,9 +472,35 @@ static b3BodyId BodyId( int handle, int body )
 	return BodyOf( GetWorld( handle ), body );
 }
 
+/**
+ * Take the answer `BodyOf` already worked out.
+ *
+ * It decides validity once and returns null for a body that has been destroyed
+ * or whose slot never held one — and then eighteen entry points passed that null
+ * straight into Box3D anyway. What happens next is luck: `b3Body_GetTransform`
+ * on a null id indexes an array from -1, which reads whatever is there and
+ * usually returns zeros, until the day the address is outside the heap and the
+ * whole tick dies with "memory access out of bounds". A player froze a machine
+ * he was holding and that is what he got, from a read that had been wrong for
+ * every rebuild before it and had simply landed somewhere harmless.
+ *
+ * A dead body reads as zero and ignores what it is told. The caller asked about
+ * something that is not there; that is not a reason to kill the simulation.
+ */
+#define BODY_OR_RETURN( id, handle, body, ... )                                                                        \
+	b3BodyId id = BodyId( handle, body );                                                                              \
+	if ( B3_IS_NULL( id ) )                                                                                            \
+	{                                                                                                                  \
+		return __VA_ARGS__;                                                                                            \
+	}
+
 void b3w_body_transform( int handle, int body, float* out )
 {
-	b3WorldTransform t = b3Body_GetTransform( BodyId( handle, body ) );
+	out[0] = out[1] = out[2] = out[3] = out[4] = out[5] = 0.0f;
+	out[6] = 1.0f;
+	BODY_OR_RETURN( id, handle, body )
+
+	b3WorldTransform t = b3Body_GetTransform( id );
 
 	out[0] = (float)t.p.x;
 	out[1] = (float)t.p.y;
@@ -487,19 +513,22 @@ void b3w_body_transform( int handle, int body, float* out )
 
 void b3w_set_position( int handle, int body, float x, float y, float z )
 {
-	b3BodyId id = BodyId( handle, body );
+	BODY_OR_RETURN( id, handle, body )
 	b3Body_SetTransform( id, ( b3Pos ){ x, y, z }, b3Body_GetRotation( id ) );
 }
 
 void b3w_set_rotation( int handle, int body, float qx, float qy, float qz, float qw )
 {
-	b3BodyId id = BodyId( handle, body );
+	BODY_OR_RETURN( id, handle, body )
 	b3Body_SetTransform( id, b3Body_GetPosition( id ), ( b3Quat ){ { qx, qy, qz }, qw } );
 }
 
 void b3w_linear_velocity( int handle, int body, float* out )
 {
-	b3Vec3 v = b3Body_GetLinearVelocity( BodyId( handle, body ) );
+	out[0] = out[1] = out[2] = 0.0f;
+	BODY_OR_RETURN( id, handle, body )
+
+	b3Vec3 v = b3Body_GetLinearVelocity( id );
 	out[0] = v.x;
 	out[1] = v.y;
 	out[2] = v.z;
@@ -507,7 +536,10 @@ void b3w_linear_velocity( int handle, int body, float* out )
 
 void b3w_angular_velocity( int handle, int body, float* out )
 {
-	b3Vec3 w = b3Body_GetAngularVelocity( BodyId( handle, body ) );
+	out[0] = out[1] = out[2] = 0.0f;
+	BODY_OR_RETURN( id, handle, body )
+
+	b3Vec3 w = b3Body_GetAngularVelocity( id );
 	out[0] = w.x;
 	out[1] = w.y;
 	out[2] = w.z;
@@ -528,7 +560,7 @@ void b3w_angular_velocity( int handle, int body, float* out )
  */
 void b3w_set_linear_velocity( int handle, int body, float x, float y, float z, int wake )
 {
-	b3BodyId id = BodyId( handle, body );
+	BODY_OR_RETURN( id, handle, body )
 	bool wasAsleep = b3Body_IsAwake( id ) == false;
 
 	b3Body_SetLinearVelocity( id, ( b3Vec3 ){ x, y, z } );
@@ -541,7 +573,7 @@ void b3w_set_linear_velocity( int handle, int body, float x, float y, float z, i
 
 void b3w_set_angular_velocity( int handle, int body, float x, float y, float z, int wake )
 {
-	b3BodyId id = BodyId( handle, body );
+	BODY_OR_RETURN( id, handle, body )
 	bool wasAsleep = b3Body_IsAwake( id ) == false;
 
 	b3Body_SetAngularVelocity( id, ( b3Vec3 ){ x, y, z } );
@@ -554,31 +586,36 @@ void b3w_set_angular_velocity( int handle, int body, float x, float y, float z, 
 
 void b3w_apply_impulse( int handle, int body, float x, float y, float z )
 {
-	b3BodyId id = BodyId( handle, body );
+	BODY_OR_RETURN( id, handle, body )
 	b3Body_ApplyLinearImpulse( id, ( b3Vec3 ){ x, y, z }, b3Body_GetWorldCenter( id ), true );
 }
 
 void b3w_apply_force( int handle, int body, float x, float y, float z, int wake )
 {
-	b3BodyId id = BodyId( handle, body );
+	BODY_OR_RETURN( id, handle, body )
 	b3Body_ApplyForce( id, ( b3Vec3 ){ x, y, z }, b3Body_GetWorldCenter( id ), wake != 0 );
 }
 
 void b3w_apply_torque( int handle, int body, float x, float y, float z, int wake )
 {
-	b3Body_ApplyTorque( BodyId( handle, body ), ( b3Vec3 ){ x, y, z }, wake != 0 );
+	BODY_OR_RETURN( id, handle, body )
+	b3Body_ApplyTorque( id, ( b3Vec3 ){ x, y, z }, wake != 0 );
 }
 
 float b3w_mass( int handle, int body )
 {
-	return b3Body_GetMass( BodyId( handle, body ) );
+	BODY_OR_RETURN( id, handle, body, 0.0f )
+	return b3Body_GetMass( id );
 }
 
 /// Diagonal of the local rotational inertia, which is what the force pipeline
 /// reads to judge whether a torque could actually turn the body.
 void b3w_principal_inertia( int handle, int body, float* out )
 {
-	b3Matrix3 I = b3Body_GetLocalRotationalInertia( BodyId( handle, body ) );
+	out[0] = out[1] = out[2] = 0.0f;
+	BODY_OR_RETURN( id, handle, body )
+
+	b3Matrix3 I = b3Body_GetLocalRotationalInertia( id );
 	out[0] = I.cx.x;
 	out[1] = I.cy.y;
 	out[2] = I.cz.z;
@@ -586,22 +623,26 @@ void b3w_principal_inertia( int handle, int body, float* out )
 
 int b3w_body_type( int handle, int body )
 {
-	return (int)b3Body_GetType( BodyId( handle, body ) );
+	BODY_OR_RETURN( id, handle, body, 0 )
+	return (int)b3Body_GetType( id );
 }
 
 void b3w_set_body_type( int handle, int body, int type )
 {
-	b3Body_SetType( BodyId( handle, body ), (b3BodyType)type );
+	BODY_OR_RETURN( id, handle, body )
+	b3Body_SetType( id, (b3BodyType)type );
 }
 
 void b3w_set_gravity_scale( int handle, int body, float scale )
 {
-	b3Body_SetGravityScale( BodyId( handle, body ), scale );
+	BODY_OR_RETURN( id, handle, body )
+	b3Body_SetGravityScale( id, scale );
 }
 
 void b3w_wake( int handle, int body )
 {
-	b3Body_SetAwake( BodyId( handle, body ), true );
+	BODY_OR_RETURN( id, handle, body )
+	b3Body_SetAwake( id, true );
 }
 
 int b3w_is_valid( int handle, int body )
@@ -791,11 +832,21 @@ int b3w_add_revolute_joint( int handle, int bodyA, int bodyB, float ax, float ay
 		return -1;
 	}
 
+	// A joint to a body that is not there is not a joint. Both ends are resolved
+	// before anything is built, so a stale handle costs a joint rather than a
+	// world holding a constraint onto nothing.
+	b3BodyId idA = BodyId( handle, bodyA );
+	b3BodyId idB = BodyId( handle, bodyB );
+	if ( B3_IS_NULL( idA ) || B3_IS_NULL( idB ) )
+	{
+		return -1;
+	}
+
 	b3Vec3 axis = { axisX, axisY, axisZ };
 
 	b3RevoluteJointDef def = b3DefaultRevoluteJointDef();
-	def.base.bodyIdA = BodyId( handle, bodyA );
-	def.base.bodyIdB = BodyId( handle, bodyB );
+	def.base.bodyIdA = idA;
+	def.base.bodyIdB = idB;
 	def.base.localFrameA = FrameAlong( ( b3Vec3 ){ ax, ay, az }, AXIS_Z, axis );
 	def.base.localFrameB = FrameAlong( ( b3Vec3 ){ bx, by, bz }, AXIS_Z, axis );
 
@@ -813,11 +864,21 @@ int b3w_add_prismatic_joint( int handle, int bodyA, int bodyB, float ax, float a
 		return -1;
 	}
 
+	// A joint to a body that is not there is not a joint. Both ends are resolved
+	// before anything is built, so a stale handle costs a joint rather than a
+	// world holding a constraint onto nothing.
+	b3BodyId idA = BodyId( handle, bodyA );
+	b3BodyId idB = BodyId( handle, bodyB );
+	if ( B3_IS_NULL( idA ) || B3_IS_NULL( idB ) )
+	{
+		return -1;
+	}
+
 	b3Vec3 axis = { axisX, axisY, axisZ };
 
 	b3PrismaticJointDef def = b3DefaultPrismaticJointDef();
-	def.base.bodyIdA = BodyId( handle, bodyA );
-	def.base.bodyIdB = BodyId( handle, bodyB );
+	def.base.bodyIdA = idA;
+	def.base.bodyIdB = idB;
 	def.base.localFrameA = FrameAlong( ( b3Vec3 ){ ax, ay, az }, AXIS_X, axis );
 	def.base.localFrameB = FrameAlong( ( b3Vec3 ){ bx, by, bz }, AXIS_X, axis );
 
