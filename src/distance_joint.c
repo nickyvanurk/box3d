@@ -421,7 +421,7 @@ void b3SolveDistanceJoint( b3JointSim* base, b3StepContext* context, bool useBia
 				if ( C > 0.0f )
 				{
 					// speculative
-					bias = C * context->inv_h;
+					bias = b3RigidLinearBias( C, context );
 				}
 				else if ( useBias )
 				{
@@ -455,7 +455,7 @@ void b3SolveDistanceJoint( b3JointSim* base, b3StepContext* context, bool useBia
 				if ( C > 0.0f )
 				{
 					// speculative
-					bias = C * context->inv_h;
+					bias = b3RigidLinearBias( C, context );
 				}
 				else if ( useBias )
 				{

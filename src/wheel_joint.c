@@ -729,7 +729,7 @@ void b3SolveWheelJoint( b3JointSim* base, b3StepContext* context, bool useBias )
 				if ( c > 0.0f )
 				{
 					// speculation
-					bias = c * context->inv_h;
+					bias = b3RigidAngularBias( c, context );
 				}
 				else if ( useBias )
 				{
@@ -761,7 +761,7 @@ void b3SolveWheelJoint( b3JointSim* base, b3StepContext* context, bool useBias )
 				if ( c > 0.0f )
 				{
 					// speculation
-					bias = c * context->inv_h;
+					bias = b3RigidAngularBias( c, context );
 				}
 				else if ( useBias )
 				{
@@ -796,7 +796,7 @@ void b3SolveWheelJoint( b3JointSim* base, b3StepContext* context, bool useBias )
 			if ( c > 0.0f )
 			{
 				// speculation
-				bias = c * context->inv_h;
+				bias = b3RigidLinearBias( c, context );
 			}
 			else if ( useBias )
 			{
@@ -834,7 +834,7 @@ void b3SolveWheelJoint( b3JointSim* base, b3StepContext* context, bool useBias )
 			if ( c > 0.0f )
 			{
 				// speculation
-				bias = c * context->inv_h;
+				bias = b3RigidLinearBias( c, context );
 			}
 			else if ( useBias )
 			{
@@ -879,18 +879,50 @@ void b3SolveWheelJoint( b3JointSim* base, b3StepContext* context, bool useBias )
 				impulseScale = base->constraintSoftness.impulseScale;
 			}
 
+			// The constraint axis must be a UNIT vector, and where it does not
+			// exist the constraint must not be solved at all.
+			//
+			// `u` is the cross product of the two axes this constraint keeps
+			// perpendicular, so its length is the sine of the angle between them.
+			// Left unnormalised it entered the effective mass squared —
+			// `k = u . (I^-1 u)` — while the Jacobian carried only one factor of
+			// it, so the impulse grew as 1/|u| and the correction it applied grew
+			// without bound as the axes approached parallel.
+			//
+			// That is precisely the configuration where it must NOT: parallel is
+			// where the error `c` is maximal, so the solver tried to correct the
+			// largest possible violation through the direction with the least
+			// possible leverage. The old `k > 0.0f` guard caught only an exact
+			// zero; a k of 1e-12 passed it and produced an effective mass of 1e12.
+			// Measured on a machine cut into overlapping fragments: this block
+			// alone took the pair from 10 rad/s to 11,937 in a single call, and
+			// the compounding ended as a NaN transform — a body that is absent
+			// from the world and can never be recovered.
+			//
+			// Normalised, `cdot` is the relative rate about the axis and `k` is a
+			// well-conditioned inverse mass, so the impulse is bounded by the
+			// inertia rather than by the alignment. Below the tolerance there is
+			// no axis to correct about: the pair is left for the substeps that
+			// follow, by which time the other constraints have moved it off the
+			// singularity.
 			b3Vec3 u = b3Cross( matrixB.cz, matrixA.cx );
-			float cdot = b3Dot( b3Sub( wB, wA ), u );
+			float uLength = b3Length( u );
+			if ( uLength > B3_MIN_CONSTRAINT_AXIS )
+			{
+				u = b3MulSV( 1.0f / uLength, u );
 
-			b3Matrix3 invInertiaSum = b3AddMM( iA, iB );
-			float k = b3Dot( u, b3MulMV( invInertiaSum, u ) );
-			float perpMass = k > 0.0f ? 1.0f / k : 0.0f;
+				float cdot = b3Dot( b3Sub( wB, wA ), u );
 
-			float deltaImpulse = -massScale * perpMass * ( cdot + bias ) - impulseScale * joint->angularImpulse.x;
-			joint->angularImpulse.x += deltaImpulse;
+				b3Matrix3 invInertiaSum = b3AddMM( iA, iB );
+				float k = b3Dot( u, b3MulMV( invInertiaSum, u ) );
+				float perpMass = k > 0.0f ? 1.0f / k : 0.0f;
 
-			wA = b3MulSub( wA, deltaImpulse, b3MulMV( iA, u ) );
-			wB = b3MulAdd( wB, deltaImpulse, b3MulMV( iB, u ) );
+				float deltaImpulse = -massScale * perpMass * ( cdot + bias ) - impulseScale * joint->angularImpulse.x;
+				joint->angularImpulse.x += deltaImpulse;
+
+				wA = b3MulSub( wA, deltaImpulse, b3MulMV( iA, u ) );
+				wB = b3MulAdd( wB, deltaImpulse, b3MulMV( iB, u ) );
+			}
 		}
 		else
 		{

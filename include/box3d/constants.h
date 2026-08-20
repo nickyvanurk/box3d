@@ -75,6 +75,26 @@ B3_API float b3GetStallThreshold( void );
 /// @warning increasing this to 0.5f * B3_PI or greater will break continuous collision.
 #define B3_MAX_ROTATION ( 0.25f * B3_PI )
 
+/// The ceiling on a rigid constraint's push-out velocity.
+///
+/// Not a physical limit — far above any correction a real joint asks for. It
+/// exists so a joint whose bodies have been displaced cannot demand a velocity
+/// whose SQUARE leaves float range: b3IntegrateVelocitiesTask evaluates
+/// w x (I * w) for gyroscopic torque, so an unbounded angular demand overflows
+/// to infinity and then to NaN, and a non-finite transform can never be
+/// recovered. See b3RigidLinearBias in joint.h.
+#define B3_MAX_CONSTRAINT_BIAS ( 1.0e6f )
+
+/// The shortest a constraint axis may be and still define a direction.
+///
+/// Axes built as a cross product have length sin(angle) between the vectors they
+/// relate, so they VANISH exactly where the constraint is most violated. Solving
+/// through a near-zero axis divides a maximal error by a vanishing leverage: the
+/// impulse diverges and the simulation leaves float range. Below this there is
+/// no direction to correct about, and the honest answer is to leave the pair to
+/// the substeps that follow. See the collinearity constraint in wheel_joint.c.
+#define B3_MIN_CONSTRAINT_AXIS ( 1.0e-4f )
+
 /// @warning modifying this can have a significant impact on performance and stability
 #define B3_SPECULATIVE_DISTANCE ( 4.0f * B3_LINEAR_SLOP )
 

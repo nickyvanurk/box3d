@@ -19,6 +19,7 @@ set(BOX3D_TEST_FILES
     test_macros.h
     test_manifold.c
     test_piston_chain.c
+    test_split_fragments.c
     test_wheel_placement.c
     test_math.c
 	test_mover.c

@@ -6,6 +6,7 @@
 #include "math_internal.h"
 #include "solver.h"
 
+#include "box3d/constants.h"
 #include "box3d/types.h"
 
 typedef struct b3DebugDraw b3DebugDraw;
@@ -350,6 +351,48 @@ void b3DestroyJointInternal( b3World* world, b3Joint* joint, bool wakeBodies );
 b3Joint* b3GetJointFullId( b3World* world, b3JointId jointId );
 b3JointSim* b3GetJointSim( b3World* world, b3Joint* joint );
 b3JointSim* b3GetJointSimCheckType( b3JointId jointId, b3JointType type );
+
+/**
+ * A rigid limit's push-out velocity, BOUNDED.
+ *
+ * A violated limit is corrected by demanding the velocity that closes the error
+ * in a single substep: `C * inv_h`. At 24 Hz with 32 substeps that factor is
+ * 768, so a joint whose bodies have been displaced demands hundreds of
+ * thousands of metres per second — which flings them further apart, which grows
+ * the error, which raises the demand. It is divergence by construction, and
+ * nothing in the loop bounded it.
+ *
+ * It ends by leaving float range. `b3IntegrateVelocitiesTask` squares angular
+ * velocity for the gyroscopic Newton-Raphson (`w x (I * w)`), so once omega
+ * reaches ~1e16 rad/s the product overflows to infinity and `Inf - Inf` is NaN.
+ * A body with a non-finite transform is not a body behaving badly, it is a body
+ * that is ABSENT: it renders from a stale snapshot, stops nothing, answers no
+ * ray, and can never be restored, because a NaN pose cannot be recorded as a
+ * good one to come back to. Players reported it as machines they could no
+ * longer place on, move, or collide with.
+ *
+ * The contact solver has always bounded its own push-out
+ * (`contact_solver.c:453`, capped at `world->contactSpeed`). Joints did not,
+ * and the same unbounded expression appears at fifteen sites across five joint
+ * types. These bound it by what the world already forbids — a constraint may
+ * not demand a velocity no body is permitted to have. That cannot change a
+ * healthy joint: its error is millimetres and its bias a few metres per second,
+ * far below either ceiling.
+ *
+ * Measured on the case that found this: 2.96e6 m/s out of one Solve, 1.43e15
+ * m/s five substeps later, NaN immediately after.
+ */
+B3_INLINE float b3RigidLinearBias( float c, const b3StepContext* context )
+{
+	return b3ClampFloat( c * context->inv_h, -B3_MAX_CONSTRAINT_BIAS, B3_MAX_CONSTRAINT_BIAS );
+}
+
+/** The angular counterpart — see b3RigidLinearBias. Bounded by the same quarter
+ *  turn per step the position integrator enforces. */
+B3_INLINE float b3RigidAngularBias( float c, const b3StepContext* context )
+{
+	return b3ClampFloat( c * context->inv_h, -B3_MAX_CONSTRAINT_BIAS, B3_MAX_CONSTRAINT_BIAS );
+}
 
 void b3PrepareJoint( b3JointSim* joint, b3StepContext* context );
 void b3WarmStartJoint( b3JointSim* joint, b3StepContext* context );

@@ -511,7 +511,7 @@ void b3SolveSphericalJoint( b3JointSim* base, b3StepContext* context, bool useBi
 			if ( c > 0.0f )
 			{
 				// speculation
-				bias = c * context->inv_h;
+				bias = b3RigidAngularBias( c, context );
 			}
 			else if ( useBias )
 			{
@@ -539,7 +539,7 @@ void b3SolveSphericalJoint( b3JointSim* base, b3StepContext* context, bool useBi
 			if ( c > 0.0f )
 			{
 				// speculation
-				bias = c * context->inv_h;
+				bias = b3RigidAngularBias( c, context );
 			}
 			else if ( useBias )
 			{
@@ -580,7 +580,7 @@ void b3SolveSphericalJoint( b3JointSim* base, b3StepContext* context, bool useBi
 		if ( c > 0.0f )
 		{
 			// speculation
-			bias = c * context->inv_h;
+			bias = b3RigidAngularBias( c, context );
 		}
 		else if ( useBias )
 		{

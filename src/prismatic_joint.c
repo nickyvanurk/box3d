@@ -533,7 +533,7 @@ void b3SolvePrismaticJoint( b3JointSim* base, b3StepContext* context, bool useBi
 				if ( C > 0.0f )
 				{
 					// speculation
-					bias = C * context->inv_h;
+					bias = b3RigidLinearBias( C, context );
 				}
 				else if ( useBias )
 				{
@@ -543,7 +543,7 @@ void b3SolvePrismaticJoint( b3JointSim* base, b3StepContext* context, bool useBi
 					// yields — the joint parks past its own stop and stays there,
 					// which is a piston chain visibly pulling apart. Full positional
 					// correction, the same bias the speculative branch above uses.
-					bias = C * context->inv_h;
+					bias = b3RigidLinearBias( C, context );
 				}
 
 				b3Vec3 vRel = b3Sub( b3Sub( b3Add( vB, b3Cross( wB, rB ) ), vA ), b3Cross( wA, b3Add( rA, d ) ) );
@@ -580,12 +580,12 @@ void b3SolvePrismaticJoint( b3JointSim* base, b3StepContext* context, bool useBi
 				if ( C > 0.0f )
 				{
 					// speculation
-					bias = C * context->inv_h;
+					bias = b3RigidLinearBias( C, context );
 				}
 				else if ( useBias )
 				{
 					// Hard, for the reason given on the lower limit above.
-					bias = C * context->inv_h;
+					bias = b3RigidLinearBias( C, context );
 				}
 
 				// sign flipped on Cdot

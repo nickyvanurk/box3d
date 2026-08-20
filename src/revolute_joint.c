@@ -478,7 +478,7 @@ void b3SolveRevoluteJoint( b3JointSim* base, b3StepContext* context, bool useBia
 			if ( c > 0.0f )
 			{
 				// speculation
-				bias = c * context->inv_h;
+				bias = b3RigidAngularBias( c, context );
 			}
 			else if ( useBias )
 			{
@@ -506,7 +506,7 @@ void b3SolveRevoluteJoint( b3JointSim* base, b3StepContext* context, bool useBia
 			if ( c > 0.0f )
 			{
 				// speculation
-				bias = c * context->inv_h;
+				bias = b3RigidAngularBias( c, context );
 			}
 			else if ( useBias )
 			{
