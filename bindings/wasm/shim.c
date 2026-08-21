@@ -249,7 +249,7 @@ void b3w_destroy_world( int handle )
 
 	// All FOUR of the per-body arrays `ReserveBodies` grows, not just the two
 	// that were here — `bodyOwner` and `detectOnly` leaked on every world
-	// teardown. Found by an ASan run over the shape churn below.
+	// teardown, found by running this under ASan.
 	free( world->bodies );
 	free( world->transforms );
 	free( world->bodyOwner );
