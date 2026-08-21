@@ -30,9 +30,9 @@
 #include <float.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
-#define B3W_MAX_WHEELS 32
 /** Bodies a vehicle may be told to ignore: its own, plus the player. */
 /** Owner id reserved for bodies that are never ground for any vehicle. */
 #define B3W_OWNER_NEVER_GROUND 0xFFFFFFFFu
@@ -456,9 +456,20 @@ typedef struct
 	int worldHandle;
 	b3BodyId chassis;
 	int wheelCount;
-	Wheel wheels[B3W_MAX_WHEELS];
-	b3Vec3 forwardWs[B3W_MAX_WHEELS];
-	b3Vec3 axle[B3W_MAX_WHEELS];
+	/*
+	 * Wheels are a GROWABLE array, not a fixed one, because the player decides
+	 * how many wheels a machine has and any constant we pick is a constant
+	 * someone builds past. This was `Wheel wheels[32]`, and a 76-wheel tank
+	 * silently drove on 32 of them: `add_wheel` refused the rest and the caller
+	 * had no way to find out.
+	 *
+	 * Anything holding a `Wheel*` across an add is holding a dangling pointer —
+	 * the grow reallocates. Take the index, not the address.
+	 */
+	int wheelCapacity;
+	Wheel* wheels;
+	b3Vec3* forwardWs;
+	b3Vec3* axle;
 	float currentVehicleSpeed;
 	/** The whole tick, recorded at prepare. Error-correction rates use this;
 	 *  impulses use the substep. See UpdateFriction. */
@@ -3102,6 +3113,9 @@ void b3w_vehicle_solve( Vehicle* v, float h )
 
 static Vehicle g_vehicles[B3W_MAX_VEHICLES];
 
+static bool ReserveWheel( Vehicle* v );
+static void FreeWheelStorage( Vehicle* v );
+
 /**
  * Solve the STEPPING world's vehicles for one substep. Registered with the world
  * as its substep callback, so the force model keeps step with the solver instead
@@ -3164,9 +3178,90 @@ void b3w_vehicle_destroy_world( b3WorldId world )
 	{
 		if ( g_vehicles[i].used && b3StoreWorldId( g_vehicles[i].world ) == dying )
 		{
+			// The bodies die with the world, but the wheel ARRAYS are ours and
+			// outlive it. Flipping `used` alone leaked them on every teardown.
+			FreeWheelStorage( &g_vehicles[i] );
 			g_vehicles[i].used = false;
 		}
 	}
+}
+
+/**
+ * Make room for one more wheel, doubling. False only when the heap is out.
+ *
+ * The three arrays grow together and are indexed in lockstep by every solver
+ * loop, so a partial grow would be worse than no grow: it is all three or the
+ * add fails.
+ */
+static bool ReserveWheel( Vehicle* v )
+{
+	if ( v->wheelCount < v->wheelCapacity )
+	{
+		return true;
+	}
+
+	int prev = v->wheelCapacity;
+	int next = prev > 0 ? prev * 2 : 8;
+
+	Wheel* wheels = (Wheel*)realloc( v->wheels, (size_t)next * sizeof( Wheel ) );
+	if ( wheels == NULL )
+	{
+		return false;
+	}
+	v->wheels = wheels;
+
+	b3Vec3* forwardWs = (b3Vec3*)realloc( v->forwardWs, (size_t)next * sizeof( b3Vec3 ) );
+	if ( forwardWs == NULL )
+	{
+		return false;
+	}
+	v->forwardWs = forwardWs;
+
+	b3Vec3* axle = (b3Vec3*)realloc( v->axle, (size_t)next * sizeof( b3Vec3 ) );
+	if ( axle == NULL )
+	{
+		return false;
+	}
+	v->axle = axle;
+
+	/*
+	 * ZERO the new tail. These were inline arrays inside `Vehicle`, so the
+	 * memset in `b3w_vehicle_create` covered them; realloc does not, and the
+	 * difference is not academic.
+	 *
+	 * `axle` and `forwardWs` are written only for wheels that found ground
+	 * (see the `groundBody < 0` skip in the friction pass) but READ wherever a
+	 * wheel has a non-zero impulse — so an airborne wheel holding a stale
+	 * impulse reads whatever the allocator last left here and applies it as a
+	 * direction. Uninitialised, that is an arbitrary force on the chassis; a
+	 * drive test caught it as 3.2 m/s of upward velocity out of nowhere.
+	 */
+	memset( v->wheels + prev, 0, (size_t)( next - prev ) * sizeof( Wheel ) );
+	memset( v->forwardWs + prev, 0, (size_t)( next - prev ) * sizeof( b3Vec3 ) );
+	memset( v->axle + prev, 0, (size_t)( next - prev ) * sizeof( b3Vec3 ) );
+
+	v->wheelCapacity = next;
+	return true;
+}
+
+/**
+ * Release the wheel arrays and leave the vehicle empty-but-valid.
+ *
+ * Called from BOTH teardown paths. `b3w_vehicle_create` memsets the whole
+ * struct, so a slot that is reused must arrive with its pointers already freed
+ * and nulled — that invariant is what makes the memset safe, and it is why
+ * `destroy_world` can no longer just flip `used`.
+ */
+static void FreeWheelStorage( Vehicle* v )
+{
+	free( v->wheels );
+	free( v->forwardWs );
+	free( v->axle );
+	v->wheels = NULL;
+	v->forwardWs = NULL;
+	v->axle = NULL;
+	v->wheelCount = 0;
+	v->wheelCapacity = 0;
 }
 
 Vehicle* b3w_vehicle_get( int handle )
@@ -3239,6 +3334,7 @@ void b3w_vehicle_destroy( int handle )
 		v->wheels[i].body = b3_nullBodyId;
 	}
 
+	FreeWheelStorage( v );
 	v->used = false;
 }
 
@@ -3275,6 +3371,20 @@ int b3w_vehicle_wheel_count( int handle )
 }
 
 /**
+ * How many wheels the readback buffer must hold.
+ *
+ * `b3w_vehicle_read_wheels` writes `wheelCount * WHEEL_READBACK_STRIDE` floats
+ * into a pointer it cannot size-check. The host used to allocate that buffer
+ * from its own copy of the old `32`, so the two agreed only by luck; raising
+ * the cap on one side alone wrote past the allocation. Ask, do not assume.
+ */
+int b3w_vehicle_wheel_capacity( int handle )
+{
+	Vehicle* v = b3w_vehicle_get( handle );
+	return v != NULL ? v->wheelCapacity : 0;
+}
+
+/**
  * Add a wheel, with the same defaults Rapier's `WheelTuning` carries.
  *
  * The tuning values are overwritten immediately by the game's per-wheel setters,
@@ -3285,7 +3395,7 @@ int b3w_vehicle_add_wheel( int handle, float cx, float cy, float cz, float dx, f
 						   float az, float restLength, float radius, float width )
 {
 	Vehicle* v = b3w_vehicle_get( handle );
-	if ( v == NULL || v->wheelCount >= B3W_MAX_WHEELS )
+	if ( v == NULL || !ReserveWheel( v ) )
 	{
 		return -1;
 	}
