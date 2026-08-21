@@ -45,7 +45,6 @@
 
 #define MAX_WORLDS 4
 #define MAX_JOINTS 4096
-#define MAX_SHAPES 65536
 
 typedef struct World
 {
@@ -100,11 +99,11 @@ typedef struct World
 	 * a BODY takes its shapes with it and `b3w_destroy_shape` is never called.
 	 * Asking the engine what is still alive is the only answer that covers both.
 	 */
-	b3ShapeId shapes[MAX_SHAPES];
+	b3ShapeId* shapes;
 	/** Per-slot generation, bumped whenever a slot is reused. Reset with the
 	 *  world (`b3w_destroy_world` clears the whole struct) — a handle held from
 	 *  a destroyed world is caught by the slot's null shape id instead. */
-	uint16_t shapeGen[MAX_SHAPES];
+	uint16_t* shapeGen;
 	/*
 	 * The heap hull a slot's shape was built over, or NULL.
 	 *
@@ -120,7 +119,9 @@ typedef struct World
 	 * registry was the thing "nobody would keep in sync"; the sweep keeps it in
 	 * sync by construction, because it asks the engine what is still alive.
 	 */
-	b3HullData* shapeHull[MAX_SHAPES];
+	b3HullData** shapeHull;
+	/** Slots allocated. Grows on demand; never shrinks while the world lives. */
+	int shapeCapacity;
 	int shapeCount;
 	/** Where the last reclaim sweep stopped, so a full registry stays amortised. */
 	int shapeRover;
@@ -250,6 +251,9 @@ void b3w_destroy_world( int handle )
 	// All FOUR of the per-body arrays `ReserveBodies` grows, not just the two
 	// that were here — `bodyOwner` and `detectOnly` leaked on every world
 	// teardown, found by running this under ASan.
+	free( world->shapes );
+	free( world->shapeGen );
+	free( world->shapeHull );
 	free( world->bodies );
 	free( world->transforms );
 	free( world->bodyOwner );
@@ -335,16 +339,86 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
  * JS callback invoked per contact pair to express that; here it is a field, so
  * the comparison never crosses the boundary at all. Zero disables the rule.
  */
-#define SHAPE_SLOT_BITS 16
-#define SHAPE_SLOT_MASK 0xFFFF
+/*
+ * A handle packs `generation << SHAPE_SLOT_BITS | slot` into a positive int32
+ * — 31 usable bits, split 21/10.
+ *
+ * The table grows now, so the SLOT FIELD is what would otherwise cap it: 16
+ * bits held the world to 65,536 shapes however large the array got, which is
+ * the same fixed ceiling one level down. 21 bits is 2,097,152 slots, about
+ * 3,200 copies of the largest machine anyone has built, all alive at once.
+ *
+ * That leaves 10 bits of generation, so a slot must be reused 1024 times
+ * before a stale handle could alias a live one. The rover walks the whole
+ * table between revisits, so that is 1024 x capacity allocations — tens of
+ * millions. The old 15 bits of generation bought headroom nobody could use
+ * against a ceiling we were actually reaching.
+ */
+#define SHAPE_SLOT_BITS 21
+#define SHAPE_SLOT_MASK 0x1FFFFF
 /** Generations stay under 15 bits so a handle is always a positive int32. */
-#define SHAPE_GEN_MASK 0x7FFF
+#define SHAPE_GEN_MASK 0x3FF
+
+/**
+ * Make room for one more shape slot, doubling. False only when the heap is out
+ * or the slot field cannot address another one.
+ *
+ * Generations are PRESERVED across a grow: realloc keeps the existing ones and
+ * only the new tail is zeroed. A generation that reset would hand a stale
+ * handle exactly the number it was waiting for.
+ */
+static bool ReserveShapeSlot( World* world )
+{
+	if ( world->shapeCount < world->shapeCapacity )
+	{
+		return true;
+	}
+
+	int prev = world->shapeCapacity;
+	int next = prev > 0 ? prev * 2 : 256;
+	if ( next > SHAPE_SLOT_MASK + 1 )
+	{
+		next = SHAPE_SLOT_MASK + 1;
+	}
+	if ( next <= prev )
+	{
+		return false;
+	}
+
+	b3ShapeId* shapes = (b3ShapeId*)realloc( world->shapes, (size_t)next * sizeof( b3ShapeId ) );
+	if ( shapes == NULL )
+	{
+		return false;
+	}
+	world->shapes = shapes;
+
+	uint16_t* gen = (uint16_t*)realloc( world->shapeGen, (size_t)next * sizeof( uint16_t ) );
+	if ( gen == NULL )
+	{
+		return false;
+	}
+	world->shapeGen = gen;
+
+	b3HullData** hulls = (b3HullData**)realloc( world->shapeHull, (size_t)next * sizeof( b3HullData* ) );
+	if ( hulls == NULL )
+	{
+		return false;
+	}
+	world->shapeHull = hulls;
+
+	memset( world->shapes + prev, 0, (size_t)( next - prev ) * sizeof( b3ShapeId ) );
+	memset( world->shapeGen + prev, 0, (size_t)( next - prev ) * sizeof( uint16_t ) );
+	memset( world->shapeHull + prev, 0, (size_t)( next - prev ) * sizeof( b3HullData* ) );
+
+	world->shapeCapacity = next;
+	return true;
+}
 
 static int RetainShape( World* world, b3ShapeId shape, b3HullData* hull )
 {
-	int slot;
+	int slot = -1;
 
-	if ( world->shapeCount < MAX_SHAPES )
+	if ( world->shapeCount < world->shapeCapacity )
 	{
 		slot = world->shapeCount++;
 	}
@@ -352,11 +426,15 @@ static int RetainShape( World* world, b3ShapeId shape, b3HullData* hull )
 	{
 		// Full. Sweep for a slot whose shape has since died, resuming where the
 		// last sweep stopped so a steady state costs about one probe.
-		slot = -1;
-		for ( int n = 0; n < MAX_SHAPES; n++ )
+		//
+		// Recycling is tried BEFORE growing, deliberately: it holds the table at
+		// the high-water mark of what is actually alive rather than at
+		// everything ever created, which is the whole difference between this
+		// and the append-only version that leaked.
+		for ( int n = 0; n < world->shapeCapacity; n++ )
 		{
 			int i = world->shapeRover;
-			world->shapeRover = ( i + 1 ) & ( MAX_SHAPES - 1 );
+			world->shapeRover = ( i + 1 ) % world->shapeCapacity;
 			if ( !b3Shape_IsValid( world->shapes[i] ) )
 			{
 				slot = i;
@@ -364,24 +442,31 @@ static int RetainShape( World* world, b3ShapeId shape, b3HullData* hull )
 			}
 		}
 
-		// Genuinely out: this many shapes are alive at once. Refuse, and say so
-		// by the return value the caller is now obliged to check.
-		if ( slot < 0 )
+		if ( slot >= 0 )
+		{
+			// Reusing the slot invalidates every handle that pointed at it.
+			world->shapeGen[slot] = (uint16_t)( ( world->shapeGen[slot] + 1 ) & SHAPE_GEN_MASK );
+
+			// The dead shape's hull goes with it. Safe here and nowhere earlier:
+			// the sweep only picks slots whose shape the engine already reports
+			// invalid, and a hull must outlive the shape built over it.
+			if ( world->shapeHull[slot] != NULL )
+			{
+				b3DestroyHull( world->shapeHull[slot] );
+				world->shapeHull[slot] = NULL;
+			}
+		}
+	}
+
+	// Every slot holds a LIVE shape, so there is nothing to recycle and the
+	// table has to get bigger. -1 now means only that the heap said no.
+	if ( slot < 0 )
+	{
+		if ( !ReserveShapeSlot( world ) )
 		{
 			return -1;
 		}
-
-		// Reusing the slot invalidates every handle that pointed at it.
-		world->shapeGen[slot] = (uint16_t)( ( world->shapeGen[slot] + 1 ) & SHAPE_GEN_MASK );
-
-		// The dead shape's hull goes with it. Safe here and nowhere earlier:
-		// the sweep only picks slots whose shape the engine already reports
-		// invalid, and a hull must outlive the shape built over it.
-		if ( world->shapeHull[slot] != NULL )
-		{
-			b3DestroyHull( world->shapeHull[slot] );
-			world->shapeHull[slot] = NULL;
-		}
+		slot = world->shapeCount++;
 	}
 
 	world->shapes[slot] = shape;
