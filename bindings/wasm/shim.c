@@ -31,7 +31,6 @@
 
 #define MAX_WORLDS 4
 #define MAX_JOINTS 4096
-#define MAX_HULLS 8192
 #define MAX_SHAPES 65536
 
 typedef struct World
@@ -65,9 +64,6 @@ typedef struct World
 	b3JointId joints[MAX_JOINTS];
 	int jointCount;
 
-	// Heap-owned hulls, released with the world — see RetainHull.
-	b3HullData* hulls[MAX_HULLS];
-	int hullCount;
 
 	/*
 	 * Shapes are handed back as handles so callers can destroy or re-filter one
@@ -91,9 +87,26 @@ typedef struct World
 	 * Asking the engine what is still alive is the only answer that covers both.
 	 */
 	b3ShapeId shapes[MAX_SHAPES];
-	/** Per-slot generation. Deliberately NOT reset when a world slot is reused —
-	 *  monotonic generations keep handles from a destroyed world invalid too. */
+	/** Per-slot generation, bumped whenever a slot is reused. Reset with the
+	 *  world (`b3w_destroy_world` clears the whole struct) — a handle held from
+	 *  a destroyed world is caught by the slot's null shape id instead. */
 	uint16_t shapeGen[MAX_SHAPES];
+	/*
+	 * The heap hull a slot's shape was built over, or NULL.
+	 *
+	 * Hulls from `b3CreateCylinder` / `b3CreateHull` are heap-owned and must
+	 * outlive the shape referencing them, unlike `b3MakeBoxHull`'s stack value.
+	 * They used to sit in a separate append-only `hulls[MAX_HULLS]` array
+	 * released only with the world, which leaked steadily — a tank costs 108 of
+	 * them per rebuild and rebuilds happen on every block placed — and past
+	 * 8192 they were not even recorded, so they could never be freed at all.
+	 *
+	 * A hull's lifetime IS its shape's lifetime, so it is stored with the shape
+	 * and freed when the slot is reclaimed. The old comment said a per-shape
+	 * registry was the thing "nobody would keep in sync"; the sweep keeps it in
+	 * sync by construction, because it asks the engine what is still alive.
+	 */
+	b3HullData* shapeHull[MAX_SHAPES];
 	int shapeCount;
 	/** Where the last reclaim sweep stopped, so a full registry stays amortised. */
 	int shapeRover;
@@ -192,7 +205,6 @@ int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableC
 	world->inUse = true;
 	world->bodyCount = 0;
 	world->jointCount = 0;
-	world->hullCount = 0;
 	world->shapeCount = 0;
 
 	ReserveBodies( world, 256 );
@@ -213,13 +225,21 @@ void b3w_destroy_world( int handle )
 	b3w_vehicle_destroy_world( world->id );
 	b3DestroyWorld( world->id );
 
-	for ( int i = 0; i < world->hullCount; ++i )
+	for ( int i = 0; i < world->shapeCount; ++i )
 	{
-		b3DestroyHull( world->hulls[i] );
+		if ( world->shapeHull[i] != NULL )
+		{
+			b3DestroyHull( world->shapeHull[i] );
+		}
 	}
 
+	// All FOUR of the per-body arrays `ReserveBodies` grows, not just the two
+	// that were here — `bodyOwner` and `detectOnly` leaked on every world
+	// teardown. Found by an ASan run over the shape churn below.
 	free( world->bodies );
 	free( world->transforms );
+	free( world->bodyOwner );
+	free( world->detectOnly );
 	memset( world, 0, sizeof( World ) );
 }
 
@@ -306,7 +326,7 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
 /** Generations stay under 15 bits so a handle is always a positive int32. */
 #define SHAPE_GEN_MASK 0x7FFF
 
-static int RetainShape( World* world, b3ShapeId shape )
+static int RetainShape( World* world, b3ShapeId shape, b3HullData* hull )
 {
 	int slot;
 
@@ -339,9 +359,19 @@ static int RetainShape( World* world, b3ShapeId shape )
 
 		// Reusing the slot invalidates every handle that pointed at it.
 		world->shapeGen[slot] = (uint16_t)( ( world->shapeGen[slot] + 1 ) & SHAPE_GEN_MASK );
+
+		// The dead shape's hull goes with it. Safe here and nowhere earlier:
+		// the sweep only picks slots whose shape the engine already reports
+		// invalid, and a hull must outlive the shape built over it.
+		if ( world->shapeHull[slot] != NULL )
+		{
+			b3DestroyHull( world->shapeHull[slot] );
+			world->shapeHull[slot] = NULL;
+		}
 	}
 
 	world->shapes[slot] = shape;
+	world->shapeHull[slot] = hull;
 	return (int)( ( (uint32_t)world->shapeGen[slot] << SHAPE_SLOT_BITS ) | (uint32_t)slot );
 }
 
@@ -411,7 +441,7 @@ int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateHullShape( bodyId, &def, &hull.base ) );
+	return RetainShape( world, b3CreateHullShape( bodyId, &def, &hull.base ), NULL );
 }
 
 int b3w_body_count( int handle )
@@ -760,7 +790,7 @@ int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius,
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateCapsuleShape( bodyId, &def, &capsule ) );
+	return RetainShape( world, b3CreateCapsuleShape( bodyId, &def, &capsule ), NULL );
 }
 
 // --- terrain and queries -------------------------------------------------
@@ -832,7 +862,7 @@ int b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int 
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateHeightFieldShape( bodyId, &shapeDef, field ) );
+	return RetainShape( world, b3CreateHeightFieldShape( bodyId, &shapeDef, field ), NULL );
 }
 
 /// Cast a ray and return the hit's world Y, or `missValue` when nothing is hit.
@@ -1057,7 +1087,7 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateMeshShape( bodyId, &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } ) );
+	return RetainShape( world, b3CreateMeshShape( bodyId, &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } ), NULL );
 }
 
 // --- joint motors and limits ---------------------------------------------
@@ -1231,16 +1261,6 @@ int b3w_cast_sphere( int handle, float cx, float cy, float cz, float radius, flo
 // structures constantly and a per-shape free would need a registry nobody
 // would keep in sync.
 
-static void RetainHull( World* world, b3HullData* hull )
-{
-	if ( world->hullCount >= MAX_HULLS )
-	{
-		return;
-	}
-
-	world->hulls[world->hullCount++] = hull;
-}
-
 int b3w_add_sphere_shape( int handle, int body, float radius, float ox, float oy, float oz, float density,
 						  float friction, float restitution, int group, int isSensor )
 {
@@ -1265,7 +1285,7 @@ int b3w_add_sphere_shape( int handle, int body, float radius, float ox, float oy
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateSphereShape( bodyId, &def, &sphere ) );
+	return RetainShape( world, b3CreateSphereShape( bodyId, &def, &sphere ), NULL );
 }
 
 /// A cylinder about local Y, matching how the game orients wheels.
@@ -1286,15 +1306,17 @@ int b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius
 	def.isSensor = isSensor != 0;
 	def.enableSensorEvents = isSensor != 0;
 
-	b3HullData* hull = b3CreateCylinder( 2.0f * halfHeight, radius, -halfHeight, sides );
-	RetainHull( world, hull );
+	// The body is resolved BEFORE the hull is built: bailing out afterwards
+	// used to strand a hull that nothing would ever free.
 	b3BodyId bodyId = BodyOf( world, body );
 	if ( B3_IS_NULL( bodyId ) )
 	{
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateHullShape( bodyId, &def, hull ) );
+	b3HullData* hull = b3CreateCylinder( 2.0f * halfHeight, radius, -halfHeight, sides );
+
+	return RetainShape( world, b3CreateHullShape( bodyId, &def, hull ), hull );
 }
 
 /// A convex hull over a point cloud the host uploaded.
@@ -1321,8 +1343,6 @@ int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int
 		return -1;
 	}
 
-	RetainHull( world, hull );
-
 	b3ShapeDef def = b3DefaultShapeDef();
 	def.density = density;
 	def.baseMaterial.friction = friction;
@@ -1337,7 +1357,7 @@ int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateHullShape( bodyId, &def, hull ) );
+	return RetainShape( world, b3CreateHullShape( bodyId, &def, hull ), hull );
 }
 
 // --- lifecycle and world state -------------------------------------------
