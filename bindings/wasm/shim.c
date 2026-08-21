@@ -29,6 +29,20 @@
 // across the boundary and a stale handle fails a bounds check rather than
 // addressing a recycled body.
 
+/*
+ * "I cannot answer that", distinct from any real answer.
+ *
+ * A query about a handle this world does not own used to return 0, which is
+ * also a real answer everywhere it was used: a body that does not exist read as
+ * ASLEEP, a cast into a destroyed world read as a MISS, a body with no shapes
+ * and a body that is not there were the same number. The caller then decided
+ * something on a fact nobody established.
+ *
+ * Callers must treat this as a third state. Choosing to fall back to a
+ * particular answer is fine — silently inheriting one is what this replaces.
+ */
+#define B3W_UNKNOWN ( -1 )
+
 #define MAX_WORLDS 4
 #define MAX_JOINTS 4096
 #define MAX_SHAPES 65536
@@ -455,7 +469,9 @@ int b3w_is_awake( int handle, int body )
 	b3BodyId id = BodyId( handle, body );
 	if ( B3_IS_NULL( id ) )
 	{
-		return 0;
+		// NOT 0. A body that is gone is not "asleep", and the host read it that
+		// way at three call sites — one of which asks the inverse question.
+		return B3W_UNKNOWN;
 	}
 
 	return b3Body_IsAwake( id ) ? 1 : 0;
@@ -1231,7 +1247,10 @@ int b3w_cast_sphere( int handle, float cx, float cy, float cz, float radius, flo
 	World* world = GetWorld( handle );
 	if ( world == NULL )
 	{
-		return 0;
+		// A cast into a world that is not there is not a MISS. `out` is left
+		// untouched, so a caller that ignores this reads stale floats rather
+		// than a fabricated clean miss.
+		return B3W_UNKNOWN;
 	}
 
 	b3Vec3 point = { 0.0f, 0.0f, 0.0f };
@@ -1580,11 +1599,14 @@ int b3w_shape_count( int handle, int body )
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
 	{
-		return 0;
+		return B3W_UNKNOWN;
 	}
 
+	// A destroyed body keeps its slot — indices are never compacted — so it
+	// passes the range check above and only resolves to null HERE. This was the
+	// second 0-return in one function, and the one that actually fired.
 	b3BodyId id = BodyOf( world, body );
-	return B3_IS_NULL( id ) ? 0 : b3Body_GetShapeCount( id );
+	return B3_IS_NULL( id ) ? B3W_UNKNOWN : b3Body_GetShapeCount( id );
 }
 
 /**
@@ -1682,7 +1704,10 @@ int b3w_cast_ray_filtered( int handle, float ox, float oy, float oz, float dx, f
 	World* world = GetWorld( handle );
 	if ( world == NULL )
 	{
-		return 0;
+		// A cast into a world that is not there is not a MISS. `out` is left
+		// untouched, so a caller that ignores this reads stale floats rather
+		// than a fabricated clean miss.
+		return B3W_UNKNOWN;
 	}
 
 	b3QueryFilter filter = b3DefaultQueryFilter();
@@ -1720,7 +1745,10 @@ int b3w_cast_ray_detailed( int handle, float ox, float oy, float oz, float dx, f
 	World* world = GetWorld( handle );
 	if ( world == NULL )
 	{
-		return 0;
+		// A cast into a world that is not there is not a MISS. `out` is left
+		// untouched, so a caller that ignores this reads stale floats rather
+		// than a fabricated clean miss.
+		return B3W_UNKNOWN;
 	}
 
 	ClosestRayHit closest = { .fraction = 1.0f, .body = -1, .hit = false };
@@ -2183,7 +2211,10 @@ int b3w_cast_sphere_filtered( int handle, float cx, float cy, float cz, float ra
 	World* world = GetWorld( handle );
 	if ( world == NULL )
 	{
-		return 0;
+		// A cast into a world that is not there is not a MISS. `out` is left
+		// untouched, so a caller that ignores this reads stale floats rather
+		// than a fabricated clean miss.
+		return B3W_UNKNOWN;
 	}
 
 	b3Vec3 point = { 0.0f, 0.0f, 0.0f };
