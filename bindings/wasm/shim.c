@@ -69,11 +69,34 @@ typedef struct World
 	b3HullData* hulls[MAX_HULLS];
 	int hullCount;
 
-	// Shapes are handed back as handles so callers can destroy or re-filter one
-	// without holding a Box3D id. Slots are never reused: a stale handle then
-	// fails a validity check rather than addressing someone else's collider.
+	/*
+	 * Shapes are handed back as handles so callers can destroy or re-filter one
+	 * without holding a Box3D id.
+	 *
+	 * A handle is `generation << 16 | slot`, NOT a bare index. Slots used to be
+	 * append-only and never reused, so that a stale handle failed a validity
+	 * check rather than addressing someone else's collider — a real hazard, and
+	 * the generation is what keeps that guarantee now that slots ARE reused.
+	 *
+	 * They have to be reused, because append-only made this a LEAK with a wall
+	 * at the end of it: nothing here is freed when a shape dies, and a machine
+	 * rebuilds its colliders on every block the player places. A 76-wheel tank
+	 * costs 646 slots per rebuild, so it exhausted all 65536 after about a
+	 * hundred placements — and past that every collider came back -1, which the
+	 * host stored as a live handle. The machine silently lost its collision.
+	 *
+	 * Reclaim is a LAZY SWEEP for slots whose shape is no longer valid, not a
+	 * free list, because the dominant teardown path never tells us: destroying
+	 * a BODY takes its shapes with it and `b3w_destroy_shape` is never called.
+	 * Asking the engine what is still alive is the only answer that covers both.
+	 */
 	b3ShapeId shapes[MAX_SHAPES];
+	/** Per-slot generation. Deliberately NOT reset when a world slot is reused —
+	 *  monotonic generations keep handles from a destroyed world invalid too. */
+	uint16_t shapeGen[MAX_SHAPES];
 	int shapeCount;
+	/** Where the last reclaim sweep stopped, so a full registry stays amortised. */
+	int shapeRover;
 
 	// pos(3) + quat(4) per body, interleaved, in body-handle order.
 	float* transforms;
@@ -278,16 +301,73 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
  * JS callback invoked per contact pair to express that; here it is a field, so
  * the comparison never crosses the boundary at all. Zero disables the rule.
  */
+#define SHAPE_SLOT_BITS 16
+#define SHAPE_SLOT_MASK 0xFFFF
+/** Generations stay under 15 bits so a handle is always a positive int32. */
+#define SHAPE_GEN_MASK 0x7FFF
+
 static int RetainShape( World* world, b3ShapeId shape )
 {
-	if ( world->shapeCount >= MAX_SHAPES )
+	int slot;
+
+	if ( world->shapeCount < MAX_SHAPES )
 	{
-		return -1;
+		slot = world->shapeCount++;
+	}
+	else
+	{
+		// Full. Sweep for a slot whose shape has since died, resuming where the
+		// last sweep stopped so a steady state costs about one probe.
+		slot = -1;
+		for ( int n = 0; n < MAX_SHAPES; n++ )
+		{
+			int i = world->shapeRover;
+			world->shapeRover = ( i + 1 ) & ( MAX_SHAPES - 1 );
+			if ( !b3Shape_IsValid( world->shapes[i] ) )
+			{
+				slot = i;
+				break;
+			}
+		}
+
+		// Genuinely out: this many shapes are alive at once. Refuse, and say so
+		// by the return value the caller is now obliged to check.
+		if ( slot < 0 )
+		{
+			return -1;
+		}
+
+		// Reusing the slot invalidates every handle that pointed at it.
+		world->shapeGen[slot] = (uint16_t)( ( world->shapeGen[slot] + 1 ) & SHAPE_GEN_MASK );
 	}
 
-	int handle = world->shapeCount++;
-	world->shapes[handle] = shape;
-	return handle;
+	world->shapes[slot] = shape;
+	return (int)( ( (uint32_t)world->shapeGen[slot] << SHAPE_SLOT_BITS ) | (uint32_t)slot );
+}
+
+/**
+ * Resolve a shape handle, or NULL if it is stale, out of range, or malformed.
+ *
+ * The generation check is the whole point: a handle held across the reuse of
+ * its slot resolves to NULL here rather than to the collider that took its
+ * place.
+ */
+static b3ShapeId* ResolveShape( World* world, int handle )
+{
+	if ( world == NULL || handle < 0 )
+	{
+		return NULL;
+	}
+
+	int slot = handle & SHAPE_SLOT_MASK;
+	int generation = ( handle >> SHAPE_SLOT_BITS ) & SHAPE_GEN_MASK;
+
+	if ( slot >= world->shapeCount || world->shapeGen[slot] != (uint16_t)generation )
+	{
+		return NULL;
+	}
+
+	return &world->shapes[slot];
 }
 
 /**
@@ -1718,27 +1798,22 @@ float b3w_revolute_angle( int handle, int joint )
  */
 void b3w_destroy_shape( int handle, int shape )
 {
-	World* world = GetWorld( handle );
-	if ( world == NULL || shape < 0 || shape >= world->shapeCount )
+	b3ShapeId* id = ResolveShape( GetWorld( handle ), shape );
+	if ( id == NULL )
 	{
 		return;
 	}
 
-	if ( b3Shape_IsValid( world->shapes[shape] ) )
+	if ( b3Shape_IsValid( *id ) )
 	{
-		b3DestroyShape( world->shapes[shape], true );
+		b3DestroyShape( *id, true );
 	}
 }
 
 int b3w_shape_is_valid( int handle, int shape )
 {
-	World* world = GetWorld( handle );
-	if ( world == NULL || shape < 0 || shape >= world->shapeCount )
-	{
-		return 0;
-	}
-
-	return b3Shape_IsValid( world->shapes[shape] ) ? 1 : 0;
+	b3ShapeId* id = ResolveShape( GetWorld( handle ), shape );
+	return id != NULL && b3Shape_IsValid( *id ) ? 1 : 0;
 }
 
 /// Destroy a joint. Joints otherwise live until their world does, which is
@@ -1771,21 +1846,16 @@ void b3w_destroy_joint( int handle, int joint )
  */
 void b3w_set_shape_filter( int handle, int shape, int category, int mask )
 {
-	World* world = GetWorld( handle );
-	if ( world == NULL || shape < 0 || shape >= world->shapeCount )
+	b3ShapeId* id = ResolveShape( GetWorld( handle ), shape );
+	if ( id == NULL || b3Shape_IsValid( *id ) == false )
 	{
 		return;
 	}
 
-	if ( b3Shape_IsValid( world->shapes[shape] ) == false )
-	{
-		return;
-	}
-
-	b3Filter filter = b3Shape_GetFilter( world->shapes[shape] );
+	b3Filter filter = b3Shape_GetFilter( *id );
 	filter.categoryBits = (uint64_t)(uint32_t)category;
 	filter.maskBits = (uint64_t)(uint32_t)mask;
-	b3Shape_SetFilter( world->shapes[shape], filter, true );
+	b3Shape_SetFilter( *id, filter, true );
 }
 
 /// Current extension of a prismatic joint. Box3D tracks this; Rapier's binding
