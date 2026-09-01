@@ -43,7 +43,16 @@
  */
 #define B3W_UNKNOWN ( -1 )
 
-#define MAX_WORLDS 4
+/*
+ * Sixteen, not four.
+ *
+ * A synchronisation lab gives every simulated client its own world — that is
+ * what makes it a model of N machines rather than one — so six players plus a
+ * reference world wants seven. Four was silently exceeded: the fifth
+ * `b3w_create_world` returns -1 and every call through that handle is then
+ * ignored, so bodies appear to spawn and read back as zeros.
+ */
+#define MAX_WORLDS 16
 #define MAX_JOINTS 4096
 
 typedef struct World
@@ -769,6 +778,127 @@ void b3w_angular_velocity( int handle, int body, float* out )
  * between the two calls, so there is no intermediate solver state, and for a
  * body that was already awake `wake = false` is a no-op either way.
  */
+/**
+ * The velocity change this body took from CONTACTS during the last step.
+ *
+ * Exposed because a replicated car needs to tell three things apart that all
+ * arrive as one velocity: what its owner's driver did, what the world did to it,
+ * and what hitting something did. Only the last is discovered locally and
+ * contested between two machines, and it is the only one that must survive a
+ * correction toward the owner's account.
+ *
+ * Measured, not modelled. The alternative in the client was to recompute the
+ * exchange analytically after the fact — a sphere-radius model with one
+ * restitution constant, against a solver that used boxes, wheels, friction and
+ * the real manifold — so it restored a different quantity than the correction
+ * removed. It is also the reason a client-side version could only ever be
+ * linear: the angular half of a collision is not recoverable from a recomputed
+ * normal impulse, and a car that is shoved is also spun.
+ *
+ * `totalNormalImpulse` is the accumulation across sub-steps rather than the
+ * final sub-step's `normalImpulse`, which is what makes this the whole of what
+ * the step applied.
+ *
+ * Writes six floats: linear velocity delta, then angular velocity delta.
+ */
+void b3w_body_contact_impulse( int handle, int body, float* out )
+{
+	out[0] = out[1] = out[2] = out[3] = out[4] = out[5] = 0.0f;
+	BODY_OR_RETURN( id, handle, body )
+
+	int capacity = b3Body_GetContactCapacity( id );
+	if ( capacity <= 0 )
+	{
+		return;
+	}
+	if ( capacity > 16 )
+	{
+		capacity = 16;
+	}
+	b3ContactData data[16];
+	int count = b3Body_GetContactData( id, data, capacity );
+
+	b3Vec3 linear = { 0.0f, 0.0f, 0.0f };
+	b3Vec3 angular = { 0.0f, 0.0f, 0.0f };
+
+	for ( int i = 0; i < count; i++ )
+	{
+		// THE NORMAL POINTS FROM A TO B, so which end of the contact this body
+		// is decides the sign. Getting this wrong is silent: it reads as the
+		// struck car being flung toward whatever hit it.
+		b3ShapeId shapeA = data[i].shapeIdA;
+		b3BodyId ownerA = b3Shape_GetBody( shapeA );
+		bool isA = B3_ID_EQUALS( ownerA, id );
+		float sign = isA ? -1.0f : 1.0f;
+
+		// ONLY WHAT THE OWNER DOES NOT ALREADY KNOW ABOUT.
+		//
+		// A replica's correction tracks its owner's account, and that account
+		// already contains everything the owner's own simulation did — including
+		// resting on the ground. Re-adding this body's ground contact on top of
+		// it double-counts a force the estimate has already paid for, which on a
+		// slope is large and continuous rather than transient.
+		//
+		// What the owner cannot know is a collision with a car being simulated
+		// HERE, a round trip before their snapshot can mention it. That is
+		// dynamic against dynamic, so a contact with static or kinematic
+		// geometry is not part of this term.
+		b3BodyId other = isA ? b3Shape_GetBody( data[i].shapeIdB ) : ownerA;
+		if ( b3Body_GetType( other ) != b3_dynamicBody )
+		{
+			continue;
+		}
+
+		for ( int m = 0; m < data[i].manifoldCount; m++ )
+		{
+			const b3Manifold* man = &data[i].manifolds[m];
+			b3Vec3 n = man->normal;
+
+			for ( int k = 0; k < man->pointCount; k++ )
+			{
+				const b3ManifoldPoint* pt = &man->points[k];
+				float j = pt->totalNormalImpulse * sign;
+				b3Vec3 impulse = { n.x * j, n.y * j, n.z * j };
+				linear.x += impulse.x;
+				linear.y += impulse.y;
+				linear.z += impulse.z;
+
+				// r x J, about this body's own centre of mass.
+				b3Vec3 r = isA ? pt->anchorA : pt->anchorB;
+				angular.x += r.y * impulse.z - r.z * impulse.y;
+				angular.y += r.z * impulse.x - r.x * impulse.z;
+				angular.z += r.x * impulse.y - r.y * impulse.x;
+			}
+
+			// Friction is central and already a linear impulse; twist is about
+			// the normal. Both are part of what the contact did and leaving them
+			// out would under-report a glancing hit, which is the case where the
+			// tangential part is most of it.
+			linear.x += man->frictionImpulse.x * sign;
+			linear.y += man->frictionImpulse.y * sign;
+			linear.z += man->frictionImpulse.z * sign;
+			angular.x += ( man->rollingImpulse.x + n.x * man->twistImpulse ) * sign;
+			angular.y += ( man->rollingImpulse.y + n.y * man->twistImpulse ) * sign;
+			angular.z += ( man->rollingImpulse.z + n.z * man->twistImpulse ) * sign;
+		}
+	}
+
+	// Reported as a VELOCITY change rather than an impulse, because that is what
+	// the caller needs and the mass and the world inertia are both here.
+	float mass = b3Body_GetMass( id );
+	if ( mass > 0.0f )
+	{
+		out[0] = (float)( linear.x / mass );
+		out[1] = (float)( linear.y / mass );
+		out[2] = (float)( linear.z / mass );
+	}
+	b3Matrix3 invI = b3Body_GetWorldInverseRotationalInertia( id );
+	b3Vec3 dw = b3MulMV( invI, angular );
+	out[3] = (float)dw.x;
+	out[4] = (float)dw.y;
+	out[5] = (float)dw.z;
+}
+
 void b3w_set_linear_velocity( int handle, int body, float x, float y, float z, int wake )
 {
 	BODY_OR_RETURN( id, handle, body )
@@ -1063,6 +1193,53 @@ int b3w_add_revolute_joint( int handle, int bodyA, int bodyB, float ax, float ay
 
 	int joint = world->jointCount++;
 	world->joints[joint] = b3CreateRevoluteJoint( world->id, &def );
+	return joint;
+}
+
+/**
+ * A motor joint: drag body B toward body A's frame with a bounded force.
+ *
+ * Exposed for a replicated body whose POSITION is dictated from outside the
+ * solver while its RESPONSE stays the solver's. Placing such a body teleports
+ * it, so it never travels between estimates and generates no contact; stepping
+ * it from a remote's stale input makes it drift; making it kinematic stops it
+ * being pushable at all. A motor is the fourth option and the only one that
+ * separates the two: B remains a dynamic body that collides and can be shoved,
+ * and a spring with a hertz, a damping ratio and a MAXIMUM FORCE pulls it
+ * toward where it is supposed to be.
+ *
+ * The maximum force is the whole point. It is what lets a collision win locally
+ * for as long as the collision lasts, and lets the correction win again once it
+ * is over, without either being switched off.
+ */
+int b3w_add_motor_joint( int handle, int bodyA, int bodyB, float hertz, float dampingRatio, float maxForce,
+						 float angularHertz, float angularDampingRatio, float maxTorque )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || world->jointCount >= MAX_JOINTS )
+	{
+		return -1;
+	}
+
+	b3BodyId idA = BodyId( handle, bodyA );
+	b3BodyId idB = BodyId( handle, bodyB );
+	if ( B3_IS_NULL( idA ) || B3_IS_NULL( idB ) )
+	{
+		return -1;
+	}
+
+	b3MotorJointDef def = b3DefaultMotorJointDef();
+	def.base.bodyIdA = idA;
+	def.base.bodyIdB = idB;
+	def.linearHertz = hertz;
+	def.linearDampingRatio = dampingRatio;
+	def.maxSpringForce = maxForce;
+	def.angularHertz = angularHertz;
+	def.angularDampingRatio = angularDampingRatio;
+	def.maxSpringTorque = maxTorque;
+
+	int joint = world->jointCount++;
+	world->joints[joint] = b3CreateMotorJoint( world->id, &def );
 	return joint;
 }
 
@@ -1891,6 +2068,35 @@ void b3w_set_revolute_servo( int handle, int joint, float targetRadians, float h
  * 0 means unowned and always drivable (terrain). 0xFFFFFFFF means never ground
  * for anyone, which is what the player is.
  */
+/**
+ * Continuous collision on or off for one body, after creation.
+ *
+ * Continuous collision assumes a body MOVED between two transforms and sweeps
+ * the space it crossed. A networked replica does not move: it is re-positioned
+ * every tick from an estimate, and a placement half a metre from the last one
+ * is not travel, it is a new opinion about where the car has been all along.
+ * Swept as though it were travel, it manufactures a time of impact against
+ * geometry the car never passed through, and the contact resolves against that
+ * phantom instead of against the real one.
+ *
+ * Measured: a car bulldozing another across open ground pushed it 96 m when
+ * both were simulated, and 1.4 m when the pusher was a replica being placed.
+ * The push was being spent on impacts that never happened.
+ *
+ * So the flag has to be per-tick rather than per-body: set while a body is
+ * stepped by the solver, cleared while it is being placed.
+ */
+void b3w_body_set_bullet( int handle, int body, int flag )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+
+	b3Body_SetBullet( BodyOf( world, body ), flag != 0 );
+}
+
 void b3w_body_set_owner( int handle, int body, unsigned int owner )
 {
 	World* world = GetWorld( handle );

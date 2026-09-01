@@ -633,6 +633,21 @@ typedef struct
 	 *  wall must not occupy a slot a drivable surface behind it could use. */
 	b3Vec3 worldUp;
 	float minSurfaceUpFacing;
+	/**
+	 * The hard point this cast started above, and the suspension's own down.
+	 *
+	 * The cast deliberately begins `2r + travel` ABOVE the hard point so a wheel
+	 * that starts a tick inside terrain is not answered with fraction 0. That
+	 * head start is for reaching PAST geometry the wheel is already in — it is
+	 * not a licence to find ground overhead, and without a test it is exactly
+	 * that: a surface most of a metre above the hard point sails through the
+	 * up-facing filter, because a roof genuinely does face up.
+	 *
+	 * Measured on two cars: 0.875 m of head start puts the cast start above
+	 * another vehicle's roof at 1.0 m, so the suspension stood on that roof and
+	 * pushed the car up onto it, 70 ticks before the two chassis ever touched.
+	 */
+	b3Pos hardPoint;
 	/** How many hits the cast offered, before dedup and the three-slot cap. A
 	 *  shape cast reports the earliest hit PER SHAPE, and terrain is one mesh
 	 *  shape holding every triangle — this is how that was caught. */
@@ -738,6 +753,38 @@ static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fr
 	// against world up rather than the suspension direction — otherwise chassis
 	// tilt would move the accept boundary around.
 	if ( b3Dot( normal, ctx->worldUp ) <= ctx->minSurfaceUpFacing )
+	{
+		return -1.0f;
+	}
+
+	/*
+	 * A wheel is not standing on something ABOVE its own hard point.
+	 *
+	 * The cast starts well above the hard point on purpose, and everything in
+	 * that head start is geometry the wheel is passing THROUGH, not geometry it
+	 * rests on. The up-facing filter cannot tell the difference: another
+	 * vehicle's roof faces up as honestly as a road does.
+	 *
+	 * Measured, and it is the whole of "a car rides up another car": at the tick
+	 * the front suspension spiked to four times its load, the front wheels'
+	 * ground body flipped from the world to the other vehicle while the two
+	 * chassis were still 17 cm apart and stayed untouching for another 70 ticks.
+	 * The suspension was pushing off a roof 0.5 m above the hard point.
+	 *
+	 * The hard point is the datum rather than the axle because it is known
+	 * before the cast resolves — the axle's position is the answer the cast
+	 * exists to produce — and because it is the conservative choice: everything
+	 * the tyre can legitimately reach is below it, including terrain a wheel has
+	 * sunk into on a climb, which is the case the head start was added for.
+	 *
+	 * Against WORLD UP, for exactly the reason written above the surface filter:
+	 * chassis tilt must not move the accept boundary around. Measured with the
+	 * suspension direction instead — a T-boned car slid 164 m rather than 16,
+	 * because once it was knocked askew the rejection plane swung with it and
+	 * threw away the ground the car was sitting on, leaving it to coast with no
+	 * wheel touching anything.
+	 */
+	if ( b3Dot( SubPos( point, ctx->hardPoint ), ctx->worldUp ) > 0.0f )
 	{
 		return -1.0f;
 	}
@@ -872,6 +919,7 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 					   .worldHandle = v->worldHandle,
 					   .worldUp = worldUp,
 					   .minSurfaceUpFacing = cosf( w->surfaceRejectAngle ),
+					   .hardPoint = source,
 					   .considered = 0,
 					   .count = 0 };
 
@@ -1183,7 +1231,27 @@ static float CalcRollingFriction( b3BodyId chassis, b3BodyId ground, b3Pos conta
 		denom1 = ImpulseDenominator( ground, contactPos, dir );
 	}
 
-	float jacDiagAbInv = 1.0f / ( denom0 + denom1 );
+	/*
+	 * SafeInv, because both denominators can be zero at once.
+	 *
+	 * `ImpulseDenominator` is `1/m + n . ((I^-1 (r x n)) x r)`, and a STATIC body
+	 * contributes nothing to either term: its mass reads 0, so `InvMass` returns
+	 * 0, and its world inverse inertia is the zero matrix. `denom1` is only ever
+	 * non-zero for a DYNAMIC ground, and terrain is static. So a chassis that has
+	 * been frozen, with its wheels on the ground, divides 1 by 0 here: the
+	 * friction impulse comes back +/-Inf, or NaN when `vrel + biasVelocity` is
+	 * itself 0 and the product is 0 * Inf.
+	 *
+	 * That value is then applied to bodies, and `b3FinalizeBodiesTask` reports
+	 * `unstable` on the next step. In the game it presents as the whole world
+	 * going non-finite the moment a machine is frozen with the physgun.
+	 *
+	 * Zero is the physically right answer, not a fudge: the denominator IS how
+	 * much the contact point moves per unit impulse, so zero means the point
+	 * cannot be moved at all, and no impulse can change it. This is the same
+	 * convention `SafeInv` above already documents.
+	 */
+	float jacDiagAbInv = SafeInv( denom0 + denom1 );
 
 	b3Vec3 vel1 = b3Body_GetWorldPointVelocity( chassis, contactPos );
 	b3Vec3 vel2 = hasGround ? b3Body_GetWorldPointVelocity( ground, contactPos ) : B3_LITERAL( b3Vec3 ){ 0, 0, 0 };

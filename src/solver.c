@@ -399,9 +399,34 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 	// integration only for a body that moved more than half its own min extent
 	// this step, and cleared every step, so a resting bullet is swept against
 	// and a moving one is left to sweep itself.
+	//
+	// "A moving one is left to sweep itself" does not hold when BOTH are fast.
+	// This test is on the TARGET, so when A sweeps and B is fast A skips, and
+	// when B sweeps A is equally fast so B skips too. Neither ever sweeps the
+	// pair, and the blind spot is exactly a symmetric high-speed impact — two
+	// vehicles closing head-on pass through each other. Measured on two cars:
+	// upstream tunnelled at 120 m/s closing, sweeping both held them 2.40 m
+	// apart, and nothing from 40 to 240 m/s passed through.
+	//
+	// The pair is still left alone once it is ALREADY TOUCHING. Continuous
+	// collision answers "did this body cross something between its two
+	// transforms", which is a question about a gap. Asked of a pair already in
+	// contact it answers yes at fraction zero every step, and the body is halted
+	// at the touch point instead of being allowed to lean on it — a car
+	// bulldozing another shoved it 0.45 m where the discrete solver alone
+	// manages metres. Resting and pushing contacts belong to the discrete
+	// solver; this one only catches what would otherwise be missed entirely.
 	if ( ( bodySim->flags & b3_isBullet ) && ( bodySim->flags & b3_isFast ) )
 	{
-		return true;
+		b3AABB a = fastShape->aabb;
+		b3AABB b = shape->aabb;
+		bool overlapping = a.lowerBound.x <= b.upperBound.x && b.lowerBound.x <= a.upperBound.x &&
+						   a.lowerBound.y <= b.upperBound.y && b.lowerBound.y <= a.upperBound.y &&
+						   a.lowerBound.z <= b.upperBound.z && b.lowerBound.z <= a.upperBound.z;
+		if ( overlapping )
+		{
+			return true;
+		}
 	}
 
 	// Skip filtered bodies
