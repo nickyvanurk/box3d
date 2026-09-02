@@ -899,6 +899,25 @@ void b3w_body_contact_impulse( int handle, int body, float* out )
 	out[5] = (float)dw.z;
 }
 
+/**
+ * Drive a KINEMATIC body to a pose over one step: the engine sets the velocity
+ * that lands it there, so contacts see the motion instead of a teleport.
+ */
+void b3w_set_target_transform( int handle, int body, float x, float y, float z, float qx, float qy, float qz, float qw,
+							   float dt )
+{
+	BODY_OR_RETURN( id, handle, body )
+	b3WorldTransform target = { ( b3Pos ){ x, y, z }, ( b3Quat ){ qx, qy, qz, qw } };
+	b3Body_SetTargetTransform( id, target, dt, true );
+}
+
+void b3w_set_damping( int handle, int body, float linear, float angular )
+{
+	BODY_OR_RETURN( id, handle, body )
+	b3Body_SetLinearDamping( id, linear );
+	b3Body_SetAngularDamping( id, angular );
+}
+
 void b3w_set_linear_velocity( int handle, int body, float x, float y, float z, int wake )
 {
 	BODY_OR_RETURN( id, handle, body )

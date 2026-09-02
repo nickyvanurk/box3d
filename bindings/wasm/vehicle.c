@@ -405,6 +405,9 @@ typedef struct
 
 	bool hasAnchor;
 	b3Pos staticFrictionAnchor;
+	/** The anchor in the GROUND BODY's frame, when that body moves. */
+	bool anchorOnGround;
+	b3Vec3 anchorLocal;
 
 	float clippedInvContactDotSuspension;
 	float suspensionRelativeVelocity;
@@ -829,6 +832,60 @@ static void StoreSuspensionLength( WheelContact* contact, float rawLength, float
  * A line-for-line port of `shape_cast`, including both rejection filters and
  * the droop-toward-full-extension branch when nothing is hit.
  */
+/*
+ * A ground that is ANIMATED: kinematic.
+ *
+ * Every velocity here was measured against a ground assumed to be still, gated
+ * on `b3_dynamicBody`. A KINEMATIC body is the engine's own notion of "animated
+ * by something else at a known velocity" — a ferry deck driven from a network
+ * stream — and a tyre that reads it as stationary lets the deck slide out from
+ * under the car at the deck's full speed. Only a DYNAMIC ground can take an
+ * impulse back; a kinematic one is infinitely massive and merely has a velocity.
+ */
+static bool GroundMoves( b3BodyId ground )
+{
+	return B3_IS_NON_NULL( ground ) && b3Body_IsValid( ground ) && b3Body_GetType( ground ) == b3_kinematicBody;
+}
+
+static bool GroundIsDynamic( b3BodyId ground )
+{
+	return B3_IS_NON_NULL( ground ) && b3Body_IsValid( ground ) && b3Body_GetType( ground ) == b3_dynamicBody;
+}
+
+static b3Vec3 GroundVelocityAt( b3BodyId ground, b3Pos point )
+{
+	return GroundMoves( ground ) ? b3Body_GetWorldPointVelocity( ground, point ) : B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f };
+}
+
+/*
+ * The static-friction anchor lives in the ground's own frame when the ground
+ * moves. Carrying a world point by the ground's velocity was measured wrong by
+ * about a fifth of a tick's travel, which the bias read as slip and turned into
+ * a parked car creeping forward at 1.2% of the deck's speed.
+ */
+static void LatchAnchor( Wheel* w, b3Pos point )
+{
+	w->hasAnchor = true;
+	w->anchorOnGround = GroundMoves( w->info.groundBodyId );
+	if ( w->anchorOnGround )
+	{
+		w->anchorLocal = b3Body_GetLocalPoint( w->info.groundBodyId, point );
+	}
+	else
+	{
+		w->staticFrictionAnchor = point;
+	}
+}
+
+static b3Pos AnchorWs( const Wheel* w )
+{
+	if ( w->anchorOnGround && GroundMoves( w->info.groundBodyId ) )
+	{
+		return b3Body_GetWorldPoint( w->info.groundBodyId, w->anchorLocal );
+	}
+	return w->staticFrictionAnchor;
+}
+
 static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 {
 	b3Vec3 worldUp = AxisVector( v->indexUpAxis );
@@ -1063,7 +1120,8 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 		w->info.lastCastStart = castStart;
 		w->info.lastAxleWs = axle;
 
-		b3Vec3 velAtContact = b3Body_GetWorldPointVelocity( v->chassis, w->info.contactPointWs );
+		b3Vec3 velAtContact = Sub3( b3Body_GetWorldPointVelocity( v->chassis, w->info.contactPointWs ),
+									GroundVelocityAt( w->info.groundBodyId, w->info.contactPointWs ) );
 		float projVel = b3Dot( w->info.contactNormalWs, velAtContact );
 		float denominator = b3Dot( w->info.contactNormalWs, w->wheelDirectionWs );
 		w->suspensionRelativeVelocity = denominator >= -0.1f ? 0.0f : projVel * w->clippedInvContactDotSuspension;
@@ -1127,7 +1185,8 @@ static void UpdateContacts( Vehicle* v, float h )
 			b3Vec3 inPlane = Sub3( toCenterNow, Scale( slideNormal, b3Dot( slideNormal, toCenterNow ) ) );
 			contact->pointWs = AddPosVec( contact->pointWs, inPlane );
 
-			b3Vec3 velNow = b3Body_GetWorldPointVelocity( v->chassis, contact->pointWs );
+			b3Vec3 velNow = Sub3( b3Body_GetWorldPointVelocity( v->chassis, contact->pointWs ),
+								  GroundVelocityAt( w->info.groundBodyId, contact->pointWs ) );
 			if ( c == 0 )
 			{
 				w->suspensionRelativeVelocity =
@@ -1224,9 +1283,8 @@ static float CalcRollingFriction( b3BodyId chassis, b3BodyId ground, b3Pos conta
 {
 	float denom0 = ImpulseDenominator( chassis, contactPos, dir );
 	float denom1 = 0.0f;
-	bool hasGround = B3_IS_NON_NULL( ground ) && b3Body_GetType( ground ) == b3_dynamicBody;
 
-	if ( hasGround )
+	if ( GroundIsDynamic( ground ) )
 	{
 		denom1 = ImpulseDenominator( ground, contactPos, dir );
 	}
@@ -1254,7 +1312,12 @@ static float CalcRollingFriction( b3BodyId chassis, b3BodyId ground, b3Pos conta
 	float jacDiagAbInv = SafeInv( denom0 + denom1 );
 
 	b3Vec3 vel1 = b3Body_GetWorldPointVelocity( chassis, contactPos );
-	b3Vec3 vel2 = hasGround ? b3Body_GetWorldPointVelocity( ground, contactPos ) : B3_LITERAL( b3Vec3 ){ 0, 0, 0 };
+	// A DYNAMIC ground keeps the velocity term it always had here; a KINEMATIC
+	// one gains it. Subtracting a dynamic ground's velocity elsewhere in the
+	// controller was tried and measured worse on a rider parked on a driven
+	// ferry, so the kinematic case alone carries the new terms.
+	b3Vec3 vel2 = GroundIsDynamic( ground ) || GroundMoves( ground ) ? b3Body_GetWorldPointVelocity( ground, contactPos )
+																	   : B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f };
 	b3Vec3 vel = Sub3( vel1, vel2 );
 	float vrel = b3Dot( dir, vel );
 
@@ -1303,26 +1366,33 @@ static void UpdateFriction( Vehicle* v, float dt )
 		// velocity-only constraint and drift the same way. A driven wheel is
 		// meant to travel, and a world anchor on a moving body is meaningless,
 		// so neither gets one.
-		bool groundIsDynamic = hasGround && B3_IS_NON_NULL( w->info.groundBodyId ) &&
-							   b3Body_GetType( w->info.groundBodyId ) == b3_dynamicBody;
-		bool canStick = hasGround && w->engineForce == 0.0f && vehicleSpeed < STATIC_FRICTION_MAX_SPEED &&
+		bool groundIsDynamic = hasGround && GroundIsDynamic( w->info.groundBodyId );
+		// Speed RELATIVE TO THE GROUND. A car parked on a deck doing 25 m/s is
+		// parked, and the anchor it latches is carried along with the deck.
+		b3Vec3 groundVel = hasGround ? GroundVelocityAt( w->info.groundBodyId, w->info.contactPointWs )
+									 : B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f };
+		// The tick's own road-speed figure on still ground, exactly as before;
+		// only a moving ground needs the difference taken here.
+		float relSpeed = GroundMoves( w->info.groundBodyId )
+							 ? b3Length( Sub3( b3Body_GetLinearVelocity( v->chassis ), groundVel ) )
+							 : vehicleSpeed;
+		bool canStick = hasGround && w->engineForce == 0.0f && relSpeed < STATIC_FRICTION_MAX_SPEED &&
 						!groundIsDynamic;
 
 		if ( canStick )
 		{
 			if ( !w->hasAnchor )
 			{
-				w->hasAnchor = true;
-				w->staticFrictionAnchor = w->info.contactPointWs;
+				LatchAnchor( w, w->info.contactPointWs );
 			}
 
 			// A tyre sticks only up to a finite slip distance; past that it has
 			// broken traction and grips somewhere new. Without this the anchor
 			// hauls a slow vehicle back to where it stood seconds ago.
-			b3Vec3 drift = SubPos( w->info.contactPointWs, w->staticFrictionAnchor );
+			b3Vec3 drift = SubPos( w->info.contactPointWs, AnchorWs( w ) );
 			if ( b3Length( drift ) > MAX_STATIC_FRICTION_SLIP )
 			{
-				w->staticFrictionAnchor = w->info.contactPointWs;
+				LatchAnchor( w, w->info.contactPointWs );
 			}
 		}
 		else
@@ -1357,17 +1427,22 @@ static void UpdateFriction( Vehicle* v, float dt )
 		float lateralBias = 0.0f;
 		if ( w->hasAnchor )
 		{
-			b3Vec3 slid = SubPos( w->info.contactPointWs, w->staticFrictionAnchor );
+			b3Vec3 slid = SubPos( w->info.contactPointWs, AnchorWs( w ) );
 			lateralBias = b3Dot( slid, v->axle[i] ) * STATIC_FRICTION_RATE;
 		}
 
-		bool groundIsDynamic = B3_IS_NON_NULL( w->info.groundBodyId ) &&
-							   b3Body_GetType( w->info.groundBodyId ) == b3_dynamicBody;
-
-		if ( groundIsDynamic )
+		// Against the ground's own velocity whenever it has one. A kinematic
+		// ground contributes no mass to the denominator and keeps the anchor
+		// bias, so it is the unilateral solve measured in the ground's frame.
+		if ( GroundIsDynamic( w->info.groundBodyId ) )
 		{
 			w->sideImpulse = ResolveSingleBilateral( v->chassis, w->info.contactPointWs, w->info.groundBodyId,
 													w->info.contactPointWs, v->axle[i], 0.0f );
+		}
+		else if ( GroundMoves( w->info.groundBodyId ) )
+		{
+			w->sideImpulse = ResolveSingleBilateral( v->chassis, w->info.contactPointWs, w->info.groundBodyId,
+													w->info.contactPointWs, v->axle[i], lateralBias );
 		}
 		else
 		{
@@ -1585,7 +1660,7 @@ static void UpdateFriction( Vehicle* v, float dt )
 				float biasVelocity = 0.0f;
 				if ( w->hasAnchor )
 				{
-					b3Vec3 slid = SubPos( w->info.contactPointWs, w->staticFrictionAnchor );
+					b3Vec3 slid = SubPos( w->info.contactPointWs, AnchorWs( w ) );
 					biasVelocity = b3Dot( slid, v->forwardWs[i] ) * STATIC_FRICTION_RATE;
 				}
 
@@ -2255,7 +2330,8 @@ static void SolveWheelContacts( Vehicle* v, Wheel* w, float h )
 		// is buried. Positive is clear of the surface.
 		float separation = -PlacementAlongSuspension( w, contact, center );
 
-		b3Vec3 vel = b3Body_GetWorldPointVelocity( w->body, contact->pointWs );
+		b3Vec3 vel = Sub3( b3Body_GetWorldPointVelocity( w->body, contact->pointWs ),
+						   GroundVelocityAt( w->info.groundBodyId, contact->pointWs ) );
 		float relVel = b3Dot( contact->normalWs, vel );
 
 		float bias;
@@ -2905,11 +2981,35 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 		b3WorldTransform t = b3Body_GetTransform( v->chassis );
 		b3Pos rest = AddPosVec( w->info.hardPointWs, Scale( w->wheelDirectionWs, w->suspensionRestLength ) );
 		b3Body_SetTransform( w->body, rest, b3MulQuat( t.q, WheelFrameRotation( w->directionCs, w->axleCs ) ) );
-		b3Body_SetLinearVelocity( w->body, B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f } );
+		// MOVING WITH THE CHASSIS, not stopped. A wheel put back at rest under a
+		// chassis doing 25 m/s is 40 kg of dead weight the joints average in: the
+		// car read 19.5 m/s on the very next tick, every time it was placed.
+		b3Body_SetLinearVelocity( w->body, b3Body_GetWorldPointVelocity( v->chassis, rest ) );
 		b3Body_SetAngularVelocity( w->body, B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f } );
 	}
 
 	b3Vec3 linvel = b3Body_GetLinearVelocity( v->chassis );
+	// RELATIVE TO WHAT THE WHEELS STAND ON. Road speed is what the drivetrain
+	// and the static-friction latch are about, and a car parked on a deck doing
+	// 25 m/s has none — read in world terms it sat past its own rev limiter and
+	// could not pull away at all.
+	{
+		b3Vec3 groundSum = { 0.0f, 0.0f, 0.0f };
+		int grounded = 0;
+		for ( int i = 0; i < v->wheelCount; i++ )
+		{
+			Wheel* w = &v->wheels[i];
+			if ( w->info.isInContact && GroundMoves( w->info.groundBodyId ) )
+			{
+				groundSum = Add3( groundSum, GroundVelocityAt( w->info.groundBodyId, w->info.contactPointWs ) );
+				grounded++;
+			}
+		}
+		if ( grounded > 0 )
+		{
+			linvel = Sub3( linvel, Scale( groundSum, 1.0f / (float)grounded ) );
+		}
+	}
 	v->currentVehicleSpeed = b3Length( linvel );
 
 	b3Quat chassisRot = b3Body_GetRotation( v->chassis );
@@ -2973,7 +3073,10 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
 		Wheel* w = &v->wheels[i];
-		b3Vec3 vel = b3Body_GetWorldPointVelocity( v->chassis, w->info.hardPointWs );
+		// Against the ground: a tyre rolling on a moving deck spins at its speed
+		// OVER THE DECK, which is what the engine's revs are read from.
+		b3Vec3 vel = Sub3( b3Body_GetWorldPointVelocity( v->chassis, w->info.hardPointWs ),
+						   GroundVelocityAt( w->info.groundBodyId, w->info.contactPointWs ) );
 
 		if ( w->inertia <= 0.0f )
 		{
@@ -3404,6 +3507,41 @@ void b3w_vehicle_destroy( int handle )
 
 	FreeWheelStorage( v );
 	v->used = false;
+}
+
+/**
+ * Give the WHOLE machine a velocity: chassis and every wheel body.
+ *
+ * A wheel is a body of its own, so writing the chassis velocity alone left four
+ * wheels at whatever they had before and the joints averaged the two: a car
+ * placed at 25 m/s was doing 20.3 a tick later, which is exactly the momentum
+ * share of 40 kg of wheels against a 174 kg chassis. Every placement of a
+ * remote car paid it.
+ */
+void b3w_vehicle_set_velocity( int handle, float vx, float vy, float vz, float wx, float wy, float wz )
+{
+	if ( handle < 0 || handle >= B3W_MAX_VEHICLES || !IsVehicleLive( &g_vehicles[handle] ) )
+	{
+		return;
+	}
+	Vehicle* v = &g_vehicles[handle];
+	b3Vec3 linear = { vx, vy, vz };
+	b3Vec3 angular = { wx, wy, wz };
+	b3Body_SetLinearVelocity( v->chassis, linear );
+	b3Body_SetAngularVelocity( v->chassis, angular );
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		Wheel* w = &v->wheels[i];
+		if ( B3_IS_NULL( w->body ) || !b3Body_IsValid( w->body ) )
+		{
+			continue;
+		}
+		// Linear only. A wheel's spin about its axle is its own, and overwriting
+		// it every placement with the chassis rate fought the joint hard enough
+		// to roll cars onto their roofs in the rear-end and t-bone stagings.
+		b3Vec3 arm = SubPos( b3Body_GetPosition( w->body ), b3Body_GetPosition( v->chassis ) );
+		b3Body_SetLinearVelocity( w->body, Add3( linear, b3Cross( angular, arm ) ) );
+	}
 }
 
 void b3w_vehicle_set_owner( int handle, unsigned int owner )
