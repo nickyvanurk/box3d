@@ -911,13 +911,12 @@ void b3w_set_target_transform( int handle, int body, float x, float y, float z, 
 	b3Body_SetTargetTransform( id, target, dt, true );
 }
 
-/** Lock every rotation axis, for a character that must stay on its feet. */
+/** Lock roll and pitch, for a character that must stay on its feet; yaw stays free. */
 void b3w_set_rotation_lock( int handle, int body, int locked )
 {
 	BODY_OR_RETURN( id, handle, body )
 	b3MotionLocks locks = b3Body_GetMotionLocks( id );
 	locks.angularX = locked != 0;
-	locks.angularY = locked != 0;
 	locks.angularZ = locked != 0;
 	b3Body_SetMotionLocks( id, locks );
 }
