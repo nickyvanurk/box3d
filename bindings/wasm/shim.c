@@ -911,6 +911,17 @@ void b3w_set_target_transform( int handle, int body, float x, float y, float z, 
 	b3Body_SetTargetTransform( id, target, dt, true );
 }
 
+/** Lock every rotation axis, for a character that must stay on its feet. */
+void b3w_set_rotation_lock( int handle, int body, int locked )
+{
+	BODY_OR_RETURN( id, handle, body )
+	b3MotionLocks locks = b3Body_GetMotionLocks( id );
+	locks.angularX = locked != 0;
+	locks.angularY = locked != 0;
+	locks.angularZ = locked != 0;
+	b3Body_SetMotionLocks( id, locks );
+}
+
 void b3w_set_damping( int handle, int body, float linear, float angular )
 {
 	BODY_OR_RETURN( id, handle, body )
@@ -2202,6 +2213,19 @@ void b3w_destroy_joint( int handle, int joint )
  * Applied after creation because that is where callers already set it — the
  * equivalent Rapier call is made on the collider, not on its descriptor.
  */
+/** A negative group never collides with itself: a told rider shares its parent's. */
+void b3w_set_shape_group( int handle, int shape, int group )
+{
+	b3ShapeId* id = ResolveShape( GetWorld( handle ), shape );
+	if ( id == NULL || b3Shape_IsValid( *id ) == false )
+	{
+		return;
+	}
+	b3Filter filter = b3Shape_GetFilter( *id );
+	filter.groupIndex = group;
+	b3Shape_SetFilter( *id, filter, true );
+}
+
 void b3w_set_shape_filter( int handle, int shape, int category, int mask )
 {
 	b3ShapeId* id = ResolveShape( GetWorld( handle ), shape );
