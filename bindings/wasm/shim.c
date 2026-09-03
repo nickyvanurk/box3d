@@ -80,6 +80,11 @@ typedef struct World
 	 * drop a contact from the solver while still reporting it.
 	 */
 	uint8_t* detectOnly;
+	/** The one body each body never collides with (-1: none): a told rider and
+	 *  its parent. Checked by the custom pair filter, so two riders of the same
+	 *  parent still collide with each other, which a shared negative group
+	 *  index could not express. */
+	int32_t* excludedFrom;
 	int bodyCount;
 	int bodyCapacity;
 
@@ -145,6 +150,7 @@ typedef struct World
  * transform read both sit above it, and both must refuse a destroyed body.
  */
 static b3BodyId BodyOf( World* world, int body );
+static bool CustomFilterExclusion( b3ShapeId shapeIdA, b3ShapeId shapeIdB, void* context );
 static b3BodyId BodyId( int handle, int body );
 
 static World g_worlds[MAX_WORLDS];
@@ -178,6 +184,8 @@ static void ReserveBodies( World* world, int needed )
 	memset( world->bodyOwner + world->bodyCapacity, 0, sizeof( uint32_t ) * (size_t)( capacity - world->bodyCapacity ) );
 	world->detectOnly = (uint8_t*)realloc( world->detectOnly, sizeof( uint8_t ) * capacity );
 	memset( world->detectOnly + world->bodyCapacity, 0, sizeof( uint8_t ) * (size_t)( capacity - world->bodyCapacity ) );
+	world->excludedFrom = (int32_t*)realloc( world->excludedFrom, sizeof( int32_t ) * capacity );
+	memset( world->excludedFrom + world->bodyCapacity, 0xFF, sizeof( int32_t ) * (size_t)( capacity - world->bodyCapacity ) );
 	world->bodyCapacity = capacity;
 }
 
@@ -226,6 +234,7 @@ int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableC
 	// The context is WHICH world is stepping: the vehicle registry is global, so
 	// the callback needs it to solve this world's vehicles and no others.
 	b3World_SetSubStepCallback( world->id, b3w_vehicle_substep, (void*)(uintptr_t)b3StoreWorldId( world->id ) );
+	b3World_SetCustomFilterCallback( world->id, CustomFilterExclusion, world );
 	world->inUse = true;
 	world->bodyCount = 0;
 	world->jointCount = 0;
@@ -267,6 +276,7 @@ void b3w_destroy_world( int handle )
 	free( world->transforms );
 	free( world->bodyOwner );
 	free( world->detectOnly );
+	free( world->excludedFrom );
 	memset( world, 0, sizeof( World ) );
 }
 
@@ -330,6 +340,7 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
 	world->bodies[body] = b3CreateBody( world->id, &def );
 	world->bodyOwner[body] = 0;
 	world->detectOnly[body] = 0;
+	world->excludedFrom[body] = -1;
 
 	// The handle rides ON the body, so a query result can name it without a
 	// reverse scan of the table. Offset by one so that a body whose user data
@@ -528,6 +539,7 @@ int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
+	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
 	def.baseMaterial.restitution = restitution;
@@ -1044,6 +1056,7 @@ int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius,
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
+	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
 	def.baseMaterial.restitution = restitution;
@@ -1124,6 +1137,7 @@ int b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int 
 	// ground with neither. A retained handle is what lets the caller apply the
 	// group through the same path every other shape uses.
 	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.enableCustomFiltering = true;
 	shapeDef.baseMaterial.friction = friction;
 	shapeDef.baseMaterial.restitution = restitution;
 
@@ -1436,6 +1450,7 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 	free( indices );
 
 	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.enableCustomFiltering = true;
 	shapeDef.baseMaterial.friction = friction;
 	shapeDef.baseMaterial.restitution = restitution;
 	shapeDef.isSensor = isSensor != 0;
@@ -1666,6 +1681,7 @@ int b3w_add_sphere_shape( int handle, int body, float radius, float ox, float oy
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
+	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
 	def.baseMaterial.restitution = restitution;
@@ -1694,6 +1710,7 @@ int b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
+	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
 	def.baseMaterial.restitution = restitution;
@@ -1739,6 +1756,7 @@ int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
+	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
 	def.baseMaterial.restitution = restitution;
@@ -1811,6 +1829,56 @@ void b3w_set_contact_tuning( int handle, float hertz, float dampingRatio, float 
 
 /** Defined below with the ray-cast helpers — the tagged-userData scheme. */
 static int BodyIndexOfShape( b3ShapeId shapeId );
+
+/**
+ * The pair filter behind `excludedFrom`: a body never collides with the one
+ * body it is excluded from, and with everything else as its group and mask
+ * bits say. Called by Box3D only for pairs where a shape enabled custom
+ * filtering, which every shape created here does.
+ */
+static bool CustomFilterExclusion( b3ShapeId shapeIdA, b3ShapeId shapeIdB, void* context )
+{
+	World* world = (World*)context;
+	int a = BodyIndexOfShape( shapeIdA );
+	int b = BodyIndexOfShape( shapeIdB );
+	if ( a < 0 || b < 0 || a >= world->bodyCount || b >= world->bodyCount )
+	{
+		return true;
+	}
+	return world->excludedFrom[a] != b && world->excludedFrom[b] != a;
+}
+
+/**
+ * Exclude `body` from colliding with `other` (-1 clears). Existing contacts
+ * between them are dropped by re-filtering the body's shapes, the same way a
+ * group change does.
+ */
+void b3w_set_body_exclusion( int handle, int body, int other )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+	if ( world->excludedFrom[body] == other )
+	{
+		return;
+	}
+	world->excludedFrom[body] = other;
+	b3BodyId id = world->bodies[body];
+	int count = b3Body_GetShapeCount( id );
+	b3ShapeId stack[64];
+	b3ShapeId* shapes = count <= 64 ? stack : (b3ShapeId*)malloc( sizeof( b3ShapeId ) * (size_t)count );
+	count = b3Body_GetShapes( id, shapes, count );
+	for ( int i = 0; i < count; ++i )
+	{
+		b3Shape_SetFilter( shapes[i], b3Shape_GetFilter( shapes[i] ), true );
+	}
+	if ( shapes != stack )
+	{
+		free( shapes );
+	}
+}
 
 /**
  * Drop a contact from the solver while still reporting it.
