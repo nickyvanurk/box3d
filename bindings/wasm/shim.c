@@ -1872,7 +1872,15 @@ void b3w_set_body_exclusion( int handle, int body, int other )
 	count = b3Body_GetShapes( id, shapes, count );
 	for ( int i = 0; i < count; ++i )
 	{
-		b3Shape_SetFilter( shapes[i], b3Shape_GetFilter( shapes[i] ), true );
+		// b3Shape_SetFilter returns early when nothing in the filter changed,
+		// so the same filter twice never touches the proxy. A group index the
+		// shape does not have, then its own back: two resets, and the pair is
+		// re-queried under the new exclusion.
+		b3Filter filter = b3Shape_GetFilter( shapes[i] );
+		b3Filter nudge = filter;
+		nudge.groupIndex = filter.groupIndex == 0 ? 1 : 0;
+		b3Shape_SetFilter( shapes[i], nudge, true );
+		b3Shape_SetFilter( shapes[i], filter, true );
 	}
 	if ( shapes != stack )
 	{
