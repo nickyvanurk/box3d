@@ -1380,6 +1380,43 @@ int b3w_add_weld_joint( int handle, int bodyA, int bodyB, float px, float py, fl
 }
 
 /**
+ * A ball joint between two bodies at the world point (px, py, pz), holding
+ * the relative pose they have now — the tow-hitch counterpart of the weld
+ * above: position pinned, every rotation free.
+ */
+int b3w_add_ball_joint( int handle, int bodyA, int bodyB, float px, float py, float pz )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || world->jointCount >= MAX_JOINTS )
+	{
+		return -1;
+	}
+
+	b3BodyId idA = BodyId( handle, bodyA );
+	b3BodyId idB = BodyId( handle, bodyB );
+	if ( B3_IS_NULL( idA ) || B3_IS_NULL( idB ) )
+	{
+		return -1;
+	}
+
+	b3Transform anchor = { { px, py, pz }, b3Quat_identity };
+	b3WorldTransform ta = b3Body_GetTransform( idA );
+	b3WorldTransform tb = b3Body_GetTransform( idB );
+	b3Transform fa = { { (float)ta.p.x, (float)ta.p.y, (float)ta.p.z }, ta.q };
+	b3Transform fb = { { (float)tb.p.x, (float)tb.p.y, (float)tb.p.z }, tb.q };
+
+	b3SphericalJointDef def = b3DefaultSphericalJointDef();
+	def.base.bodyIdA = idA;
+	def.base.bodyIdB = idB;
+	def.base.localFrameA = b3InvMulTransforms( fa, anchor );
+	def.base.localFrameB = b3InvMulTransforms( fb, anchor );
+
+	int joint = world->jointCount++;
+	world->joints[joint] = b3CreateSphericalJoint( world->id, &def );
+	return joint;
+}
+
+/**
  * The force a joint carried in the last step, as a magnitude in newtons.
  *
  * Read from the game side rather than through Box3D's threshold events, so the
