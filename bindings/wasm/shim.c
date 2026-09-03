@@ -1316,6 +1316,80 @@ int b3w_add_prismatic_joint( int handle, int bodyA, int bodyB, float ax, float a
 }
 
 /**
+ * Weld two bodies together where they are now.
+ *
+ * The joint frame is the world point (px, py, pz) with the world axes, and each
+ * body's local frame is that point seen from the body — so the weld holds the
+ * relative pose the bodies have at the moment of the call, whatever it is.
+ * Both frames are derived here rather than passed in because "hold what you
+ * are touching" is the only pose a caller ever means; a weld that had to be
+ * given two local frames would recompute exactly this on the other side.
+ *
+ * Zero hertz is Box3D's "as rigid as the solver allows". Two bodies is the case
+ * the docs say the approximate solver does hold; the warning is about chains.
+ */
+int b3w_add_weld_joint( int handle, int bodyA, int bodyB, float px, float py, float pz, float linearHertz,
+						float angularHertz, float dampingRatio )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || world->jointCount >= MAX_JOINTS )
+	{
+		return -1;
+	}
+
+	b3BodyId idA = BodyId( handle, bodyA );
+	b3BodyId idB = BodyId( handle, bodyB );
+	if ( B3_IS_NULL( idA ) || B3_IS_NULL( idB ) )
+	{
+		return -1;
+	}
+
+	b3Transform anchor = { { px, py, pz }, b3Quat_identity };
+	b3WorldTransform ta = b3Body_GetTransform( idA );
+	b3WorldTransform tb = b3Body_GetTransform( idB );
+	b3Transform fa = { { (float)ta.p.x, (float)ta.p.y, (float)ta.p.z }, ta.q };
+	b3Transform fb = { { (float)tb.p.x, (float)tb.p.y, (float)tb.p.z }, tb.q };
+
+	b3WeldJointDef def = b3DefaultWeldJointDef();
+	def.base.bodyIdA = idA;
+	def.base.bodyIdB = idB;
+	def.base.localFrameA = b3InvMulTransforms( fa, anchor );
+	def.base.localFrameB = b3InvMulTransforms( fb, anchor );
+	def.linearHertz = linearHertz;
+	def.angularHertz = angularHertz;
+	def.linearDampingRatio = dampingRatio;
+	def.angularDampingRatio = dampingRatio;
+
+	int joint = world->jointCount++;
+	world->joints[joint] = b3CreateWeldJoint( world->id, &def );
+	return joint;
+}
+
+/**
+ * The force a joint carried in the last step, as a magnitude in newtons.
+ *
+ * Read from the game side rather than through Box3D's threshold events, so the
+ * hold limit — a game-design number — stays in the game and the engine keeps
+ * reporting a fact. Zero for a joint that is gone.
+ */
+float b3w_joint_force( int handle, int joint )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || joint < 0 || joint >= world->jointCount )
+	{
+		return 0.0f;
+	}
+
+	b3JointId id = world->joints[joint];
+	if ( b3Joint_IsValid( id ) == false )
+	{
+		return 0.0f;
+	}
+
+	return b3Length( b3Joint_GetConstraintForce( id ) );
+}
+
+/**
  * Attach a static triangle mesh.
  *
  * No internal-edge flag is passed because Box3D has none to pass: ghost-contact
