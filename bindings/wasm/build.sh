@@ -30,7 +30,7 @@ EXPORTS='[
 	"_b3w_create_body","_b3w_add_box_shape","_b3w_body_count","_b3w_is_awake",
 	"_b3w_transforms_ptr","_b3w_read_transforms",
 	"_b3w_body_transform","_b3w_set_position","_b3w_set_rotation",
-	"_b3w_linear_velocity","_b3w_angular_velocity",
+	"_b3w_linear_velocity","_b3w_angular_velocity","_b3w_body_center",
 	"_b3w_set_linear_velocity","_b3w_set_angular_velocity","_b3w_set_target_transform","_b3w_set_damping","_b3w_vehicle_set_velocity","_b3w_set_rotation_lock","_b3w_set_shape_group","_b3w_body_contact_impulse",
 	"_b3w_apply_impulse","_b3w_apply_force","_b3w_apply_torque",
 	"_b3w_mass","_b3w_principal_inertia",

@@ -743,6 +743,17 @@ void b3w_set_rotation( int handle, int body, float qx, float qy, float qz, float
 	b3Body_SetTransform( id, b3Body_GetPosition( id ), ( b3Quat ){ { qx, qy, qz }, qw } );
 }
 
+/** The body's centre of mass in the world: the point its linear velocity belongs to. */
+void b3w_body_center( int handle, int body, float* out )
+{
+	out[0] = out[1] = out[2] = 0.0f;
+	BODY_OR_RETURN( id, handle, body )
+	b3Pos c = b3Body_GetWorldCenter( id );
+	out[0] = (float)c.x;
+	out[1] = (float)c.y;
+	out[2] = (float)c.z;
+}
+
 void b3w_linear_velocity( int handle, int body, float* out )
 {
 	out[0] = out[1] = out[2] = 0.0f;
@@ -907,7 +918,7 @@ void b3w_set_target_transform( int handle, int body, float x, float y, float z, 
 							   float dt )
 {
 	BODY_OR_RETURN( id, handle, body )
-	b3WorldTransform target = { ( b3Pos ){ x, y, z }, ( b3Quat ){ qx, qy, qz, qw } };
+	b3WorldTransform target = { .p = ( b3Pos ){ x, y, z }, .q = ( b3Quat ){ qx, qy, qz, qw } };
 	b3Body_SetTargetTransform( id, target, dt, true );
 }
 
