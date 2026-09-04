@@ -85,6 +85,10 @@ typedef struct World
 	 *  parent still collide with each other, which a shared negative group
 	 *  index could not express. */
 	int32_t* excludedFrom;
+	/** Bodies placed from a network stream. Two of them never solve a contact
+	 *  between them: their owners resolve it, and the solver shoving one out
+	 *  of the other here only fights the next placement. */
+	uint8_t* placed;
 	int bodyCount;
 	int bodyCapacity;
 
@@ -186,6 +190,8 @@ static void ReserveBodies( World* world, int needed )
 	memset( world->detectOnly + world->bodyCapacity, 0, sizeof( uint8_t ) * (size_t)( capacity - world->bodyCapacity ) );
 	world->excludedFrom = (int32_t*)realloc( world->excludedFrom, sizeof( int32_t ) * capacity );
 	memset( world->excludedFrom + world->bodyCapacity, 0xFF, sizeof( int32_t ) * (size_t)( capacity - world->bodyCapacity ) );
+	world->placed = (uint8_t*)realloc( world->placed, sizeof( uint8_t ) * capacity );
+	memset( world->placed + world->bodyCapacity, 0, sizeof( uint8_t ) * (size_t)( capacity - world->bodyCapacity ) );
 	world->bodyCapacity = capacity;
 }
 
@@ -277,6 +283,7 @@ void b3w_destroy_world( int handle )
 	free( world->bodyOwner );
 	free( world->detectOnly );
 	free( world->excludedFrom );
+	free( world->placed );
 	memset( world, 0, sizeof( World ) );
 }
 
@@ -341,6 +348,7 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
 	world->bodyOwner[body] = 0;
 	world->detectOnly[body] = 0;
 	world->excludedFrom[body] = -1;
+	world->placed[body] = 0;
 
 	// The handle rides ON the body, so a query result can name it without a
 	// reverse scan of the table. Offset by one so that a body whose user data
@@ -1946,6 +1954,11 @@ static bool PreSolveDetectOnly( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos po
 	int a = BodyIndexOfShape( shapeIdA );
 	int b = BodyIndexOfShape( shapeIdB );
 
+	if ( a >= 0 && b >= 0 && a < world->bodyCount && b < world->bodyCount && world->placed[a] && world->placed[b] )
+	{
+		return false;
+	}
+
 	bool aDetect = a >= 0 && a < world->bodyCapacity && world->detectOnly[a] != 0;
 	bool bDetect = b >= 0 && b < world->bodyCapacity && world->detectOnly[b] != 0;
 
@@ -1988,6 +2001,30 @@ static bool PreSolveDetectOnly( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos po
  * in; the callback itself is registered once, lazily, because a world with no
  * vehicles should not pay for it.
  */
+/** Mark a body as placed from the network (or not). Contacts between two placed bodies are detected, never solved. */
+void b3w_set_body_placed( int handle, int body, int on )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+	if ( world->placed[body] == ( on != 0 ) )
+	{
+		return;
+	}
+	world->placed[body] = on != 0;
+	b3World_SetPreSolveCallback( world->id, PreSolveDetectOnly, world );
+	b3BodyId id = world->bodies[body];
+	int count = b3Body_GetShapeCount( id );
+	b3ShapeId shapes[64];
+	int n = b3Body_GetShapes( id, shapes, count < 64 ? count : 64 );
+	for ( int k = 0; k < n; ++k )
+	{
+		b3Shape_EnablePreSolveEvents( shapes[k], true );
+	}
+}
+
 void b3w_set_detect_only( int handle, int bodiesPtr, int count )
 {
 	World* world = GetWorld( handle );
