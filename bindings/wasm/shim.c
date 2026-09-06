@@ -1425,6 +1425,139 @@ int b3w_add_ball_joint( int handle, int bodyA, int bodyB, float px, float py, fl
 }
 
 /**
+ * A distance joint between two bodies, anchored at two separate world points.
+ *
+ * Unlike the weld and ball joints above, the two anchors are NOT the same
+ * point — a rope spans a gap, so each end is placed on its own body.
+ *
+ * The rope configuration is `hertz == 0` with the limit enabled: the spring
+ * block is skipped entirely (`distance_joint.c` guards it on `hertz > 0`), and
+ * the upper-limit block does the work. That block is already exactly a rope —
+ * it clamps its impulse at zero, so it pulls the bodies together once they are
+ * further apart than `maxLength` and does nothing at all below it. Slack below
+ * the limit, hard stop at it, and no compression by construction.
+ *
+ * A spring rope (a bungee) is the same call with `hertz > 0`. Note the sign
+ * convention if you go there: `axis` runs A to B and tension is the NEGATIVE
+ * impulse, so `lowerSpringForce` caps tension and `upperSpringForce` caps
+ * compression — set the upper to zero for a spring that can only pull.
+ */
+int b3w_add_distance_joint( int handle, int bodyA, int bodyB, float ax, float ay, float az, float bx, float by, float bz,
+							float minLength, float maxLength, float hertz, float dampingRatio )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || world->jointCount >= MAX_JOINTS )
+	{
+		return -1;
+	}
+
+	b3BodyId idA = BodyId( handle, bodyA );
+	b3BodyId idB = BodyId( handle, bodyB );
+	if ( B3_IS_NULL( idA ) || B3_IS_NULL( idB ) )
+	{
+		return -1;
+	}
+
+	b3Transform anchorA = { { ax, ay, az }, b3Quat_identity };
+	b3Transform anchorB = { { bx, by, bz }, b3Quat_identity };
+	b3WorldTransform ta = b3Body_GetTransform( idA );
+	b3WorldTransform tb = b3Body_GetTransform( idB );
+	b3Transform fa = { { (float)ta.p.x, (float)ta.p.y, (float)ta.p.z }, ta.q };
+	b3Transform fb = { { (float)tb.p.x, (float)tb.p.y, (float)tb.p.z }, tb.q };
+
+	b3DistanceJointDef def = b3DefaultDistanceJointDef();
+	def.base.bodyIdA = idA;
+	def.base.bodyIdB = idB;
+	def.base.localFrameA = b3InvMulTransforms( fa, anchorA );
+	def.base.localFrameB = b3InvMulTransforms( fb, anchorB );
+	def.length = maxLength;
+	def.minLength = minLength;
+	def.maxLength = maxLength;
+	def.enableLimit = true;
+	// Required: the limit and the motor are both solved inside the soft branch,
+	// so a joint with the spring disabled is rigid and ignores them.
+	def.enableSpring = true;
+	def.hertz = hertz;
+	def.dampingRatio = dampingRatio;
+
+	int joint = world->jointCount++;
+	world->joints[joint] = b3CreateDistanceJoint( world->id, &def );
+	return joint;
+}
+
+/**
+ * Move a rope's limits. Reeling a winch in is a shrinking maxLength, so the
+ * rest length tracks it — otherwise a spring rope would fight its own limit.
+ */
+void b3w_set_distance_limits( int handle, int joint, float minLength, float maxLength )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || joint < 0 || joint >= world->jointCount )
+	{
+		return;
+	}
+
+	b3JointId id = world->joints[joint];
+	if ( B3_IS_NULL( id ) )
+	{
+		return;
+	}
+
+	b3DistanceJoint_SetLengthRange( id, minLength, maxLength );
+	b3DistanceJoint_SetLength( id, maxLength );
+}
+
+/**
+ * Drive the rope's length under power — the winch. Speed is metres per second,
+ * positive paying out; force is the budget in newtons, the same (speed, budget)
+ * pair every motor in the game takes. A zero force disables the motor so a
+ * winch at rest leaves the rope a plain limit again.
+ */
+void b3w_set_distance_motor( int handle, int joint, float speed, float maxForce )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || joint < 0 || joint >= world->jointCount )
+	{
+		return;
+	}
+
+	b3JointId id = world->joints[joint];
+	if ( B3_IS_NULL( id ) )
+	{
+		return;
+	}
+
+	b3DistanceJoint_EnableMotor( id, maxForce > 0.0f );
+	b3DistanceJoint_SetMotorSpeed( id, speed );
+	b3DistanceJoint_SetMaxMotorForce( id, maxForce );
+}
+
+/**
+ * The distance between a rope's two anchors right now, in metres.
+ *
+ * This is what tells the renderer whether a rope is taut or slack — sag is the
+ * difference between this and the rope's length — and it is a measurement of
+ * the world, not of what we asked for. B3_HUGE for a joint that is gone, so a
+ * caller cannot read a missing rope as a rope of length zero.
+ */
+float b3w_distance_length( int handle, int joint )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || joint < 0 || joint >= world->jointCount )
+	{
+		return B3_HUGE;
+	}
+
+	b3JointId id = world->joints[joint];
+	if ( B3_IS_NULL( id ) )
+	{
+		return B3_HUGE;
+	}
+
+	return b3DistanceJoint_GetCurrentLength( id );
+}
+
+/**
  * The force a joint carried in the last step, as a magnitude in newtons.
  *
  * Read from the game side rather than through Box3D's threshold events, so the
