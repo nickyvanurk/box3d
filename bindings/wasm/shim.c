@@ -578,6 +578,29 @@ int b3w_body_count( int handle )
 	return world == NULL ? 0 : world->bodyCount;
 }
 
+// Bodies that EXIST, as opposed to slots ever handed out: `bodyCount` above is
+// the slot array's length and never falls, because a destroyed body keeps its
+// index so no handle can be reused by mistake. A gauge that wants a population
+// reads this one.
+int b3w_live_body_count( int handle )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL )
+	{
+		return 0;
+	}
+
+	int live = 0;
+	for ( int i = 0; i < world->bodyCount; ++i )
+	{
+		if ( !B3_IS_NULL( BodyOf( world, i ) ) )
+		{
+			++live;
+		}
+	}
+	return live;
+}
+
 int b3w_is_awake( int handle, int body )
 {
 	b3BodyId id = BodyId( handle, body );
