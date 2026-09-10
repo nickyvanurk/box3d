@@ -85,11 +85,29 @@ emcc \
 	-s SINGLE_FILE=0 \
 	-s FILESYSTEM=0
 
+# Provenance or nothing. Built outside a checkout — from a `git archive` tarball,
+# say — `rev-parse` writes an empty commit and the `status` test sees no changes,
+# so the file claims `"dirty": false` while recording no source at all. That is
+# worse than refusing: it is the one field a reader trusts to trace a binary back.
+# `BUILD_COMMIT` is the escape hatch, and it exists for one real job: verifying a
+# shipped binary by building the same revision from a `git archive` tarball and
+# comparing hashes. That tarball has no `.git`, so without this the check the
+# guard protects would be the check the guard prevents.
+COMMIT="${BUILD_COMMIT:-}"
+if [ -z "$COMMIT" ] && ! COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"; then
+	COMMIT=""
+fi
+if [ -z "$COMMIT" ]; then
+	echo "build.sh: $ROOT is not a git checkout and BUILD_COMMIT is unset, so the" >&2
+	echo "          artifact cannot record what produced it. Pass BUILD_COMMIT=<sha>." >&2
+	exit 1
+fi
+
 cat > "$OUT/build.json" <<EOF
 {
 	"source": "$(git -C "$ROOT" remote get-url origin 2>/dev/null || echo unknown)",
-	"commit": "$(git -C "$ROOT" rev-parse HEAD)",
-	"dirty": $(test -n "$(git -C "$ROOT" status --porcelain)" && echo true || echo false),
+	"commit": "$COMMIT",
+	"dirty": $(test -n "${BUILD_COMMIT:-}" && echo false || { test -n "$(git -C "$ROOT" status --porcelain)" && echo true || echo false; }),
 	"emcc": "$(emcc --version | head -1 | sed 's/.*replacement + linker emulating GNU ld) //;s/ .*//')"
 }
 EOF
