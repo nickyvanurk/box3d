@@ -53,7 +53,6 @@
  * ignored, so bodies appear to spawn and read back as zeros.
  */
 #define MAX_WORLDS 16
-#define MAX_JOINTS 4096
 
 typedef struct World
 {
@@ -92,8 +91,37 @@ typedef struct World
 	int bodyCount;
 	int bodyCapacity;
 
-	b3JointId joints[MAX_JOINTS];
+	/*
+	 * Joints are handed back as handles for the same reasons shapes are, and
+	 * they got there the same way: this was a fixed array of 4096 with a
+	 * bump allocator, `b3w_destroy_joint` freed nothing, and a machine rebuilds
+	 * every pivot, piston and weld on every block the player places. Past 4096
+	 * every add returned -1, the host stored it as a live joint, and
+	 * `b3Array_Get( ..., -1 )` reads the word before the array — which traps in
+	 * about one heap layout in forty and silently corrupts the other
+	 * thirty-nine.
+	 *
+	 * A handle is `generation << 21 | slot`, so a handle held across the reuse
+	 * of its slot resolves to null rather than to the joint that took its
+	 * place. That is what lets slots be recycled without breaking the identity
+	 * the host's motor cache keys on.
+	 *
+	 * Reclaim is a LAZY SWEEP for slots whose joint the engine no longer
+	 * recognises, not a free list, because the dominant teardown path never
+	 * tells us: the host drops its joint refs on a rebuild without calling
+	 * destroy, and destroying a BODY takes its joints with it inside Box3D.
+	 * Asking the engine what is still alive is the only answer that covers all
+	 * three. `b3w_destroy_joint` still nulls its slot, which just makes that
+	 * slot visible to the sweep immediately.
+	 */
+	b3JointId* joints;
+	/** Per-slot generation, bumped whenever a slot is reused. */
+	uint16_t* jointGen;
+	/** Slots allocated. Grows on demand; never shrinks while the world lives. */
+	int jointCapacity;
 	int jointCount;
+	/** Where the last reclaim sweep stopped, so a full table stays amortised. */
+	int jointRover;
 
 
 	/*
@@ -244,6 +272,8 @@ int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableC
 	world->inUse = true;
 	world->bodyCount = 0;
 	world->jointCount = 0;
+	world->jointCapacity = 0;
+	world->jointRover = 0;
 	world->shapeCount = 0;
 
 	ReserveBodies( world, 256 );
@@ -275,6 +305,8 @@ void b3w_destroy_world( int handle )
 	// All FOUR of the per-body arrays `ReserveBodies` grows, not just the two
 	// that were here — `bodyOwner` and `detectOnly` leaked on every world
 	// teardown, found by running this under ASan.
+	free( world->joints );
+	free( world->jointGen );
 	free( world->shapes );
 	free( world->shapeGen );
 	free( world->shapeHull );
@@ -384,7 +416,12 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
  */
 #define SHAPE_SLOT_BITS 21
 #define SHAPE_SLOT_MASK 0x1FFFFF
-/** Generations stay under 15 bits so a handle is always a positive int32. */
+/** 10 bits of generation above 21 bits of slot: a handle is at most 0x7FFFFFFF,
+ *  so it is always a positive int32 and a negative value is never a real one.
+ *  The trade the width buys: a slot recycled 1024 times re-issues a handle a
+ *  stale reference could still hold, and that aliasing would be SILENT. At 21
+ *  bits of slot that needs ~262k creations landing on one slot, which no
+ *  session reaches — but it is a bound, not an impossibility. */
 #define SHAPE_GEN_MASK 0x3FF
 
 /**
@@ -1249,11 +1286,225 @@ static b3Transform FrameAlong( b3Vec3 anchor, b3Vec3 localAxis, b3Vec3 axis )
 static const b3Vec3 AXIS_X = { 1.0f, 0.0f, 0.0f };
 static const b3Vec3 AXIS_Z = { 0.0f, 0.0f, 1.0f };
 
+/*
+ * The same split the shape table uses, for the same reason: the slot field has
+ * to address every joint a world can hold at once, and the generation only has
+ * to outlast the reuse of one slot.
+ */
+#define JOINT_SLOT_BITS 21
+#define JOINT_SLOT_MASK 0x1FFFFF
+/** 10 bits of generation above 21 bits of slot: a handle is at most 0x7FFFFFFF,
+ *  so it is always a positive int32 and a negative value is never a real one.
+ *  The trade the width buys: a slot recycled 1024 times re-issues a handle a
+ *  stale reference could still hold, and that aliasing would be SILENT. At 21
+ *  bits of slot that needs ~262k creations landing on one slot, which no
+ *  session reaches — but it is a bound, not an impossibility. */
+#define JOINT_GEN_MASK 0x3FF
+
+/**
+ * Make room for one more joint slot, doubling. False only when the heap is out
+ * or the slot field cannot address another one.
+ *
+ * Generations are PRESERVED across a grow: realloc keeps the existing ones and
+ * only the new tail is zeroed. A generation that reset would hand a stale
+ * handle exactly the number it was waiting for.
+ */
+static bool ReserveJointSlot( World* world )
+{
+	if ( world->jointCount < world->jointCapacity )
+	{
+		return true;
+	}
+
+	int prev = world->jointCapacity;
+	int next = prev > 0 ? prev * 2 : 256;
+	if ( next > JOINT_SLOT_MASK + 1 )
+	{
+		next = JOINT_SLOT_MASK + 1;
+	}
+	if ( next <= prev )
+	{
+		return false;
+	}
+
+	b3JointId* joints = (b3JointId*)realloc( world->joints, (size_t)next * sizeof( b3JointId ) );
+	if ( joints == NULL )
+	{
+		return false;
+	}
+	world->joints = joints;
+
+	uint16_t* gen = (uint16_t*)realloc( world->jointGen, (size_t)next * sizeof( uint16_t ) );
+	if ( gen == NULL )
+	{
+		return false;
+	}
+	world->jointGen = gen;
+
+	memset( world->joints + prev, 0, (size_t)( next - prev ) * sizeof( b3JointId ) );
+	memset( world->jointGen + prev, 0, (size_t)( next - prev ) * sizeof( uint16_t ) );
+
+	world->jointCapacity = next;
+	return true;
+}
+
+/**
+ * Record a joint and return its handle, or -1 if no slot could be had.
+ *
+ * Recycling is tried BEFORE growing, deliberately: it holds the table at the
+ * high-water mark of what is actually alive rather than at everything ever
+ * created, which is the whole difference between this and the bump allocator
+ * that leaked.
+ */
+static int RetainJoint( World* world, b3JointId joint )
+{
+	int slot = -1;
+
+	if ( world->jointCount < world->jointCapacity )
+	{
+		slot = world->jointCount++;
+	}
+	else
+	{
+		// Full. Sweep for a slot whose joint has since died, resuming where the
+		// last sweep stopped so a steady state costs about one probe.
+		for ( int n = 0; n < world->jointCapacity; n++ )
+		{
+			int i = world->jointRover;
+			world->jointRover = ( i + 1 ) % world->jointCapacity;
+			if ( !b3Joint_IsValid( world->joints[i] ) )
+			{
+				slot = i;
+				break;
+			}
+		}
+
+		// Reusing the slot invalidates every handle that pointed at it.
+		if ( slot >= 0 )
+		{
+			world->jointGen[slot] = (uint16_t)( ( world->jointGen[slot] + 1 ) & JOINT_GEN_MASK );
+		}
+	}
+
+	// Every slot holds a LIVE joint, so there is nothing to recycle and the
+	// table has to get bigger. -1 now means only that the heap said no.
+	if ( slot < 0 )
+	{
+		if ( !ReserveJointSlot( world ) )
+		{
+			return -1;
+		}
+		slot = world->jointCount++;
+	}
+
+	world->joints[slot] = joint;
+	return (int)( ( (uint32_t)world->jointGen[slot] << JOINT_SLOT_BITS ) | (uint32_t)slot );
+}
+
+/**
+ * Resolve a joint handle to its slot, or NULL if it is stale, out of range or
+ * malformed. The generation check is the whole point: a handle held across the
+ * reuse of its slot resolves to NULL here rather than to the joint that took
+ * its place.
+ */
+static b3JointId* ResolveJoint( World* world, int handle )
+{
+	if ( world == NULL || handle < 0 )
+	{
+		return NULL;
+	}
+
+	int slot = handle & JOINT_SLOT_MASK;
+	int generation = ( handle >> JOINT_SLOT_BITS ) & JOINT_GEN_MASK;
+
+	if ( slot >= world->jointCount || world->jointGen[slot] != (uint16_t)generation )
+	{
+		return NULL;
+	}
+
+	return &world->joints[slot];
+}
+
+/**
+ * Resolve a joint to a live id, or null.
+ *
+ * The counterpart of `BodyOf`, and it exists because joints were missed when
+ * that one was written. A slot passing a bounds check does NOT mean the joint
+ * exists: the host drops a joint on every rebuild, and Box3D destroys a body's
+ * joints with the body. Handing a dead or null id to Box3D indexes an array
+ * from -1 under `-DNDEBUG`, which is the same silent heap corruption
+ * `BODY_OR_RETURN` was written to end.
+ */
+static b3JointId JointOf( World* world, int joint )
+{
+	b3JointId* slot = ResolveJoint( world, joint );
+	if ( slot == NULL || b3Joint_IsValid( *slot ) == false )
+	{
+		return b3_nullJointId;
+	}
+
+	return *slot;
+}
+
+static b3JointId JointId( int handle, int joint )
+{
+	return JointOf( GetWorld( handle ), joint );
+}
+
+/**
+ * Take the answer `JointOf` already worked out — the joint half of
+ * `BODY_OR_RETURN`, and it is here for exactly the same reason.
+ *
+ * A dead joint reads as zero and ignores what it is told. The caller asked
+ * about something that is not there; that is not a reason to kill the
+ * simulation.
+ */
+#define JOINT_OR_RETURN( id, handle, joint, ... )                                                                      \
+	b3JointId id = JointId( handle, joint );                                                                           \
+	if ( B3_IS_NULL( id ) )                                                                                            \
+	{                                                                                                                  \
+		return __VA_ARGS__;                                                                                            \
+	}
+
+/** Joint slots ever allocated: the table's length, which never falls. */
+int b3w_joint_count( int handle )
+{
+	World* world = GetWorld( handle );
+	return world == NULL ? 0 : world->jointCount;
+}
+
+/**
+ * Joints that EXIST, as opposed to slots ever handed out.
+ *
+ * The probe this bug needed and did not have. `jointCount` above is the
+ * high-water mark of simultaneous liveness — with the slots recycled it stops
+ * being a leak counter and becomes a budget — and the gap between the two is
+ * how much of the table is reclaimable right now.
+ */
+int b3w_live_joint_count( int handle )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL )
+	{
+		return 0;
+	}
+
+	int live = 0;
+	for ( int i = 0; i < world->jointCount; ++i )
+	{
+		if ( b3Joint_IsValid( world->joints[i] ) )
+		{
+			++live;
+		}
+	}
+	return live;
+}
+
 int b3w_add_revolute_joint( int handle, int bodyA, int bodyB, float ax, float ay, float az, float bx, float by,
 							float bz, float axisX, float axisY, float axisZ )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || world->jointCount >= MAX_JOINTS )
+	if ( world == NULL )
 	{
 		return -1;
 	}
@@ -1276,9 +1527,7 @@ int b3w_add_revolute_joint( int handle, int bodyA, int bodyB, float ax, float ay
 	def.base.localFrameA = FrameAlong( ( b3Vec3 ){ ax, ay, az }, AXIS_Z, axis );
 	def.base.localFrameB = FrameAlong( ( b3Vec3 ){ bx, by, bz }, AXIS_Z, axis );
 
-	int joint = world->jointCount++;
-	world->joints[joint] = b3CreateRevoluteJoint( world->id, &def );
-	return joint;
+	return RetainJoint( world, b3CreateRevoluteJoint( world->id, &def ) );
 }
 
 /**
@@ -1301,7 +1550,7 @@ int b3w_add_motor_joint( int handle, int bodyA, int bodyB, float hertz, float da
 						 float angularHertz, float angularDampingRatio, float maxTorque )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || world->jointCount >= MAX_JOINTS )
+	if ( world == NULL )
 	{
 		return -1;
 	}
@@ -1323,16 +1572,14 @@ int b3w_add_motor_joint( int handle, int bodyA, int bodyB, float hertz, float da
 	def.angularDampingRatio = angularDampingRatio;
 	def.maxSpringTorque = maxTorque;
 
-	int joint = world->jointCount++;
-	world->joints[joint] = b3CreateMotorJoint( world->id, &def );
-	return joint;
+	return RetainJoint( world, b3CreateMotorJoint( world->id, &def ) );
 }
 
 int b3w_add_prismatic_joint( int handle, int bodyA, int bodyB, float ax, float ay, float az, float bx, float by,
 							 float bz, float axisX, float axisY, float axisZ )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || world->jointCount >= MAX_JOINTS )
+	if ( world == NULL )
 	{
 		return -1;
 	}
@@ -1355,9 +1602,7 @@ int b3w_add_prismatic_joint( int handle, int bodyA, int bodyB, float ax, float a
 	def.base.localFrameA = FrameAlong( ( b3Vec3 ){ ax, ay, az }, AXIS_X, axis );
 	def.base.localFrameB = FrameAlong( ( b3Vec3 ){ bx, by, bz }, AXIS_X, axis );
 
-	int joint = world->jointCount++;
-	world->joints[joint] = b3CreatePrismaticJoint( world->id, &def );
-	return joint;
+	return RetainJoint( world, b3CreatePrismaticJoint( world->id, &def ) );
 }
 
 /**
@@ -1377,7 +1622,7 @@ int b3w_add_weld_joint( int handle, int bodyA, int bodyB, float px, float py, fl
 						float angularHertz, float dampingRatio )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || world->jointCount >= MAX_JOINTS )
+	if ( world == NULL )
 	{
 		return -1;
 	}
@@ -1405,9 +1650,7 @@ int b3w_add_weld_joint( int handle, int bodyA, int bodyB, float px, float py, fl
 	def.linearDampingRatio = dampingRatio;
 	def.angularDampingRatio = dampingRatio;
 
-	int joint = world->jointCount++;
-	world->joints[joint] = b3CreateWeldJoint( world->id, &def );
-	return joint;
+	return RetainJoint( world, b3CreateWeldJoint( world->id, &def ) );
 }
 
 /**
@@ -1418,7 +1661,7 @@ int b3w_add_weld_joint( int handle, int bodyA, int bodyB, float px, float py, fl
 int b3w_add_ball_joint( int handle, int bodyA, int bodyB, float px, float py, float pz )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || world->jointCount >= MAX_JOINTS )
+	if ( world == NULL )
 	{
 		return -1;
 	}
@@ -1442,9 +1685,7 @@ int b3w_add_ball_joint( int handle, int bodyA, int bodyB, float px, float py, fl
 	def.base.localFrameA = b3InvMulTransforms( fa, anchor );
 	def.base.localFrameB = b3InvMulTransforms( fb, anchor );
 
-	int joint = world->jointCount++;
-	world->joints[joint] = b3CreateSphericalJoint( world->id, &def );
-	return joint;
+	return RetainJoint( world, b3CreateSphericalJoint( world->id, &def ) );
 }
 
 /**
@@ -1469,7 +1710,7 @@ int b3w_add_distance_joint( int handle, int bodyA, int bodyB, float ax, float ay
 							float minLength, float maxLength, float hertz, float dampingRatio )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || world->jointCount >= MAX_JOINTS )
+	if ( world == NULL )
 	{
 		return -1;
 	}
@@ -1503,9 +1744,7 @@ int b3w_add_distance_joint( int handle, int bodyA, int bodyB, float ax, float ay
 	def.hertz = hertz;
 	def.dampingRatio = dampingRatio;
 
-	int joint = world->jointCount++;
-	world->joints[joint] = b3CreateDistanceJoint( world->id, &def );
-	return joint;
+	return RetainJoint( world, b3CreateDistanceJoint( world->id, &def ) );
 }
 
 /**
@@ -1514,17 +1753,7 @@ int b3w_add_distance_joint( int handle, int bodyA, int bodyB, float ax, float ay
  */
 void b3w_set_distance_limits( int handle, int joint, float minLength, float maxLength )
 {
-	World* world = GetWorld( handle );
-	if ( world == NULL || joint < 0 || joint >= world->jointCount )
-	{
-		return;
-	}
-
-	b3JointId id = world->joints[joint];
-	if ( B3_IS_NULL( id ) )
-	{
-		return;
-	}
+	JOINT_OR_RETURN( id, handle, joint )
 
 	b3DistanceJoint_SetLengthRange( id, minLength, maxLength );
 	b3DistanceJoint_SetLength( id, maxLength );
@@ -1538,17 +1767,7 @@ void b3w_set_distance_limits( int handle, int joint, float minLength, float maxL
  */
 void b3w_set_distance_motor( int handle, int joint, float speed, float maxForce )
 {
-	World* world = GetWorld( handle );
-	if ( world == NULL || joint < 0 || joint >= world->jointCount )
-	{
-		return;
-	}
-
-	b3JointId id = world->joints[joint];
-	if ( B3_IS_NULL( id ) )
-	{
-		return;
-	}
+	JOINT_OR_RETURN( id, handle, joint )
 
 	b3DistanceJoint_EnableMotor( id, maxForce > 0.0f );
 	b3DistanceJoint_SetMotorSpeed( id, speed );
@@ -1565,17 +1784,7 @@ void b3w_set_distance_motor( int handle, int joint, float speed, float maxForce 
  */
 float b3w_distance_length( int handle, int joint )
 {
-	World* world = GetWorld( handle );
-	if ( world == NULL || joint < 0 || joint >= world->jointCount )
-	{
-		return B3_HUGE;
-	}
-
-	b3JointId id = world->joints[joint];
-	if ( B3_IS_NULL( id ) )
-	{
-		return B3_HUGE;
-	}
+	JOINT_OR_RETURN( id, handle, joint, B3_HUGE )
 
 	return b3DistanceJoint_GetCurrentLength( id );
 }
@@ -1589,17 +1798,7 @@ float b3w_distance_length( int handle, int joint )
  */
 float b3w_joint_force( int handle, int joint )
 {
-	World* world = GetWorld( handle );
-	if ( world == NULL || joint < 0 || joint >= world->jointCount )
-	{
-		return 0.0f;
-	}
-
-	b3JointId id = world->joints[joint];
-	if ( b3Joint_IsValid( id ) == false )
-	{
-		return 0.0f;
-	}
+	JOINT_OR_RETURN( id, handle, joint, 0.0f )
 
 	return b3Length( b3Joint_GetConstraintForce( id ) );
 }
@@ -1705,22 +1904,11 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 // deliberately — one host-side call site rather than two — even though Box3D
 // names the force cap differently for each (torque vs force).
 
-static b3JointId JointId( int handle, int joint )
-{
-	World* world = GetWorld( handle );
-	if ( world == NULL || joint < 0 || joint >= world->jointCount )
-	{
-		return b3_nullJointId;
-	}
-
-	return world->joints[joint];
-}
-
 /// Drive a revolute joint at `speed` rad/s, capped at `maxTorque`. A zero or
 /// negative cap disables the motor rather than fighting with zero authority.
 void b3w_set_revolute_motor( int handle, int joint, float speed, float maxTorque )
 {
-	b3JointId id = JointId( handle, joint );
+	JOINT_OR_RETURN( id, handle, joint )
 
 	b3RevoluteJoint_EnableMotor( id, maxTorque > 0.0f );
 	b3RevoluteJoint_SetMotorSpeed( id, speed );
@@ -1739,7 +1927,9 @@ void b3w_set_revolute_motor( int handle, int joint, float speed, float maxTorque
  */
 void b3w_set_joint_constraint_tuning( int handle, int joint, float hertz, float dampingRatio )
 {
-	b3Joint_SetConstraintTuning( JointId( handle, joint ), hertz, dampingRatio );
+	JOINT_OR_RETURN( id, handle, joint )
+
+	b3Joint_SetConstraintTuning( id, hertz, dampingRatio );
 }
 
 
@@ -1757,12 +1947,14 @@ void b3w_set_joint_constraint_tuning( int handle, int joint, float hertz, float 
  */
 void b3w_wake_joint_bodies( int handle, int joint )
 {
-	b3Joint_WakeBodies( JointId( handle, joint ) );
+	JOINT_OR_RETURN( id, handle, joint )
+
+	b3Joint_WakeBodies( id );
 }
 
 void b3w_set_revolute_limits( int handle, int joint, int enable, float lower, float upper )
 {
-	b3JointId id = JointId( handle, joint );
+	JOINT_OR_RETURN( id, handle, joint )
 
 	b3RevoluteJoint_EnableLimit( id, enable != 0 );
 	if ( enable != 0 )
@@ -1774,7 +1966,7 @@ void b3w_set_revolute_limits( int handle, int joint, int enable, float lower, fl
 /// As above, for a prismatic joint: `speed` in m/s, capped at `maxForce`.
 void b3w_set_prismatic_motor( int handle, int joint, float speed, float maxForce )
 {
-	b3JointId id = JointId( handle, joint );
+	JOINT_OR_RETURN( id, handle, joint )
 
 	b3PrismaticJoint_EnableMotor( id, maxForce > 0.0f );
 	b3PrismaticJoint_SetMotorSpeed( id, speed );
@@ -1783,7 +1975,7 @@ void b3w_set_prismatic_motor( int handle, int joint, float speed, float maxForce
 
 void b3w_set_prismatic_limits( int handle, int joint, int enable, float lower, float upper )
 {
-	b3JointId id = JointId( handle, joint );
+	JOINT_OR_RETURN( id, handle, joint )
 
 	b3PrismaticJoint_EnableLimit( id, enable != 0 );
 	if ( enable != 0 )
@@ -2467,7 +2659,7 @@ int b3w_cast_ray_detailed( int handle, float ox, float oy, float oz, float dx, f
  */
 void b3w_set_revolute_servo( int handle, int joint, float targetRadians, float hertz, float dampingRatio )
 {
-	b3JointId id = JointId( handle, joint );
+	JOINT_OR_RETURN( id, handle, joint )
 
 	b3RevoluteJoint_EnableSpring( id, hertz > 0.0f );
 	b3RevoluteJoint_SetTargetAngle( id, targetRadians );
@@ -2543,7 +2735,9 @@ uint32_t b3w_owner_of_body( int handle, int body )
 /// Current joint angle in radians, which the servo and the game's readouts need.
 float b3w_revolute_angle( int handle, int joint )
 {
-	return b3RevoluteJoint_GetAngle( JointId( handle, joint ) );
+	JOINT_OR_RETURN( id, handle, joint, 0.0f )
+
+	return b3RevoluteJoint_GetAngle( id );
 }
 
 // --- shape mutation ------------------------------------------------------
@@ -2579,16 +2773,21 @@ int b3w_shape_is_valid( int handle, int shape )
 /// wrong for a game that rebuilds structures on every placement.
 void b3w_destroy_joint( int handle, int joint )
 {
-	World* world = GetWorld( handle );
-	if ( world == NULL || joint < 0 || joint >= world->jointCount )
+	b3JointId* slot = ResolveJoint( GetWorld( handle ), joint );
+	if ( slot == NULL )
 	{
 		return;
 	}
 
-	if ( b3Joint_IsValid( world->joints[joint] ) )
+	if ( b3Joint_IsValid( *slot ) )
 	{
-		b3DestroyJoint( world->joints[joint], true );
+		b3DestroyJoint( *slot, true );
 	}
+
+	// Nulling is what makes the slot reclaimable on the spot rather than at the
+	// next sweep, and it is also the cheap, exact answer for a joint the engine
+	// would still call valid at this instant.
+	*slot = b3_nullJointId;
 }
 
 /**
@@ -2634,7 +2833,9 @@ void b3w_set_shape_filter( int handle, int shape, int category, int mask )
 /// exposes no equivalent, which is why its side re-derives it.
 float b3w_prismatic_translation( int handle, int joint )
 {
-	return b3PrismaticJoint_GetTranslation( JointId( handle, joint ) );
+	JOINT_OR_RETURN( id, handle, joint, 0.0f )
+
+	return b3PrismaticJoint_GetTranslation( id );
 }
 
 // ---------------------------------------------------------------------------
