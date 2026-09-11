@@ -697,6 +697,13 @@ B3_API float b3Body_GetSleepVelocity( b3BodyId bodyId );
 /// anything that wakes it, so a body that never sleeps shows a timer that never grows.
 B3_API float b3Body_GetSleepTime( b3BodyId bodyId );
 
+/// Credit this body as commanded for this step, so the step does not count toward
+/// sleep. The sleep timer is judged on measured velocity alone, so a sustained force
+/// too weak to reach the threshold cannot keep a body awake by itself. Call this every
+/// step you drive the body; stop calling and it sleeps normally on the next step.
+/// Wakes the body if it has already slept.
+B3_API void b3Body_KeepAwake( b3BodyId bodyId );
+
 /// Wake a body from sleep. This wakes the entire island the body is touching.
 /// @warning Putting a body to sleep will put the entire island of bodies touching this body to sleep,
 /// which can be expensive and possibly unintuitive.

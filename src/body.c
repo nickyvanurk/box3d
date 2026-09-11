@@ -1932,6 +1932,48 @@ float b3Body_GetSleepTime( b3BodyId bodyId )
 	return body->sleepTime;
 }
 
+/**
+ * Credit this body as commanded for this step, so the step does not count
+ * toward sleep.
+ *
+ * The sleep timer is a pure function of MEASURED VELOCITY (see b3IntegrateVelocities
+ * in solver.c): it is zeroed only when sleepVelocity exceeds the body's threshold,
+ * and force is not an input to that test. b3Body_ApplyForce wakes a body only if it
+ * is ALREADY sleeping, so a force can un-sleep a body after the fact but can never
+ * keep one awake.
+ *
+ * That gap is invisible until a sustained command is too weak to reach the threshold
+ * within B3_TIME_TO_SLEEP. Then the body sleeps mid-command, waking discards its
+ * velocity (b3WakeSolverSet resets the body state to identity), the next force wakes
+ * it again from a standstill, and it ratchets forever at exactly the sleep period —
+ * a machine that visibly cannot move however much thrust is bolted to it.
+ *
+ * The caller resets the timer every step it commands the body, and the solver's own
+ * `sleepTime += timeStep` then leaves it one step old rather than accumulating, so a
+ * commanded body never reaches B3_TIME_TO_SLEEP. Stop calling and it sleeps normally
+ * on the very next step: this defers sleep, it does not disable it. That is the whole
+ * difference from b3Body_EnableSleep, which is a permanent property of the body.
+ *
+ * Waking is part of the contract. A "keep awake" that silently did nothing to a body
+ * which had already dropped off would reintroduce the fault it exists to fix.
+ */
+void b3Body_KeepAwake( b3BodyId bodyId )
+{
+	b3World* world = b3GetWorld( bodyId.world0 );
+
+	B3_REC( world, BodyKeepAwake, bodyId );
+
+	if ( b3Body_IsAwake( bodyId ) == false )
+	{
+		// Carries its own locked-world guard, and zeroes sleepTime itself.
+		b3Body_SetAwake( bodyId, true );
+	}
+
+	// Re-fetch: waking moves the body between solver sets.
+	b3Body* body = b3GetBodyFullId( world, bodyId );
+	body->sleepTime = 0.0f;
+}
+
 void b3Body_SetAwake( b3BodyId bodyId, bool awake )
 {
 	b3World* world = b3GetUnlockedWorld( bodyId.world0 );

@@ -1100,6 +1100,12 @@ void b3w_set_gravity_scale( int handle, int body, float scale )
 	b3Body_SetGravityScale( id, scale );
 }
 
+void b3w_keep_awake( int handle, int body )
+{
+	BODY_OR_RETURN( id, handle, body )
+	b3Body_KeepAwake( id );
+}
+
 void b3w_wake( int handle, int body )
 {
 	BODY_OR_RETURN( id, handle, body )

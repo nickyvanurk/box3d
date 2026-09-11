@@ -2916,11 +2916,16 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 	// Drive only, never the brake: an idle vehicle carries a standing brake, so
 	// waking on that would hold every parked machine in the world awake forever
 	// and sleep is the tick budget's biggest lever.
+	//
+	// KeepAwake, not SetAwake: a wake alone buys one step. The sleep timer is
+	// judged on measured velocity, so a heavy hull whose engine force cannot
+	// reach the threshold within B3_TIME_TO_SLEEP slept mid-throttle, lost its
+	// velocity to the wake, and ratcheted from a standstill every sleep period.
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
 		if ( v->wheels[i].engineForce != 0.0f )
 		{
-			b3Body_SetAwake( v->chassis, true );
+			b3Body_KeepAwake( v->chassis );
 			break;
 		}
 	}
