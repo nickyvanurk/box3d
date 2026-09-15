@@ -2944,8 +2944,16 @@ void b3w_set_body_mass( int handle, int body, float mass )
  * Flatten a body's contact manifolds into `out`, returning how many were
  * written (capped at `capacity`).
  *
- * 7 floats per manifold: normal xyz (pointing AWAY from the queried body),
- * deepest penetration depth, normal impulse, tangent impulse, other body index.
+ * 8 floats per manifold: normal xyz (pointing AWAY from the queried body),
+ * deepest penetration depth, normal impulse, tangent impulse, other body index,
+ * approach speed.
+ *
+ * Approach speed is the pre-solve closing speed along the normal, the same
+ * quantity Box3D's own hit events report (solver.c) — how hard the two shapes
+ * were coming together before the solver stopped them. It is what a "hit" is:
+ * mass-independent, and untouched by whatever forces the caller applied that
+ * step, which is what makes it the right trigger for anything shock-sensitive.
+ * Only points the solver actually pushed on count, as in the hit events.
  *
  * The normal is flipped here when the queried body is shape B, because Box3D
  * reports A->B and the caller must not have to know which end it is on: a
@@ -2994,17 +3002,23 @@ int b3w_body_contacts( int handle, int body, float* out, int capacity )
 
 			float depth = 0.0f;
 			float normalImpulse = 0.0f;
+			float approachSpeed = 0.0f;
 			for ( int p = 0; p < manifold->pointCount; p++ )
 			{
-				float separation = manifold->points[p].separation;
+				const b3ManifoldPoint* mp = manifold->points + p;
+				float separation = mp->separation;
 				if ( separation < 0.0f && -separation > depth )
 				{
 					depth = -separation;
 				}
-				normalImpulse += manifold->points[p].normalImpulse;
+				normalImpulse += mp->normalImpulse;
+				if ( mp->totalNormalImpulse > 0.0f && -mp->normalVelocity > approachSpeed )
+				{
+					approachSpeed = -mp->normalVelocity;
+				}
 			}
 
-			float* o = out + written * 7;
+			float* o = out + written * 8;
 			o[0] = manifold->normal.x * sign;
 			o[1] = manifold->normal.y * sign;
 			o[2] = manifold->normal.z * sign;
@@ -3012,6 +3026,7 @@ int b3w_body_contacts( int handle, int body, float* out, int capacity )
 			o[4] = normalImpulse;
 			o[5] = b3Length( manifold->frictionImpulse );
 			o[6] = (float)otherIndex;
+			o[7] = approachSpeed;
 			written++;
 		}
 	}
