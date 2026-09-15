@@ -3034,6 +3034,66 @@ int b3w_body_contacts( int handle, int body, float* out, int capacity )
 	return written;
 }
 
+/**
+ * The hardest this body was struck this step: the largest approach speed over
+ * EVERY contact point it has, in m/s. Zero for a body resting or separating.
+ *
+ * Its own entry point rather than a read of `b3w_body_contacts`, because that
+ * one caps at 64 manifolds and a large chassis on several terrain chunks can
+ * carry more — a strike hidden past the cap would simply not be reported. This
+ * walks the whole set, taking a heap buffer only when the stack one is short.
+ */
+float b3w_body_max_approach_speed( int handle, int body )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return 0.0f;
+	}
+
+	b3BodyId id = BodyOf( world, body );
+	int count = b3Body_GetContactCapacity( id );
+	if ( count <= 0 )
+	{
+		return 0.0f;
+	}
+
+	b3ContactData local[64];
+	b3ContactData* data = local;
+	if ( count > 64 )
+	{
+		data = (b3ContactData*)malloc( (size_t)count * sizeof( b3ContactData ) );
+		if ( data == NULL )
+		{
+			return 0.0f;
+		}
+	}
+	count = b3Body_GetContactData( id, data, count );
+
+	float best = 0.0f;
+	for ( int i = 0; i < count; i++ )
+	{
+		for ( int m = 0; m < data[i].manifoldCount; m++ )
+		{
+			const b3Manifold* manifold = data[i].manifolds + m;
+			for ( int p = 0; p < manifold->pointCount; p++ )
+			{
+				const b3ManifoldPoint* mp = manifold->points + p;
+				if ( mp->totalNormalImpulse > 0.0f && -mp->normalVelocity > best )
+				{
+					best = -mp->normalVelocity;
+				}
+			}
+		}
+	}
+
+	if ( data != local )
+	{
+		free( data );
+	}
+	return best;
+}
+
 /** A body's world AABB, as min xyz then max xyz. */
 void b3w_body_aabb( int handle, int body, float* out )
 {
