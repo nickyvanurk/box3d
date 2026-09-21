@@ -88,6 +88,15 @@ typedef struct World
 	 *  between them: their owners resolve it, and the solver shoving one out
 	 *  of the other here only fights the next placement. */
 	uint8_t* placed;
+	/**
+	 * Bodies whose mass is NOT recomputed per shape, parallel to `bodies`.
+	 *
+	 * Box3D re-derives a body's mass from every shape on it each time one is
+	 * added, which is O(shapes) per add and O(shapes²) to build a body — a
+	 * grid of 3,600 cells cost a quarter of a second in that alone. A caller
+	 * attaching a batch defers the update and applies it once at the end.
+	 */
+	uint8_t* massDeferred;
 	int bodyCount;
 	int bodyCapacity;
 
@@ -220,6 +229,8 @@ static void ReserveBodies( World* world, int needed )
 	memset( world->excludedFrom + world->bodyCapacity, 0xFF, sizeof( int32_t ) * (size_t)( capacity - world->bodyCapacity ) );
 	world->placed = (uint8_t*)realloc( world->placed, sizeof( uint8_t ) * capacity );
 	memset( world->placed + world->bodyCapacity, 0, sizeof( uint8_t ) * (size_t)( capacity - world->bodyCapacity ) );
+	world->massDeferred = (uint8_t*)realloc( world->massDeferred, sizeof( uint8_t ) * capacity );
+	memset( world->massDeferred + world->bodyCapacity, 0, sizeof( uint8_t ) * (size_t)( capacity - world->bodyCapacity ) );
 	world->bodyCapacity = capacity;
 }
 
@@ -316,6 +327,7 @@ void b3w_destroy_world( int handle )
 	free( world->detectOnly );
 	free( world->excludedFrom );
 	free( world->placed );
+	free( world->massDeferred );
 	memset( world, 0, sizeof( World ) );
 }
 
@@ -381,6 +393,7 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
 	world->detectOnly[body] = 0;
 	world->excludedFrom[body] = -1;
 	world->placed[body] = 0;
+	world->massDeferred[body] = 0;
 
 	// The handle rides ON the body, so a query result can name it without a
 	// reverse scan of the table. Offset by one so that a body whose user data
@@ -584,6 +597,7 @@ int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
+	def.updateBodyMass = world->massDeferred[body] == 0;
 	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
@@ -1130,6 +1144,7 @@ int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius,
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
+	def.updateBodyMass = world->massDeferred[body] == 0;
 	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
@@ -2080,6 +2095,7 @@ int b3w_add_sphere_shape( int handle, int body, float radius, float ox, float oy
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
+	def.updateBodyMass = world->massDeferred[body] == 0;
 	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
@@ -2109,6 +2125,7 @@ int b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
+	def.updateBodyMass = world->massDeferred[body] == 0;
 	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
@@ -2155,6 +2172,7 @@ int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
+	def.updateBodyMass = world->massDeferred[body] == 0;
 	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
@@ -2744,6 +2762,32 @@ float b3w_revolute_angle( int handle, int joint )
 	JOINT_OR_RETURN( id, handle, joint, 0.0f )
 
 	return b3RevoluteJoint_GetAngle( id );
+}
+
+/**
+ * Defer a body's mass update while shapes are attached to it, and apply it
+ * once when the deferral ends. Deferring on is free; deferring off recomputes
+ * the mass from every shape, once, which is what every add did before.
+ */
+void b3w_body_defer_mass( int handle, int body, int deferred )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+
+	world->massDeferred[body] = deferred != 0;
+	if ( deferred != 0 )
+	{
+		return;
+	}
+
+	b3BodyId bodyId = BodyOf( world, body );
+	if ( !B3_IS_NULL( bodyId ) && b3Body_IsValid( bodyId ) )
+	{
+		b3Body_ApplyMassFromShapes( bodyId );
+	}
 }
 
 // --- shape mutation ------------------------------------------------------

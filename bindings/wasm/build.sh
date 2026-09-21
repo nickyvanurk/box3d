@@ -27,7 +27,7 @@ mkdir -p "$OUT"
 
 EXPORTS='[
 	"_b3w_create_world","_b3w_destroy_world","_b3w_step",
-	"_b3w_create_body","_b3w_add_box_shape","_b3w_body_count","_b3w_live_body_count","_b3w_is_awake",
+	"_b3w_create_body","_b3w_add_box_shape","_b3w_body_defer_mass","_b3w_body_count","_b3w_live_body_count","_b3w_is_awake",
 	"_b3w_transforms_ptr","_b3w_read_transforms",
 	"_b3w_body_transform","_b3w_set_position","_b3w_set_rotation",
 	"_b3w_linear_velocity","_b3w_angular_velocity","_b3w_body_center",
