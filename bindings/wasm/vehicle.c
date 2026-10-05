@@ -454,6 +454,9 @@ typedef struct
 	 * good for one step and no more.
 	 */
 	bool armed;
+	/** No tyre latches a static-friction anchor during the next step — see
+	 *  `b3w_vehicle_release_anchors`. Cleared, like `armed`, as it completes. */
+	bool anchorsReleased;
 	b3WorldId world;
 	/** The shim's world handle, for the body-owner table. */
 	int worldHandle;
@@ -1377,7 +1380,7 @@ static void UpdateFriction( Vehicle* v, float dt )
 							 ? b3Length( Sub3( b3Body_GetLinearVelocity( v->chassis ), groundVel ) )
 							 : vehicleSpeed;
 		bool canStick = hasGround && w->engineForce == 0.0f && relSpeed < STATIC_FRICTION_MAX_SPEED &&
-						!groundIsDynamic;
+						!groundIsDynamic && !v->anchorsReleased;
 
 		if ( canStick )
 		{
@@ -3335,6 +3338,7 @@ void b3w_vehicle_disarm_world( b3WorldId world )
 		if ( g_vehicles[i].used && b3StoreWorldId( g_vehicles[i].world ) == stepped )
 		{
 			g_vehicles[i].armed = false;
+			g_vehicles[i].anchorsReleased = false;
 		}
 	}
 }
@@ -3546,6 +3550,34 @@ void b3w_vehicle_set_velocity( int handle, float vx, float vy, float vz, float w
 		// to roll cars onto their roofs in the rear-end and t-bone stagings.
 		b3Vec3 arm = SubPos( b3Body_GetPosition( w->body ), b3Body_GetPosition( v->chassis ) );
 		b3Body_SetLinearVelocity( w->body, Add3( linear, b3Cross( angular, arm ) ) );
+	}
+}
+
+/**
+ * The machine was MOVED, not driven: let every tyre grip wherever it now is.
+ *
+ * A parked tyre latches the point it stands on and hauls the car back to it
+ * for any slip under `MAX_STATIC_FRICTION_SLIP`. That is right for a car the
+ * solver moves and wrong for one the host moves: a network correction closes a
+ * gap a centimetre a tick, every centimetre was pulled straight back, and a
+ * remote car at rest sat a quarter metre from where its owner had it,
+ * indefinitely.
+ *
+ * For the WHOLE next step, not only its first substep: friction is solved
+ * every substep, and a tyre that re-latched in the first one held the car
+ * against the rest of the step's motion. Latched again on the step after.
+ */
+void b3w_vehicle_release_anchors( int handle )
+{
+	if ( handle < 0 || handle >= B3W_MAX_VEHICLES || !IsVehicleLive( &g_vehicles[handle] ) )
+	{
+		return;
+	}
+	Vehicle* v = &g_vehicles[handle];
+	v->anchorsReleased = true;
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		v->wheels[i].hasAnchor = false;
 	}
 }
 
