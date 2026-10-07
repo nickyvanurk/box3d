@@ -2253,8 +2253,32 @@ static int BodyIndexOfShape( b3ShapeId shapeId );
  * bits say. Called by Box3D only for pairs where a shape enabled custom
  * filtering, which every shape created here does.
  */
+/**
+ * A TYRE: a shape a host hangs on a vehicle's chassis where a wheel rides, so
+ * another machine cannot enter the wheel. It meets MOVING bodies only. The
+ * ground is carried by the wheel's cast, and a shape on the chassis that also
+ * touched it would be a second support fighting the suspension — and for a
+ * host whose world is built of the same bodies its machines are (a frozen
+ * ramp, a bridge), a category cannot say "the ground"; a body type can.
+ */
+static const uint64_t TYRE_CATEGORY = 0x0010;
+
+static bool IsTyreAgainstStatic( b3ShapeId tyre, b3ShapeId other )
+{
+	if ( ( b3Shape_GetFilter( tyre ).categoryBits & TYRE_CATEGORY ) == 0 )
+	{
+		return false;
+	}
+	return b3Body_GetType( b3Shape_GetBody( other ) ) == b3_staticBody;
+}
+
 static bool CustomFilterExclusion( b3ShapeId shapeIdA, b3ShapeId shapeIdB, void* context )
 {
+	if ( IsTyreAgainstStatic( shapeIdA, shapeIdB ) || IsTyreAgainstStatic( shapeIdB, shapeIdA ) )
+	{
+		return false;
+	}
+
 	World* world = (World*)context;
 	int a = BodyIndexOfShape( shapeIdA );
 	int b = BodyIndexOfShape( shapeIdB );
@@ -2535,6 +2559,12 @@ static float OnRayHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float frac
 	(void)triangleIndex;
 	(void)childIndex;
 
+	// A tyre is not a surface: nothing stands on it, picks it or places onto it.
+	if ( b3Shape_GetFilter( shapeId ).categoryBits & TYRE_CATEGORY )
+	{
+		return -1.0f;
+	}
+
 	ClosestRayHit* closest = (ClosestRayHit*)context;
 	closest->fraction = fraction;
 	closest->normal = normal;
@@ -2581,6 +2611,11 @@ static float OnFilteredRayHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, fl
 
 	FilteredRayHit* ctx = (FilteredRayHit*)context;
 	int body = BodyIndexOfShape( shapeId );
+
+	if ( b3Shape_GetFilter( shapeId ).categoryBits & TYRE_CATEGORY )
+	{
+		return -1.0f;
+	}
 
 	if ( body >= 0 && ( body == ctx->exclude || ( body >= ctx->skipLo && body <= ctx->skipHi ) ) )
 	{
