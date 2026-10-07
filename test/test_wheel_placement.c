@@ -1321,6 +1321,46 @@ static int ALightMachineRests( void )
 }
 
 /*
+ * A wheel made weightless and given its weight back leaves the machine as it was.
+ *
+ * The game does exactly that to another player's car every time it hands the car
+ * from being placed to being simulated and back: a placed replica's wheels go to
+ * zero mass, a simulated one's get theirs again. The give-back returned the
+ * wheel's MASS rather than what the wheel had taken, so the take was counted
+ * twice on the way back and the chassis gained a wheel's mass per wheel per
+ * round trip — a remote car 40 kg heavier after every contact, and heavier
+ * still after the next.
+ */
+static int AWeightlessRoundTripKeepsTheMass( void )
+{
+	WheelRig rig = CreateRig( 0.0f, 4 );
+	for ( int i = 0; i < 4; i++ )
+	{
+		b3w_vehicle_set_wheel_mass( rig.vehicle, i, 10.0f );
+	}
+	float authored = b3Body_GetMass( rig.chassis );
+
+	for ( int trip = 0; trip < 3; trip++ )
+	{
+		for ( int i = 0; i < 4; i++ )
+		{
+			b3w_vehicle_set_wheel_mass( rig.vehicle, i, 0.0f );
+		}
+		for ( int i = 0; i < 4; i++ )
+		{
+			b3w_vehicle_set_wheel_mass( rig.vehicle, i, 10.0f );
+		}
+		float after = b3Body_GetMass( rig.chassis );
+		printf( "    round trip %d: chassis %.3f kg, authored %.3f kg\n", trip + 1, after, authored );
+		ENSURE( fabsf( after - authored ) < 1.0e-3f );
+	}
+
+	b3w_vehicle_destroy( rig.vehicle );
+	b3DestroyWorld( rig.world );
+	return 0;
+}
+
+/*
  * Driving one way and the other, on flat ground, should ride the same height.
  *
  * Reported as "riding backward does not raise my chassis, riding forward does".
@@ -1336,7 +1376,12 @@ static int DrivenBothWaysRidesTheSame( void )
 	{
 		float sign = pass == 0 ? 1.0f : -1.0f;
 
-		g_rigChassisDensity = 163.0f;
+		// A 134 kg chassis once its wheels have taken theirs, which the shove
+		// below brings to about 24 m/s. This was density 163, and 134 kg only
+		// because re-setting the rig's 20 kg wheels to 10 counted each wheel's
+		// take twice; counted once, 163 is a 60 kg chassis shoved to 41 m/s,
+		// which is not the machine this was measured on.
+		g_rigChassisDensity = 284.0f;
 		WheelRig rig = CreateRig( 0.0f, 4 );
 		Vehicle* v = b3w_vehicle_get( rig.vehicle );
 		for ( int k = 0; k < v->wheelCount; k++ )
@@ -2249,6 +2294,7 @@ int WheelRigTest( void )
 	g_rigSidewaysWheel = true;
 	RUN_SUBTEST( ALightMachineRests );
 	g_rigSidewaysWheel = false;
+	RUN_SUBTEST( AWeightlessRoundTripKeepsTheMass );
 	RUN_SUBTEST( AHighMountedWheelStaysOffTheGround );
 	RUN_SUBTEST( DrivenBothWaysRidesTheSame );
 	RUN_SUBTEST( DroppedOnFlatGround );

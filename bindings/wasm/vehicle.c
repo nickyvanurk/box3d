@@ -3713,13 +3713,18 @@ void b3w_vehicle_set_wheel_mass( int handle, int index, float mass )
 	}
 
 	Wheel* w = &v->wheels[index];
-	if ( w->mass > 0.0f )
+	if ( w->massTakenFromChassis > 0.0f )
 	{
-		// Give back what this wheel took before taking the new amount, so a
-		// second call is not a second subtraction.
+		// Give back what this wheel TOOK — not its mass, which the share capped,
+		// and which a weightless wheel (a placed replica's) never took at all —
+		// so a second call is not a second subtraction. Giving back `w->mass`
+		// left `massTakenFromChassis` standing after a wheel went to zero, and
+		// the next call counted it into the machine again: every placed and
+		// simulated round trip made a car 10 kg a wheel heavier.
 		b3MassData chassis = b3Body_GetMassData( v->chassis );
-		chassis.mass += w->mass;
+		chassis.mass += w->massTakenFromChassis;
 		b3Body_SetMassData( v->chassis, chassis );
+		w->massTakenFromChassis = 0.0f;
 	}
 
 	w->mass = mass;
