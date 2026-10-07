@@ -461,6 +461,14 @@ static bool RigPreSolve( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3
 	return b3w_tyre_presolve( shapeIdA, shapeIdB, point, normal ) != 0;
 }
 
+bool b3w_tyre_should_pair( b3ShapeId shapeIdA, b3ShapeId shapeIdB );
+
+static bool RigPairFilter( b3ShapeId shapeIdA, b3ShapeId shapeIdB, void* context )
+{
+	(void)context;
+	return b3w_tyre_should_pair( shapeIdA, shapeIdB );
+}
+
 static WheelRig CreateRig( float slopeRadians, int wheelCount )
 {
 	WheelRig rig;
@@ -520,8 +528,9 @@ static WheelRig CreateRig( float slopeRadians, int wheelCount )
 	b3CreateHullShape( rig.chassis, &chassisShape, &chassisBox.base );
 
 	rig.vehicle = b3w_vehicle_create( rig.world, 0, rig.chassis );
-	// The tyre's contact rule, as the shim installs it for every game world.
+	// The tyre's rules, as the shim installs them for every game world.
 	b3World_SetPreSolveCallback( rig.world, RigPreSolve, NULL );
+	b3World_SetCustomFilterCallback( rig.world, RigPairFilter, NULL );
 
 	AddRigWheels( &rig, wheelCount );
 
@@ -2353,8 +2362,9 @@ static void DriveAtAStep( float height, float* rise, float* climbRate, float* tr
 	def.type = b3_staticBody;
 	def.position = B3_LITERAL( b3Pos ){ 3.6f, 0.5f * height, 0.0f };
 	b3BodyId step = b3CreateBody( rig.world, &def );
+	// Box3D's DEFAULT filter, on purpose: a shape given none is in every category,
+	// and a tyre once recognised by a category bit took such a step for a tyre.
 	b3ShapeDef shape = b3DefaultShapeDef();
-	shape.filter.categoryBits = GROUND_CATEGORY;
 	b3BoxHull box = b3MakeBoxHull( 2.0f, 0.5f * height, 2.0f );
 	b3CreateHullShape( step, &shape, &box.base );
 

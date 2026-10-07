@@ -2260,11 +2260,18 @@ static int BodyIndexOfShape( b3ShapeId shapeId );
 /** Defined in vehicle.c: a tyre's own contact rule. */
 int b3w_tyre_presolve( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Vec3 normal );
 
-/** A tyre shape's category (vehicle.c, B3W_TYRE_CATEGORY): nothing stands on, picks or places onto it. */
-static const uint64_t TYRE_CATEGORY = 0x0010;
+/** Defined in vehicle.c: is this a vehicle's tyre? Nothing stands on, picks or places onto one. */
+bool b3w_is_tyre( b3ShapeId shapeId );
+/** Defined in vehicle.c: a tyre never pairs with terrain. */
+bool b3w_tyre_should_pair( b3ShapeId shapeIdA, b3ShapeId shapeIdB );
 
 static bool CustomFilterExclusion( b3ShapeId shapeIdA, b3ShapeId shapeIdB, void* context )
 {
+	if ( !b3w_tyre_should_pair( shapeIdA, shapeIdB ) )
+	{
+		return false;
+	}
+
 	World* world = (World*)context;
 	int a = BodyIndexOfShape( shapeIdA );
 	int b = BodyIndexOfShape( shapeIdB );
@@ -2550,7 +2557,7 @@ static float OnRayHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float frac
 	(void)childIndex;
 
 	// A tyre is not a surface: nothing stands on it, picks it or places onto it.
-	if ( b3Shape_GetFilter( shapeId ).categoryBits & TYRE_CATEGORY )
+	if ( b3w_is_tyre( shapeId ) )
 	{
 		return -1.0f;
 	}
@@ -2602,7 +2609,7 @@ static float OnFilteredRayHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, fl
 	FilteredRayHit* ctx = (FilteredRayHit*)context;
 	int body = BodyIndexOfShape( shapeId );
 
-	if ( b3Shape_GetFilter( shapeId ).categoryBits & TYRE_CATEGORY )
+	if ( b3w_is_tyre( shapeId ) )
 	{
 		return -1.0f;
 	}

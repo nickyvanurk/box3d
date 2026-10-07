@@ -757,11 +757,14 @@ static void KeepWheelHit( WheelCast* ctx, WheelHit hit )
 uint32_t b3w_owner_of_body( int handle, int body );
 
 /**
- * The category a tyre shape carries on top of its machine's. Nothing stands on,
- * picks or places onto a tyre (the shim's ray queries skip it) and no wheel's
- * sweep takes one for ground.
+ * Is this shape a vehicle's tyre? Nothing stands on, picks or places onto one
+ * (the shim's ray queries skip it) and no wheel's sweep takes one for ground.
+ *
+ * Known by its tag, never by a collision category: a shape given no filter is in
+ * EVERY category, so a "tyre bit" was set on the game's default floor and on the
+ * player, and the sweep skipped the ground as if it were somebody's tyre.
  */
-#define B3W_TYRE_CATEGORY 0x0010ull
+bool b3w_is_tyre( b3ShapeId shapeId );
 /** How much smaller the tyre's box is than the tyre the cast carries, so the two never argue (archlab's figure). */
 static const float TYRE_CLEARANCE = 0.01f;
 /** Rubber against what it runs into — archlab's tyre friction. */
@@ -789,6 +792,19 @@ static const float UNDER_THE_WHEEL_COS = 0.70710678f;
  * twice.
  */
 static const float TYRE_WALL_COS = 0.64278761f;
+/**
+ * The same two limits for a MOVING machine's surface: road within 25 degrees,
+ * wall past 30.
+ *
+ * PhysX's sample makes every vehicle non-drivable (`setupNonDrivableSurface`:
+ * it "prevents vehicles from driving on any other vehicles"). That would also
+ * stop a car driving onto a carrier, so a machine is road only where it is
+ * nearly flat — a deck, a roof — and its wedge nose or door, which pass a
+ * 45-degree test, never become a ramp the suspension drives up. Terrain and
+ * frozen builds keep PhysX's 45: a built ramp is meant to be driven.
+ */
+static const float MACHINE_ROAD_COS = 0.90630779f;
+static const float MACHINE_WALL_COS = 0.86602540f;
 /** Two normals within 15 degrees describe the same surface. */
 static const float SAME_SURFACE_COS = 0.96592583f;
 
@@ -811,9 +827,10 @@ static const float SAME_SURFACE_COS = 0.96592583f;
  * up anywhere on the tyre, so a nose or a door the tread brushed became ground
  * and the suspension threw the car up onto it.
  */
-static bool IsUnderTheWheel( const WheelCast* ctx, b3Pos point, b3Vec3 normal, float fraction )
+static bool IsUnderTheWheel( const WheelCast* ctx, b3Pos point, b3Vec3 normal, float fraction, b3BodyId hitBody )
 {
-	if ( -b3Dot( normal, ctx->suspensionDown ) < UNDER_THE_WHEEL_COS )
+	float road = b3Body_GetType( hitBody ) == b3_staticBody ? UNDER_THE_WHEEL_COS : MACHINE_ROAD_COS;
+	if ( -b3Dot( normal, ctx->suspensionDown ) < road )
 	{
 		return false;
 	}
@@ -905,12 +922,12 @@ static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fr
 	}
 
 	// Another machine's tyre is not a surface either: it is where a wheel is.
-	if ( b3Shape_GetFilter( shapeId ).categoryBits & B3W_TYRE_CATEGORY )
+	if ( b3w_is_tyre( shapeId ) )
 	{
 		return -1.0f;
 	}
 
-	if ( !IsUnderTheWheel( ctx, point, normal, fraction ) )
+	if ( !IsUnderTheWheel( ctx, point, normal, fraction, hitBody ) )
 	{
 		return -1.0f;
 	}
@@ -2820,12 +2837,12 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 	stopDef.density = 0.0f;
 	stopDef.enableContactEvents = false;
 
-	// The machine's own filter, so it collides with exactly what the chassis
-	// collides with and never with the machine itself — see `MachineFilter`.
-	b3Filter machine;
-	if ( MachineFilter( v, &machine ) )
+	b3ShapeId chassisShapes[1];
+	if ( b3Body_GetShapes( v->chassis, chassisShapes, 1 ) == 1 )
 	{
-		stopDef.filter = machine;
+		// The machine's own filter, so it collides with exactly what the chassis
+		// collides with and never with the machine itself.
+		stopDef.filter = b3Shape_GetFilter( chassisShapes[0] );
 	}
 
 	// Held out of the world until a cast says it is clear of it — see
@@ -3019,11 +3036,14 @@ static b3Pos WheelCentreNow( const Vehicle* v, const Wheel* w, b3Vec3* down )
  * The collision filter of the MACHINE: any chassis shape that is not one of this
  * vehicle's own bump stops or tyres.
  *
- * Box3D lists a body's shapes newest first, so "the chassis's first shape" was
- * whatever the vehicle added last — for every wheel after the first, the
- * previous wheel's bump stop, still held out of the world with a zero mask. So
- * every bump stop after the first copied a filter that matches nothing and
- * could never stop anything, and the first tyre shape did the same.
+ * Box3D lists a body's shapes newest first, so "the chassis's first shape" is
+ * whatever the vehicle added last — a bump stop, held out of the world with a
+ * zero mask, or a tyre. A tyre that copied it collided with nothing.
+ *
+ * (The bump stops copy "the first shape" themselves, so every stop after the
+ * first wheel's carries a zero mask and has never stopped anything. Reviving
+ * them is a tuning change — a ballasted tank then drags on them — and is left
+ * to be made on its own.)
  */
 static bool MachineFilter( const Vehicle* v, b3Filter* filter )
 {
@@ -3146,7 +3166,6 @@ static void UpdateTyre( Vehicle* v, Wheel* w, int index )
 		def.density = 0.0f;
 		def.baseMaterial.friction = TYRE_FRICTION;
 		def.filter = machine;
-		def.filter.categoryBits |= B3W_TYRE_CATEGORY;
 		def.enablePreSolveEvents = true;
 		def.enableCustomFiltering = true;
 		def.userData = (void*)(intptr_t)( B3W_TYRE_TAG | ( v->handle << 12 ) | index );
@@ -3165,6 +3184,19 @@ static void UpdateTyre( Vehicle* v, Wheel* w, int index )
 		b3Shape_SetContactAnchor( w->tyreShape, true, w->chassisConnectionPointCs );
 		w->tyreTop = top;
 		w->tyreBottom = bottom;
+	}
+
+	// The machine's collision as it is NOW: a host rewrites its machine's filters
+	// (a placed copy meets no other placed copy) and knows nothing of a tyre the
+	// engine made, so the tyre follows.
+	b3Filter now;
+	if ( MachineFilter( v, &now ) )
+	{
+		b3Filter had = b3Shape_GetFilter( w->tyreShape );
+		if ( had.categoryBits != now.categoryBits || had.maskBits != now.maskBits || had.groupIndex != now.groupIndex )
+		{
+			b3Shape_SetFilter( w->tyreShape, now, true );
+		}
 	}
 
 	// The tread: the wheel's spin about its (steered) axle, through its centre, as
@@ -3228,7 +3260,8 @@ static bool KeepTyreContact( Vehicle* v, Wheel* w, b3ShapeId other, b3Pos point,
 
 	b3Vec3 down;
 	b3Pos centre = WheelCentreNow( v, w, &down );
-	if ( -b3Dot( towardWheel, down ) > TYRE_WALL_COS )
+	float wall = b3Body_GetType( otherBody ) == b3_staticBody ? TYRE_WALL_COS : MACHINE_WALL_COS;
+	if ( -b3Dot( towardWheel, down ) > wall )
 	{
 		return false;
 	}
@@ -3872,6 +3905,35 @@ static void FreeWheelStorage( Vehicle* v )
 	v->axle = NULL;
 	v->wheelCount = 0;
 	v->wheelCapacity = 0;
+}
+
+/**
+ * May these two shapes collide at all, as far as tyres are concerned?
+ *
+ * PhysX's first filtering rule: "wheel shapes must not hit drivable surfaces".
+ * The terrain — a mesh or a height field — IS the drivable world, and the
+ * sweep carries the wheel on it; a tyre left touching it stood the machine on
+ * its tyres. Nor can the contact rule do it instead: Box3D runs its pre-solve
+ * on convex contacts only, never on a mesh's. So a tyre never pairs with
+ * terrain, and meets machines and frozen builds — convex, and judged by
+ * `b3w_tyre_presolve`.
+ */
+bool b3w_tyre_should_pair( b3ShapeId shapeIdA, b3ShapeId shapeIdB )
+{
+	bool tyreA = b3w_is_tyre( shapeIdA );
+	bool tyreB = b3w_is_tyre( shapeIdB );
+	if ( !tyreA && !tyreB )
+	{
+		return true;
+	}
+	b3ShapeType other = b3Shape_GetType( tyreA ? shapeIdB : shapeIdA );
+	return other != b3_meshShape && other != b3_heightShape && other != b3_compoundShape;
+}
+
+bool b3w_is_tyre( b3ShapeId shapeId )
+{
+	Vehicle* v = NULL;
+	return TyreWheel( shapeId, &v ) != NULL;
 }
 
 static Wheel* TyreWheel( b3ShapeId shapeId, Vehicle** vehicle )
