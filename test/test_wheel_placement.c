@@ -1361,6 +1361,44 @@ static int AWeightlessRoundTripKeepsTheMass( void )
 }
 
 /*
+ * A chassis whose mass is re-derived from its shapes gives the wheels their share
+ * back by the next step.
+ *
+ * Box3D re-derives a body's mass whenever a shape is attached or removed, and the
+ * game puts the whole machine's mass back after each — so a car whose colliders
+ * landed a few frames after it was built carried its wheels' mass twice, 40 kg
+ * more than the same car built at once.
+ */
+static int AReDerivedChassisGivesTheWheelsTheirShare( void )
+{
+	WheelRig rig = CreateRig( 0.0f, 4 );
+	Vehicle* v = b3w_vehicle_get( rig.vehicle );
+	for ( int i = 0; i < 4; i++ )
+	{
+		b3w_vehicle_set_wheel_mass( rig.vehicle, i, 10.0f );
+	}
+	float authored = b3Body_GetMass( rig.chassis );
+
+	b3Body_ApplyMassFromShapes( rig.chassis );
+	float whole = b3Body_GetMass( rig.chassis );
+
+	b3w_vehicle_prepare( v, RIG_TICK );
+	b3World_Step( rig.world, RIG_TICK, RIG_SUBSTEPS );
+	b3w_vehicle_place_wheels( 0 );
+	v->armed = false;
+
+	float after = b3Body_GetMass( rig.chassis );
+	printf( "    chassis %.3f kg as built, %.3f kg re-derived, %.3f kg after a step\n", authored, whole, after );
+
+	b3w_vehicle_destroy( rig.vehicle );
+	b3DestroyWorld( rig.world );
+
+	ENSURE( whole > authored + 1.0f );
+	ENSURE( fabsf( after - authored ) < 1.0e-3f );
+	return 0;
+}
+
+/*
  * Driving one way and the other, on flat ground, should ride the same height.
  *
  * Reported as "riding backward does not raise my chassis, riding forward does".
@@ -2295,6 +2333,7 @@ int WheelRigTest( void )
 	RUN_SUBTEST( ALightMachineRests );
 	g_rigSidewaysWheel = false;
 	RUN_SUBTEST( AWeightlessRoundTripKeepsTheMass );
+	RUN_SUBTEST( AReDerivedChassisGivesTheWheelsTheirShare );
 	RUN_SUBTEST( AHighMountedWheelStaysOffTheGround );
 	RUN_SUBTEST( DrivenBothWaysRidesTheSame );
 	RUN_SUBTEST( DroppedOnFlatGround );

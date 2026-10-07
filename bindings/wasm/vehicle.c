@@ -507,6 +507,11 @@ typedef struct
 	 * compared in O(1) here.
 	 */
 	uint32_t owner;
+	/**
+	 * The chassis mass as the wheels' takes last left it — see `RetakeWheelMass`.
+	 * Zero until a wheel has taken anything.
+	 */
+	float chassisMassAsLeft;
 } Vehicle;
 
 static b3Vec3 AxisVector( int index )
@@ -2578,10 +2583,37 @@ static void ApplyWheelMass( Vehicle* v, Wheel* w )
 	w->massTakenFromChassis = want;
 	chassis.mass = remaining;
 	b3Body_SetMassData( v->chassis, chassis );
+	v->chassisMassAsLeft = remaining;
 
 	// The spring is specified against these masses, so it is stale the moment
 	// they change.
 	ConfigureWheelJoint( v, w );
+}
+
+/**
+ * The chassis was given the WHOLE machine's mass by something else: take the
+ * wheels' share off it again.
+ *
+ * The wheels' share comes off the chassis here, behind the host's back, and the
+ * host has its own idea of what the chassis weighs — every part of the machine,
+ * wheels included — which it puts back whenever a collider is attached or
+ * removed, because Box3D re-derives a body's mass from its shapes at each. So
+ * the first collider change after the wheels were built handed their share back
+ * to the chassis for good: a car whose colliders land a few frames after it is
+ * built weighed 40 kg more than the same car built at once, and two clients
+ * holding the same machine disagreed about its mass.
+ *
+ * A chassis mass this vehicle did not leave can only be such a whole, so the
+ * takes start over from it.
+ */
+static void RetakeWheelMass( Vehicle* v )
+{
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		v->wheels[i].massTakenFromChassis = 0.0f;
+		ApplyWheelMass( v, &v->wheels[i] );
+	}
+	v->chassisMassAsLeft = b3Body_GetMass( v->chassis );
 }
 
 /**
@@ -2877,6 +2909,12 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 	 * a step: nothing destroys a body while the solver is running.
 	 */
 	DropDeadHandles( v );
+
+	if ( v->chassisMassAsLeft > 0.0f && b3Body_GetType( v->chassis ) == b3_dynamicBody &&
+		 b3Body_GetMass( v->chassis ) != v->chassisMassAsLeft )
+	{
+		RetakeWheelMass( v );
+	}
 
 	// A fresh friction budget for the tick the substeps are about to share.
 	for ( int i = 0; i < v->wheelCount; i++ )
@@ -3725,6 +3763,7 @@ void b3w_vehicle_set_wheel_mass( int handle, int index, float mass )
 		chassis.mass += w->massTakenFromChassis;
 		b3Body_SetMassData( v->chassis, chassis );
 		w->massTakenFromChassis = 0.0f;
+		v->chassisMassAsLeft = chassis.mass;
 	}
 
 	w->mass = mass;
