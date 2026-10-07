@@ -33,6 +33,8 @@ typedef struct b3ManifoldConstraint
 	b3Vec3 rollingImpulse;
 	float tangentVelocity1;
 	float tangentVelocity2;
+	/** See `b3Manifold::stepImpulse`. */
+	b3Vec3 stepImpulse;
 } b3ManifoldConstraint;
 
 typedef struct b3ContactConstraint

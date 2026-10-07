@@ -2641,6 +2641,13 @@ typedef struct b3Manifold
 	/// Rolling resistance angular impulse
 	b3Vec3 rollingImpulse;
 
+	/// The linear impulse this manifold applied to shape B's body over the whole
+	/// step (shape A's received its negative): the normal and friction impulses as
+	/// each substep applied them, plus restitution. What the contact DID, which no
+	/// other field states — `normalImpulse` is only the last substep's accumulator
+	/// and `totalNormalImpulse` counts it once per solver pass.
+	b3Vec3 stepImpulse;
+
 	/// The number of contact points, will be 0 to 4
 	int pointCount;
 

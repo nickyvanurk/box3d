@@ -449,6 +449,90 @@ static int BulletMeetsASettlingBullet( void )
 	return 0;
 }
 
+/*
+ * A manifold's step impulse is what the contact did to its bodies over the step.
+ *
+ * Asked of two free boxes with nothing else acting on them, every change of
+ * momentum is the contact's: each box's mass times its change of velocity is
+ * the step impulse its manifolds report, struck and pushing alike. Nothing
+ * else in a manifold says that — the normal impulse is the last substep's
+ * accumulator and the total counts it once per solver pass.
+ */
+static float SumStepImpulseX( b3BodyId body, b3BodyId other )
+{
+	b3ContactData data[32];
+	int n = b3Body_GetContactData( body, data, 32 );
+	float x = 0.0f;
+	for ( int i = 0; i < n; i++ )
+	{
+		b3BodyId a = b3Shape_GetBody( data[i].shapeIdA );
+		b3BodyId b = b3Shape_GetBody( data[i].shapeIdB );
+		bool queriedIsA = B3_ID_EQUALS( a, body );
+		if ( !B3_ID_EQUALS( queriedIsA ? b : a, other ) )
+		{
+			continue;
+		}
+		for ( int m = 0; m < data[i].manifoldCount; m++ )
+		{
+			// The impulse is B's; A received its negative.
+			float onB = data[i].manifolds[m].stepImpulse.x;
+			x += queriedIsA ? -onB : onB;
+		}
+	}
+	return x;
+}
+
+static int StepImpulseIsTheContactsMomentum( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = (b3Vec3){ 0.0f, 0.0f, 0.0f };
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BoxHull hull = b3MakeBoxHull( 1.0f, 0.5f, 0.5f );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.0f, 0.0f, 0.0f };
+	b3BodyId struck = b3CreateBody( worldId, &bodyDef );
+	b3CreateHullShape( struck, &shapeDef, &hull.base );
+
+	// Closing at 6 m/s from 0.1 m off, then held against it at that speed.
+	bodyDef.position = (b3Pos){ 2.1f, 0.0f, 0.0f };
+	bodyDef.linearVelocity = (b3Vec3){ -6.0f, 0.0f, 0.0f };
+	b3BodyId striker = b3CreateBody( worldId, &bodyDef );
+	shapeDef.density = 3.0f;
+	b3CreateHullShape( striker, &shapeDef, &hull.base );
+
+	float worst = 0.0f;
+	int contactSteps = 0;
+	for ( int step = 0; step < 12; step++ )
+	{
+		b3Vec3 v0 = b3Body_GetLinearVelocity( struck );
+		b3Vec3 u0 = b3Body_GetLinearVelocity( striker );
+		b3World_Step( worldId, 1.0f / 24.0f, 4 );
+
+		float dpStruck = b3Body_GetMass( struck ) * ( b3Body_GetLinearVelocity( struck ).x - v0.x );
+		float dpStriker = b3Body_GetMass( striker ) * ( b3Body_GetLinearVelocity( striker ).x - u0.x );
+		float jStruck = SumStepImpulseX( struck, striker );
+		float jStriker = SumStepImpulseX( striker, struck );
+		if ( fabsf( dpStruck ) > 1.0e-3f )
+		{
+			contactSteps++;
+		}
+		printf( "    step %d: struck momentum %.3f impulse %.3f | striker momentum %.3f impulse %.3f\n", step, dpStruck,
+				jStruck, dpStriker, jStriker );
+		worst = b3MaxFloat( worst, fabsf( dpStruck - jStruck ) );
+		worst = b3MaxFloat( worst, fabsf( dpStriker - jStriker ) );
+	}
+
+	b3DestroyWorld( worldId );
+
+	ENSURE( contactSteps > 0 );
+	ENSURE( worst < 1.0e-2f );
+	return 0;
+}
+
 static int TestContactEvents( void )
 {
 	b3WorldDef worldDef = b3DefaultWorldDef();
@@ -1224,6 +1308,7 @@ int WorldTest( void )
 	RUN_SUBTEST( TestSensor );
 	RUN_SUBTEST( TestContinuousMoveEvent );
 	RUN_SUBTEST( BulletMeetsASettlingBullet );
+	RUN_SUBTEST( StepImpulseIsTheContactsMomentum );
 	RUN_SUBTEST( TestContactEvents );
 	RUN_SUBTEST( TestHitEvents );
 	RUN_SUBTEST( TestCompoundHitEvents );

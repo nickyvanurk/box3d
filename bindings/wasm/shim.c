@@ -3079,6 +3079,70 @@ int b3w_body_contacts( int handle, int body, float* out, int capacity )
 }
 
 /**
+ * The linear impulse `body` received from its contacts with `other` over the
+ * last step, into `out[0..2]`, and how many touching contacts the two share.
+ *
+ * Every contact between the two, not the first 64 manifolds: a block-built
+ * machine touching another carries hundreds. Read from each manifold's
+ * `stepImpulse`, which is what the contact did and nothing else — a body's
+ * change of velocity across a step also holds its brakes, its tyres and
+ * gravity, and a collision measured that way is a collision plus all of them.
+ */
+int b3w_body_pair_impulse( int handle, int body, int other, float* out )
+{
+	out[0] = out[1] = out[2] = 0.0f;
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount || other < 0 || other >= world->bodyCount )
+	{
+		return 0;
+	}
+
+	b3BodyId id = BodyOf( world, body );
+	b3BodyId otherId = BodyOf( world, other );
+	int capacity = b3Body_GetContactCapacity( id );
+	if ( capacity <= 0 )
+	{
+		return 0;
+	}
+
+	b3ContactData stack[64];
+	b3ContactData* data = capacity <= 64 ? stack : (b3ContactData*)malloc( sizeof( b3ContactData ) * (size_t)capacity );
+	if ( data == NULL )
+	{
+		return 0;
+	}
+	int count = b3Body_GetContactData( id, data, capacity );
+
+	int touching = 0;
+	for ( int i = 0; i < count; i++ )
+	{
+		b3BodyId a = b3Shape_GetBody( data[i].shapeIdA );
+		b3BodyId b = b3Shape_GetBody( data[i].shapeIdB );
+		bool queriedIsA = B3_ID_EQUALS( a, id );
+		if ( !B3_ID_EQUALS( queriedIsA ? b : a, otherId ) )
+		{
+			continue;
+		}
+		touching++;
+		// A manifold's step impulse is shape B's; shape A received its negative.
+		float sign = queriedIsA ? -1.0f : 1.0f;
+		for ( int m = 0; m < data[i].manifoldCount; m++ )
+		{
+			b3Vec3 j = data[i].manifolds[m].stepImpulse;
+			out[0] += sign * j.x;
+			out[1] += sign * j.y;
+			out[2] += sign * j.z;
+		}
+	}
+
+	if ( data != stack )
+	{
+		free( data );
+	}
+	return touching;
+}
+
+/**
  * The hardest this body was struck this step: the largest approach speed over
  * EVERY contact point it has, in m/s. Zero for a body resting or separating.
  *

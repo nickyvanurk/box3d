@@ -253,6 +253,7 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 					constraint->frictionImpulse.x = warmStartScale * b3Dot( manifold->frictionImpulse, tangent1 );
 					constraint->frictionImpulse.y = warmStartScale * b3Dot( manifold->frictionImpulse, tangent2 );
 				}
+				constraint->stepImpulse = b3Vec3_zero;
 
 				{
 					float k = b3Dot( normal, b3MulMV( b3AddMM( iA, iB ), normal ) );
@@ -566,6 +567,13 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 				wA = b3Sub( wA, b3MulMV( iA, b3Cross( rA, P ) ) );
 				vB = b3MulAdd( vB, mB, P );
 				wB = b3Add( wB, b3MulMV( iB, b3Cross( rB, P ) ) );
+
+				// What this substep applied, now that the relax pass has settled it:
+				// the warm start re-applied both accumulators and the passes only
+				// adjusted them, so their final values are the substep's impulse.
+				b3Vec3 applied = b3MulSV( totalNormalImpulse, constraint->normal );
+				applied = b3Add( applied, b3Blend2( newImpulse.x, tangent1, newImpulse.y, tangent2 ) );
+				constraint->stepImpulse = b3Add( constraint->stepImpulse, applied );
 			}
 		}
 
@@ -669,6 +677,7 @@ void b3ApplyRestitution_Mesh( b3SolverBlock block, b3StepContext* context )
 				wA = b3Sub( wA, b3MulMV( iA, b3Cross( rA, P ) ) );
 				vB = b3MulAdd( vB, mB, P );
 				wB = b3Add( wB, b3MulMV( iB, b3Cross( rB, P ) ) );
+				cm->stepImpulse = b3Add( cm->stepImpulse, P );
 			}
 
 			if ( stateA->flags & b3_dynamicFlag )
@@ -757,6 +766,7 @@ void b3StoreImpulses_Mesh( b3SolverBlock block, b3StepContext* context, int work
 				manifold->frictionImpulse = b3Blend2( constraint->frictionImpulse.x, constraint->tangent1,
 													  constraint->frictionImpulse.y, constraint->tangent2 );
 				manifold->rollingImpulse = constraint->rollingImpulse;
+				manifold->stepImpulse = constraint->stepImpulse;
 
 				int count = constraint->pointCount;
 				B3_ASSERT( count == manifold->pointCount );
@@ -980,6 +990,8 @@ typedef struct b3ContactConstraintWide
 	b3FloatW twistImpulse;
 	b3SymMatrix2W tangentMass;
 	b3Vec2W frictionImpulse;
+	/** See `b3Manifold::stepImpulse`. */
+	b3Vec3W stepImpulse;
 	b3SymMatrix3W rollingMass;
 	b3Vec3W rollingImpulse;
 	b3FloatW friction;
@@ -1492,6 +1504,9 @@ void b3PrepareContacts_Convex( b3SolverBlock block, b3StepContext* context )
 					( (float*)&constraint->frictionImpulse.y )[lane] =
 						warmStartScale * b3Dot( manifold->frictionImpulse, tangent2 );
 				}
+				( (float*)&constraint->stepImpulse.X )[lane] = 0.0f;
+				( (float*)&constraint->stepImpulse.Y )[lane] = 0.0f;
+				( (float*)&constraint->stepImpulse.Z )[lane] = 0.0f;
 
 				{
 					float k = b3Dot( normal, b3MulMV( b3AddMM( iA, iB ), normal ) );
@@ -1814,6 +1829,12 @@ void b3SolveContacts_Convex( b3SolverBlock block, b3StepContext* context, bool u
 				bA.v = b3MulSubSVW( bA.v, c->invMassA, P );
 				bB.w = b3MulAddMVW( bB.w, c->invIB, b3CrossW( rB, P ) );
 				bB.v = b3MulAddSVW( bB.v, c->invMassB, P );
+
+				// What this substep applied, now that the relax pass has settled it —
+				// see the scalar path.
+				b3Vec3W applied = b3MulSVW( totalNormalImpulse, c->normal );
+				applied = b3AddVW( applied, b3AddVW( b3MulSVW( newImpulse.x, tangent1 ), b3MulSVW( newImpulse.y, tangent2 ) ) );
+				c->stepImpulse = b3AddVW( c->stepImpulse, applied );
 			}
 		}
 
@@ -1891,6 +1912,7 @@ void b3ApplyRestitution_Convex( b3SolverBlock block, b3StepContext* context )
 			bA.v = b3MulSubSVW( bA.v, c->invMassA, P );
 			bB.w = b3MulAddMVW( bB.w, c->invIB, b3CrossW( rB, P ) );
 			bB.v = b3MulAddSVW( bB.v, c->invMassB, P );
+			c->stepImpulse = b3AddVW( c->stepImpulse, P );
 		}
 
 		b3ScatterBodies( states, c->indexA, &bA );
@@ -1974,6 +1996,11 @@ void b3StoreImpulses_Convex( b3SolverBlock block, b3StepContext* context, int wo
 					rollingImpulseX[lane],
 					rollingImpulseY[lane],
 					rollingImpulseZ[lane],
+				};
+				m->stepImpulse = (b3Vec3){
+					( (const float*)&c->stepImpulse.X )[lane],
+					( (const float*)&c->stepImpulse.Y )[lane],
+					( (const float*)&c->stepImpulse.Z )[lane],
 				};
 
 				int pointCount = m->pointCount;
