@@ -319,6 +319,9 @@ typedef struct b3ContinuousContext
 	b3World* world;
 	b3BodySim* fastBodySim;
 	b3Shape* fastShape;
+	// The fast shape's box where the step BEGAN. `fastShape->aabb` already holds
+	// where the sweep ends by the time the tree is queried.
+	b3AABB fastBox1;
 	b3Vec3 centroid1, centroid2;
 	b3Sweep sweep;
 	// World base for re-centering sweeps. Keeps TOI in float precision far from the origin.
@@ -416,9 +419,18 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 	// bulldozing another shoved it 0.45 m where the discrete solver alone
 	// manages metres. Resting and pushing contacts belong to the discrete
 	// solver; this one only catches what would otherwise be missed entirely.
+	//
+	// Touching where the step BEGAN. This read the fast shape's box at the END
+	// of its sweep, which overlaps the target precisely when the sweep is about
+	// to hit it — so every closing pair whose target counted as fast was called
+	// touching and skipped. And "fast" is cheap to be: a body's min extent is
+	// its thinnest shape's, so a car with one thin part is fast from a few
+	// millimetres of settling. A car at 30 m/s went 0.3 m into one that had
+	// just been set down, and the interlocked block hulls were shoved apart
+	// sideways a cell at a time for a third of a second.
 	if ( ( bodySim->flags & b3_isBullet ) && ( bodySim->flags & b3_isFast ) )
 	{
-		b3AABB a = fastShape->aabb;
+		b3AABB a = continuousContext->fastBox1;
 		b3AABB b = shape->aabb;
 		bool overlapping = a.lowerBound.x <= b.upperBound.x && b.lowerBound.x <= a.upperBound.x &&
 						   a.lowerBound.y <= b.upperBound.y && b.lowerBound.y <= a.upperBound.y &&
@@ -557,6 +569,7 @@ static void b3SolveContinuous( b3World* world, int bodySimIndex, b3TaskContext* 
 		shapeId = fastShape->nextShapeId;
 
 		context.fastShape = fastShape;
+		context.fastBox1 = fastShape->aabb;
 		context.centroid1 = b3TransformPoint( xf1, fastShape->localCentroid );
 		context.centroid2 = b3TransformPoint( xf2, fastShape->localCentroid );
 

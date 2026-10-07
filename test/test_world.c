@@ -395,6 +395,60 @@ static int TestSensor( void )
 	return 0;
 }
 
+/*
+ * A fast bullet closing on a bullet that is only settling must not pass into it.
+ *
+ * A body's min extent is its smallest shape's, so one thin part makes a few
+ * millimetres of settling count as "fast" — and a bullet is not swept against
+ * a fast bullet that it is already touching, because that pair is the discrete
+ * solver's. Whether it is already touching was asked of the incoming shape's
+ * box at the END of its sweep, which overlaps exactly when the sweep would have
+ * found an impact, so a car closing at 30 m/s on a parked one that had just
+ * settled 4 mm went 0.3 m into it, and the two block hulls were thrown apart
+ * sideways a cell at a time. Touching is a question about where the step began.
+ */
+static int BulletMeetsASettlingBullet( void )
+{
+	// Settling: a few millimetres a step, which is "fast" only because of the
+	// thin shape. Still: the control, swept against all along.
+	float settling[] = { 0.1f, 0.0f };
+	for ( int i = 0; i < 2; i++ )
+	{
+		b3WorldDef worldDef = b3DefaultWorldDef();
+		worldDef.gravity = (b3Vec3){ 0.0f, 0.0f, 0.0f };
+		b3WorldId worldId = b3CreateWorld( &worldDef );
+
+		b3BoxHull hull = b3MakeBoxHull( 2.0f, 0.5f, 1.0f );
+		b3BoxHull thin = b3MakeBoxHull( 0.002f, 0.002f, 0.002f );
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.isBullet = true;
+		bodyDef.position = (b3Pos){ 0.0f, 0.0f, 0.0f };
+		bodyDef.linearVelocity = (b3Vec3){ 0.0f, 0.0f, settling[i] };
+		b3BodyId parked = b3CreateBody( worldId, &bodyDef );
+		b3CreateHullShape( parked, &shapeDef, &hull.base );
+		b3CreateHullShape( parked, &shapeDef, &thin.base );
+
+		// Its nose 0.9 m off the parked one's tail, and 1.25 m of travel a step.
+		bodyDef.position = (b3Pos){ 4.9f, 0.0f, 0.0f };
+		bodyDef.linearVelocity = (b3Vec3){ -30.0f, 0.0f, 0.0f };
+		b3BodyId striker = b3CreateBody( worldId, &bodyDef );
+		b3CreateHullShape( striker, &shapeDef, &hull.base );
+
+		b3World_Step( worldId, 1.0f / 24.0f, 4 );
+
+		float gap = ( (float)b3Body_GetPosition( striker ).x - 2.0f ) - ( (float)b3Body_GetPosition( parked ).x + 2.0f );
+		printf( "    parked settling at %.1f m/s: the striker ends %.3f m off it\n", settling[i], gap );
+		b3DestroyWorld( worldId );
+
+		ENSURE( gap > -0.05f );
+	}
+
+	return 0;
+}
+
 static int TestContactEvents( void )
 {
 	b3WorldDef worldDef = b3DefaultWorldDef();
@@ -1169,6 +1223,7 @@ int WorldTest( void )
 	RUN_SUBTEST( TestExplosion );
 	RUN_SUBTEST( TestSensor );
 	RUN_SUBTEST( TestContinuousMoveEvent );
+	RUN_SUBTEST( BulletMeetsASettlingBullet );
 	RUN_SUBTEST( TestContactEvents );
 	RUN_SUBTEST( TestHitEvents );
 	RUN_SUBTEST( TestCompoundHitEvents );
