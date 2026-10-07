@@ -453,6 +453,14 @@ static void AddRigWheels( WheelRig* rig, int wheelCount )
 
 }
 
+int b3w_tyre_presolve( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Vec3 normal );
+
+static bool RigPreSolve( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Vec3 normal, void* context )
+{
+	(void)context;
+	return b3w_tyre_presolve( shapeIdA, shapeIdB, point, normal ) != 0;
+}
+
 static WheelRig CreateRig( float slopeRadians, int wheelCount )
 {
 	WheelRig rig;
@@ -512,6 +520,8 @@ static WheelRig CreateRig( float slopeRadians, int wheelCount )
 	b3CreateHullShape( rig.chassis, &chassisShape, &chassisBox.base );
 
 	rig.vehicle = b3w_vehicle_create( rig.world, 0, rig.chassis );
+	// The tyre's contact rule, as the shim installs it for every game world.
+	b3World_SetPreSolveCallback( rig.world, RigPreSolve, NULL );
 
 	AddRigWheels( &rig, wheelCount );
 
@@ -2326,6 +2336,93 @@ static int RebuildingAVehicleManyTimes( void )
 	return 0;
 }
 
+/**
+ * Driven at something, how high does the machine go and how far does it get?
+ *
+ * A static box `height` tall across the rig's path, its near face 1.6 m ahead —
+ * clear of the chassis floor (0.55 m) so only the tyres can meet it, the way a
+ * car's tyres meet another car's sill or wedge nose. Pushed toward it at 3 m/s
+ * by a force on the chassis, as the slope tests drive.
+ */
+static void DriveAtAStep( float height, float* rise, float* climbRate, float* travelled )
+{
+	WheelRig rig = CreateRig( 0.0f, 4 );
+	StepRig( &rig, 72 );
+
+	b3BodyDef def = b3DefaultBodyDef();
+	def.type = b3_staticBody;
+	def.position = B3_LITERAL( b3Pos ){ 3.6f, 0.5f * height, 0.0f };
+	b3BodyId step = b3CreateBody( rig.world, &def );
+	b3ShapeDef shape = b3DefaultShapeDef();
+	shape.filter.categoryBits = GROUND_CATEGORY;
+	b3BoxHull box = b3MakeBoxHull( 2.0f, 0.5f * height, 2.0f );
+	b3CreateHullShape( step, &shape, &box.base );
+
+	Vehicle* v = b3w_vehicle_get( rig.vehicle );
+	float startY = (float)b3Body_GetPosition( rig.chassis ).y;
+	float startX = (float)b3Body_GetPosition( rig.chassis ).x;
+	*rise = 0.0f;
+	*climbRate = 0.0f;
+	for ( int i = 0; i < 96; i++ )
+	{
+		b3Vec3 vel = b3Body_GetLinearVelocity( rig.chassis );
+		if ( vel.x < 3.0f )
+		{
+			float mass = b3Body_GetMass( rig.chassis );
+			b3Body_ApplyForceToCenter( rig.chassis, B3_LITERAL( b3Vec3 ){ mass * 6.0f, 0.0f, 0.0f }, true );
+		}
+		b3w_vehicle_prepare( v, RIG_TICK );
+		b3World_Step( rig.world, RIG_TICK, RIG_SUBSTEPS );
+		b3w_vehicle_place_wheels( 0 );
+		v->armed = false;
+
+		float y = (float)b3Body_GetPosition( rig.chassis ).y - startY;
+		*rise = y > *rise ? y : *rise;
+		float up = b3Body_GetLinearVelocity( rig.chassis ).y;
+		*climbRate = up > *climbRate ? up : *climbRate;
+	}
+	*travelled = (float)b3Body_GetPosition( rig.chassis ).x - startX;
+
+	b3w_vehicle_destroy_world( rig.world );
+	b3DestroyWorld( rig.world );
+}
+
+/**
+ * A step taller than a tyre can roll onto stops the machine at it, LEVEL.
+ *
+ * PhysX's acceptance (`PxVehicleUpdate.cpp`): ground is only what lies under
+ * the wheel, within 45 degrees, so a tyre meeting a step above r(1 - cos 45) —
+ * 0.12 m for this 0.4 m tyre — finds no ground in it, and its collision shape
+ * stops the machine instead. The filter this replaced took the step's top as
+ * ground the moment the tread overlapped it, and the suspension threw the
+ * machine up onto it: the pop-up onto another car's sill.
+ */
+static int AStepTooTallStopsTheMachineLevel( void )
+{
+	float rise, climbRate, travelled;
+	DriveAtAStep( 0.3f, &rise, &climbRate, &travelled );
+	printf( "    0.3 m step: rose %.3f m, fastest climb %.2f m/s, travelled %.2f m\n", rise, climbRate, travelled );
+	ENSURE( rise < 0.05f );
+	ENSURE( climbRate < 0.5f );
+	ENSURE( travelled < 2.6f );
+	return 0;
+}
+
+/**
+ * A kerb a tyre can take, it rolls over — no climb rate a player would read
+ * as being thrown, and it carries on past.
+ */
+static int AKerbItCanTakeIsRolledOver( void )
+{
+	float rise, climbRate, travelled;
+	DriveAtAStep( 0.08f, &rise, &climbRate, &travelled );
+	printf( "    0.08 m kerb: rose %.3f m, fastest climb %.2f m/s, travelled %.2f m\n", rise, climbRate, travelled );
+	ENSURE( rise > 0.05f );
+	ENSURE( travelled > 4.0f );
+	ENSURE( climbRate < 1.5f );
+	return 0;
+}
+
 int WheelRigTest( void )
 {
 	RUN_SUBTEST( ALightMachineRests );
@@ -2336,6 +2433,8 @@ int WheelRigTest( void )
 	RUN_SUBTEST( AReDerivedChassisGivesTheWheelsTheirShare );
 	RUN_SUBTEST( AHighMountedWheelStaysOffTheGround );
 	RUN_SUBTEST( DrivenBothWaysRidesTheSame );
+	RUN_SUBTEST( AStepTooTallStopsTheMachineLevel );
+	RUN_SUBTEST( AKerbItCanTakeIsRolledOver );
 	RUN_SUBTEST( DroppedOnFlatGround );
 	RUN_SUBTEST( PenetrationAcrossTickRates );
 	RUN_SUBTEST( HittingASuddenSlope );

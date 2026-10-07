@@ -176,6 +176,10 @@ static b3Shape* b3CreateShapeInternal( b3World* world, b3Body* body, b3WorldTran
 	shape->userData = def->userData;
 	shape->userShape = NULL;
 	shape->flags = 0;
+	shape->contactAnchor = b3Vec3_zero;
+	shape->hasSurfaceSpin = false;
+	shape->spinCenter = b3Vec3_zero;
+	shape->spinVelocity = b3Vec3_zero;
 	shape->flags |= def->enableSensorEvents ? b3_enableSensorEvents : 0;
 	shape->flags |= def->enableContactEvents ? b3_enableContactEvents : 0;
 	shape->flags |= def->enableCustomFiltering ? b3_enableCustomFiltering : 0;
@@ -1455,6 +1459,41 @@ void b3Shape_EnablePreSolveEvents( b3ShapeId shapeId, bool flag )
 
 	b3Shape* shape = b3GetShape( world, shapeId );
 	shape->flags = flag ? shape->flags | b3_enablePreSolveEvents : shape->flags & ~b3_enablePreSolveEvents;
+}
+
+void b3Shape_SetContactAnchor( b3ShapeId shapeId, bool enabled, b3Vec3 localPoint )
+{
+	B3_ASSERT( b3IsValidVec3( localPoint ) );
+
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	B3_REC( world, ShapeSetContactAnchor, shapeId, enabled, localPoint );
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	shape->contactAnchor = localPoint;
+	shape->flags = enabled ? shape->flags | b3_overrideContactAnchor : shape->flags & ~b3_overrideContactAnchor;
+}
+
+void b3Shape_SetSurfaceSpin( b3ShapeId shapeId, bool enabled, b3Vec3 center, b3Vec3 angularVelocity )
+{
+	B3_ASSERT( b3IsValidVec3( center ) && b3IsValidVec3( angularVelocity ) );
+
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	B3_REC( world, ShapeSetSurfaceSpin, shapeId, enabled, center, angularVelocity );
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	shape->hasSurfaceSpin = enabled;
+	shape->spinCenter = center;
+	shape->spinVelocity = angularVelocity;
 }
 
 bool b3Shape_ArePreSolveEventsEnabled( b3ShapeId shapeId )

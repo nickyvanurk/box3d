@@ -90,6 +90,8 @@ B3_REC_OP( 0x55, ShapeEnableSensorEvents, RET_NONE, ARG( SHAPEID, shape ) ARG( B
 B3_REC_OP( 0x56, ShapeEnableContactEvents, RET_NONE, ARG( SHAPEID, shape ) ARG( BOOL, flag ) )
 B3_REC_OP( 0x57, ShapeEnablePreSolveEvents, RET_NONE, ARG( SHAPEID, shape ) ARG( BOOL, flag ) )
 B3_REC_OP( 0x58, ShapeEnableHitEvents, RET_NONE, ARG( SHAPEID, shape ) ARG( BOOL, flag ) )
+B3_REC_OP( 0xF4, ShapeSetSurfaceSpin, RET_NONE, ARG( SHAPEID, shape ) ARG( BOOL, enabled ) ARG( VEC3, center ) ARG( VEC3, angularVelocity ) )
+B3_REC_OP( 0xF3, ShapeSetContactAnchor, RET_NONE, ARG( SHAPEID, shape ) ARG( BOOL, enabled ) ARG( VEC3, localPoint ) )
 B3_REC_OP( 0x59, ShapeSetSphere, RET_NONE, ARG( SHAPEID, shape ) ARG( SPHERE, sphere ) )
 B3_REC_OP( 0x5A, ShapeSetCapsule, RET_NONE, ARG( SHAPEID, shape ) ARG( CAPSULE, capsule ) )
 B3_REC_OP( 0x5B, ShapeApplyWind, RET_NONE, ARG( SHAPEID, shape ) ARG( VEC3, wind ) ARG( F32, drag ) ARG( F32, lift ) ARG( F32, maxSpeed ) ARG( BOOL, wake ) )

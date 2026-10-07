@@ -963,6 +963,22 @@ B3_API bool b3Shape_AreContactEventsEnabled( b3ShapeId shapeId );
 /// @see b3PreSolveFcn
 B3_API void b3Shape_EnablePreSolveEvents( b3ShapeId shapeId, bool flag );
 
+/// Make every contact this shape takes part in act on its body at `localPoint` (body frame)
+/// instead of where the shapes touch. The contact is still FOUND where they touch, and the
+/// other body still feels it there. This is PhysX's vehicle contact modification
+/// (`PxVehicleModifyWheelContacts`): a wheel's rigid contacts are moved to the suspension's
+/// force application point, so running a wheel into something pushes the machine the way
+/// its suspension would rather than levering it up from the bottom of the tyre.
+/// `enabled` false restores ordinary contacts.
+B3_API void b3Shape_SetContactAnchor( b3ShapeId shapeId, bool enabled, b3Vec3 localPoint );
+
+/// Give this shape's surface a spin: at a contact point p, the surface moves at
+/// `angularVelocity x (p - center)` (both in the body frame), on top of the material's
+/// tangent velocity. A tyre's tread is exactly this, and it is how PhysX's vehicle contact
+/// modification hands a rigid wheel contact the tread speed at that point
+/// (`PxVehicleModifyWheelContacts`, the wheel tangent velocity). `enabled` false removes it.
+B3_API void b3Shape_SetSurfaceSpin( b3ShapeId shapeId, bool enabled, b3Vec3 center, b3Vec3 angularVelocity );
+
 /// Returns true if pre-solve events are enabled
 B3_API bool b3Shape_ArePreSolveEventsEnabled( b3ShapeId shapeId );
 

@@ -872,6 +872,80 @@ bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Sha
 			}
 		}
 
+		// Is this contact HOLDING a body up — pushing it within 45 degrees of against
+		// gravity? Then it is support: the body standing on something rather than
+		// running into it. Support acts where it touches and carries no spin.
+		// (A wheel mounted sideways lies on the ground on its tyre: moved to its mount
+		// and turned by a flat-lying wheel's spin, that contact jittered a light
+		// machine.) The normal runs A to B: B is pushed along it, A against it.
+		bool supportA = false;
+		bool supportB = false;
+		if ( contact->manifoldCount > 0 )
+		{
+			b3Vec3 up = b3Normalize( b3Neg( world->gravity ) );
+			float upward = b3Dot( contact->manifolds[0].normal, up );
+			const float support = 0.70710678f;
+			supportA = -upward > support;
+			supportB = upward > support;
+		}
+
+		// A spinning surface (b3Shape_SetSurfaceSpin) moves at the contact at its spin
+		// about its centre. Here, where A and B are the contact's own shapes: inside the
+		// convex update a compound child may have been swapped with its partner.
+		bool spinA = shapeA->hasSurfaceSpin && !supportA;
+		bool spinB = shapeB->hasSurfaceSpin && !supportB;
+		if ( ( spinA || spinB ) && contact->manifoldCount > 0 && contact->manifolds[0].pointCount > 0 )
+		{
+			// Recomputed whole rather than added to: the mesh path never refreshes the
+			// material part, and an increment there would accumulate every update.
+			b3Vec3 materialA = b3RotateVector( xfA.q, b3GetShapeMaterials( shapeA )[0].tangentVelocity );
+			b3Vec3 materialB = b3RotateVector( xfB.q, b3GetShapeMaterials( shapeB )[0].tangentVelocity );
+			contact->tangentVelocity = b3Sub( materialA, materialB );
+
+			b3Vec3 offsetA = b3Add( centerA, contact->manifolds[0].points[0].anchorA );
+			if ( spinA )
+			{
+				b3Vec3 arm = b3Sub( offsetA, b3RotateVector( xfA.q, shapeA->spinCenter ) );
+				b3Vec3 spin = b3RotateVector( xfA.q, shapeA->spinVelocity );
+				contact->tangentVelocity = b3Add( contact->tangentVelocity, b3Cross( spin, arm ) );
+			}
+			if ( spinB )
+			{
+				b3Vec3 offsetB = b3Add( centerB, contact->manifolds[0].points[0].anchorB );
+				b3Vec3 arm = b3Sub( offsetB, b3RotateVector( xfB.q, shapeB->spinCenter ) );
+				b3Vec3 spin = b3RotateVector( xfB.q, shapeB->spinVelocity );
+				contact->tangentVelocity = b3Sub( contact->tangentVelocity, b3Cross( spin, arm ) );
+			}
+		}
+
+		// A shape that acts at a fixed point of its body (b3Shape_SetContactAnchor):
+		// found where the shapes touch, applied there on the other body, and at the
+		// anchor on this one — unless it is support. After the pre-solve, which
+		// judged the real point.
+		bool overrideA = ( shapeA->flags & b3_overrideContactAnchor ) != 0 && !supportA;
+		bool overrideB = ( shapeB->flags & b3_overrideContactAnchor ) != 0 && !supportB;
+		if ( overrideA || overrideB )
+		{
+			b3Vec3 anchorA = b3RotateVector( xfA.q, b3Sub( shapeA->contactAnchor, localCenterA ) );
+			b3Vec3 anchorB = b3RotateVector( xfB.q, b3Sub( shapeB->contactAnchor, localCenterB ) );
+			for ( int i = 0; i < contact->manifoldCount; ++i )
+			{
+				b3Manifold* manifold = contact->manifolds + i;
+				for ( int j = 0; j < manifold->pointCount; ++j )
+				{
+					b3ManifoldPoint* mp = manifold->points + j;
+					if ( overrideA )
+					{
+						mp->anchorA = anchorA;
+					}
+					if ( overrideB )
+					{
+						mp->anchorB = anchorB;
+					}
+				}
+			}
+		}
+
 		contact->flags |= b3_simTouchingFlag;
 	}
 	else

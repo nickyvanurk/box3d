@@ -21,6 +21,7 @@ typedef enum b3ShapeFlags
 	b3_enablePreSolveEvents = 0x10,
 	b3_enlargedAABB = 0x20,
 	b3_enableSpeculative = 0x40,
+	b3_overrideContactAnchor = 0x80,
 } b3ShapeFlags;
 
 typedef struct b3Shape
@@ -35,6 +36,15 @@ typedef struct b3Shape
 	float density;
 	float explosionScale;
 	float aabbMargin;
+
+	/// Body-local point this shape's contacts act at, when b3_overrideContactAnchor is set.
+	b3Vec3 contactAnchor;
+
+	/// A surface that turns about `spinCenter` at `spinVelocity` (both body frame): each
+	/// contact's surface velocity is spinVelocity x (point - spinCenter). See b3Shape_SetSurfaceSpin.
+	bool hasSurfaceSpin;
+	b3Vec3 spinCenter;
+	b3Vec3 spinVelocity;
 
 	b3AABB aabb;
 	b3AABB fatAABB;

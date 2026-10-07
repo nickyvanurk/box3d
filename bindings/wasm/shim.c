@@ -192,6 +192,7 @@ typedef struct World
  */
 static b3BodyId BodyOf( World* world, int body );
 static bool CustomFilterExclusion( b3ShapeId shapeIdA, b3ShapeId shapeIdB, void* context );
+static bool PreSolveDetectOnly( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Vec3 normal, void* context );
 static b3BodyId BodyId( int handle, int body );
 
 static World g_worlds[MAX_WORLDS];
@@ -280,6 +281,9 @@ int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableC
 	// the callback needs it to solve this world's vehicles and no others.
 	b3World_SetSubStepCallback( world->id, b3w_vehicle_substep, (void*)(uintptr_t)b3StoreWorldId( world->id ) );
 	b3World_SetCustomFilterCallback( world->id, CustomFilterExclusion, world );
+	// From the start: a tyre's contact rule lives here, and a world with no
+	// detect-only or placed body would otherwise never have one installed.
+	b3World_SetPreSolveCallback( world->id, PreSolveDetectOnly, world );
 	world->inUse = true;
 	world->bodyCount = 0;
 	world->jointCount = 0;
@@ -2253,32 +2257,14 @@ static int BodyIndexOfShape( b3ShapeId shapeId );
  * bits say. Called by Box3D only for pairs where a shape enabled custom
  * filtering, which every shape created here does.
  */
-/**
- * A TYRE: a shape a host hangs on a vehicle's chassis where a wheel rides, so
- * another machine cannot enter the wheel. It meets MOVING bodies only. The
- * ground is carried by the wheel's cast, and a shape on the chassis that also
- * touched it would be a second support fighting the suspension — and for a
- * host whose world is built of the same bodies its machines are (a frozen
- * ramp, a bridge), a category cannot say "the ground"; a body type can.
- */
-static const uint64_t TYRE_CATEGORY = 0x0010;
+/** Defined in vehicle.c: a tyre's own contact rule. */
+int b3w_tyre_presolve( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Vec3 normal );
 
-static bool IsTyreAgainstStatic( b3ShapeId tyre, b3ShapeId other )
-{
-	if ( ( b3Shape_GetFilter( tyre ).categoryBits & TYRE_CATEGORY ) == 0 )
-	{
-		return false;
-	}
-	return b3Body_GetType( b3Shape_GetBody( other ) ) == b3_staticBody;
-}
+/** A tyre shape's category (vehicle.c, B3W_TYRE_CATEGORY): nothing stands on, picks or places onto it. */
+static const uint64_t TYRE_CATEGORY = 0x0010;
 
 static bool CustomFilterExclusion( b3ShapeId shapeIdA, b3ShapeId shapeIdB, void* context )
 {
-	if ( IsTyreAgainstStatic( shapeIdA, shapeIdB ) || IsTyreAgainstStatic( shapeIdB, shapeIdA ) )
-	{
-		return false;
-	}
-
 	World* world = (World*)context;
 	int a = BodyIndexOfShape( shapeIdA );
 	int b = BodyIndexOfShape( shapeIdB );
@@ -2343,8 +2329,12 @@ void b3w_set_body_exclusion( int handle, int body, int other )
  */
 static bool PreSolveDetectOnly( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Vec3 normal, void* context )
 {
-	(void)point;
-	(void)normal;
+	// A tyre's contacts under its wheel are the suspension's (see vehicle.c). The
+	// rest go on to every other rule here, as any contact does.
+	if ( b3w_tyre_presolve( shapeIdA, shapeIdB, point, normal ) == 0 )
+	{
+		return false;
+	}
 
 	World* world = (World*)context;
 	int a = BodyIndexOfShape( shapeIdA );

@@ -375,6 +375,24 @@ typedef struct
 	 * stop cannot catch a bottoming that has already happened.
 	 */
 	b3ShapeId stopShape;
+	/**
+	 * The tyre as COLLISION, PhysX's way (`SnippetVehicleContactMod.cpp`): a shape
+	 * where the tyre is, meeting everything, whose contacts UNDER the wheel are
+	 * dropped because the suspension owns those, and whose others — another car's
+	 * door, its nose, a wall, the lip of a kerb too tall to roll onto — push the
+	 * machine at the suspension's application point and carry the tread's speed.
+	 * See `UpdateTyre` and `b3w_tyre_presolve`.
+	 *
+	 * On the CHASSIS, for the bump stop's reason: the wheel body is teleported
+	 * onto the surface every tick. PhysX moves its wheel shape with the suspension
+	 * every update; re-shaping one here throws its contacts away, so the box is
+	 * sized once to span the travel the tyre actually occupies — from fully
+	 * compressed down to its loaded ride height — and never reaches below a
+	 * loaded tread.
+	 */
+	b3ShapeId tyreShape;
+	float tyreTop;
+	float tyreBottom;
 	b3Filter stopFilter;
 	bool stopArmed;
 
@@ -512,7 +530,11 @@ typedef struct
 	 * Zero until a wheel has taken anything.
 	 */
 	float chassisMassAsLeft;
+	/** This vehicle's slot, so a tyre shape can name its wheel. */
+	int handle;
 } Vehicle;
+
+static bool MachineFilter( const Vehicle* v, b3Filter* filter );
 
 static b3Vec3 AxisVector( int index )
 {
@@ -659,6 +681,15 @@ typedef struct
 	 * pushed the car up onto it, 70 ticks before the two chassis ever touched.
 	 */
 	b3Pos hardPoint;
+	/**
+	 * Where the swept tyre starts and how far it goes, the suspension's own
+	 * down and the axle: what PhysX's acceptance test asks of a hit — see
+	 * `IsUnderTheWheel`.
+	 */
+	b3Pos castStart;
+	b3Vec3 translation;
+	b3Vec3 suspensionDown;
+	b3Vec3 axle;
 	/** How many hits the cast offered, before dedup and the three-slot cap. A
 	 *  shape cast reports the earliest hit PER SHAPE, and terrain is one mesh
 	 *  shape holding every triangle — this is how that was caught. */
@@ -724,6 +755,79 @@ static void KeepWheelHit( WheelCast* ctx, WheelHit hit )
 
 /** Defined in shim.c — the body-owner table lives with the body table. */
 uint32_t b3w_owner_of_body( int handle, int body );
+
+/**
+ * The category a tyre shape carries on top of its machine's. Nothing stands on,
+ * picks or places onto a tyre (the shim's ray queries skip it) and no wheel's
+ * sweep takes one for ground.
+ */
+#define B3W_TYRE_CATEGORY 0x0010ull
+/** How much smaller the tyre's box is than the tyre the cast carries, so the two never argue (archlab's figure). */
+static const float TYRE_CLEARANCE = 0.01f;
+/** Rubber against what it runs into — archlab's tyre friction. */
+static const float TYRE_FRICTION = 0.6f;
+/**
+ * The share of the tread's speed a rigid wheel contact is given: PhysX's
+ * WHEEL_TANGENT_VELOCITY_MULTIPLIER (`SnippetVehicleContactMod.cpp`).
+ */
+static const float TYRE_TREAD_SHARE = 0.1f;
+/** A tyre's user-data tag: which vehicle and wheel it belongs to. */
+#define B3W_TYRE_TAG 0x40000000
+
+/**
+ * PhysX's threshold for "under the wheel", as a cosine: the SDK's contact-
+ * modification sample sets both of its reject angles to 45 degrees
+ * (`SnippetVehicleContactMod.cpp`, POINT_REJECT_ANGLE and NORMAL_REJECT_ANGLE).
+ */
+static const float UNDER_THE_WHEEL_COS = 0.70710678f;
+/**
+ * Past what angle a TYRE treats a surface as something it runs into: 50
+ * degrees, five past the sweep's 45. A surface right at PhysX's boundary
+ * flipped between road and wall from tick to tick as the machine pitched — a
+ * single wheel climbing 30 degrees pitched 15 the other way and was kicked off
+ * the slope at 4 m/s. Between the two it is neither, so nothing pushes on it
+ * twice.
+ */
+static const float TYRE_WALL_COS = 0.64278761f;
+/** Two normals within 15 degrees describe the same surface. */
+static const float SAME_SURFACE_COS = 0.96592583f;
+
+/**
+ * Is this a surface the wheel ROLLS on, or something it runs INTO?
+ *
+ * PhysX's sweep acceptance (`PxVehicleUpdate.cpp`, intersectCylinderPlane),
+ * both of its tests:
+ *
+ * - the surface faces the suspension: its normal within 45 degrees of the
+ *   suspension's up;
+ * - the contact is under the wheel: the direction from the swept tyre's centre
+ *   to the contact, in the wheel's own plane, within 45 degrees of the
+ *   suspension's down.
+ *
+ * Everything else is the tyre's FRONT or side meeting something — another
+ * car's door, its wedge nose, a wall, the lip of a kerb taller than the tyre
+ * can take — and is answered by the tyre's collision shape, not by the spring.
+ * The filter this replaced accepted anything facing within 80 degrees of world
+ * up anywhere on the tyre, so a nose or a door the tread brushed became ground
+ * and the suspension threw the car up onto it.
+ */
+static bool IsUnderTheWheel( const WheelCast* ctx, b3Pos point, b3Vec3 normal, float fraction )
+{
+	if ( -b3Dot( normal, ctx->suspensionDown ) < UNDER_THE_WHEEL_COS )
+	{
+		return false;
+	}
+
+	b3Pos centre = AddPosVec( ctx->castStart, Scale( ctx->translation, fraction ) );
+	b3Vec3 toPoint = SubPos( point, centre );
+	toPoint = Sub3( toPoint, Scale( ctx->axle, b3Dot( toPoint, ctx->axle ) ) );
+	float length = b3Length( toPoint );
+	if ( length < 1.0e-6f )
+	{
+		return true;
+	}
+	return b3Dot( toPoint, ctx->suspensionDown ) >= UNDER_THE_WHEEL_COS * length;
+}
 
 static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction, uint64_t userMaterialId,
 						 int triangleIndex, int childIndex, void* context )
@@ -796,6 +900,17 @@ static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fr
 	 * wheel touching anything.
 	 */
 	if ( b3Dot( SubPos( point, ctx->hardPoint ), ctx->worldUp ) > 0.0f )
+	{
+		return -1.0f;
+	}
+
+	// Another machine's tyre is not a surface either: it is where a wheel is.
+	if ( b3Shape_GetFilter( shapeId ).categoryBits & B3W_TYRE_CATEGORY )
+	{
+		return -1.0f;
+	}
+
+	if ( !IsUnderTheWheel( ctx, point, normal, fraction ) )
 	{
 		return -1.0f;
 	}
@@ -985,6 +1100,10 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 					   .worldUp = worldUp,
 					   .minSurfaceUpFacing = cosf( w->surfaceRejectAngle ),
 					   .hardPoint = source,
+					   .castStart = castStart,
+					   .translation = Scale( direction, raylen + offset ),
+					   .suspensionDown = direction,
+					   .axle = axle,
 					   .considered = 0,
 					   .count = 0 };
 
@@ -2701,12 +2820,12 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 	stopDef.density = 0.0f;
 	stopDef.enableContactEvents = false;
 
-	b3ShapeId chassisShapes[1];
-	if ( b3Body_GetShapes( v->chassis, chassisShapes, 1 ) == 1 )
+	// The machine's own filter, so it collides with exactly what the chassis
+	// collides with and never with the machine itself — see `MachineFilter`.
+	b3Filter machine;
+	if ( MachineFilter( v, &machine ) )
 	{
-		// The machine's own filter, so it collides with exactly what the chassis
-		// collides with and never with the machine itself.
-		stopDef.filter = b3Shape_GetFilter( chassisShapes[0] );
+		stopDef.filter = machine;
 	}
 
 	// Held out of the world until a cast says it is clear of it — see
@@ -2882,6 +3001,274 @@ static void DropDeadHandles( Vehicle* v )
  * the chassis moves millimetres in one tick. Splitting it from the solve is
  * what makes solving 32 times affordable.
  */
+/**
+ * Where a wheel's centre is NOW, from the chassis as it stands: the hard point,
+ * then down the suspension by its current length. (`Wheel::center` is set once,
+ * when the wheel body is made, and judged from it a tyre measured its contacts
+ * from where the wheel started.)
+ */
+static b3Pos WheelCentreNow( const Vehicle* v, const Wheel* w, b3Vec3* down )
+{
+	b3WorldTransform t = b3Body_GetTransform( v->chassis );
+	*down = b3RotateVector( t.q, w->directionCs );
+	b3Pos hard = AddPosVec( t.p, b3RotateVector( t.q, w->chassisConnectionPointCs ) );
+	return AddPosVec( hard, Scale( *down, w->info.suspensionLength ) );
+}
+
+/**
+ * The collision filter of the MACHINE: any chassis shape that is not one of this
+ * vehicle's own bump stops or tyres.
+ *
+ * Box3D lists a body's shapes newest first, so "the chassis's first shape" was
+ * whatever the vehicle added last — for every wheel after the first, the
+ * previous wheel's bump stop, still held out of the world with a zero mask. So
+ * every bump stop after the first copied a filter that matches nothing and
+ * could never stop anything, and the first tyre shape did the same.
+ */
+static bool MachineFilter( const Vehicle* v, b3Filter* filter )
+{
+	int capacity = b3Body_GetShapeCount( v->chassis );
+	b3ShapeId stack[64];
+	b3ShapeId* shapes = capacity <= 64 ? stack : (b3ShapeId*)malloc( sizeof( b3ShapeId ) * (size_t)capacity );
+	int count = b3Body_GetShapes( v->chassis, shapes, capacity );
+	bool found = false;
+	for ( int i = 0; i < count && !found; i++ )
+	{
+		bool ours = false;
+		for ( int k = 0; k < v->wheelCount && !ours; k++ )
+		{
+			ours = B3_ID_EQUALS( shapes[i], v->wheels[k].stopShape ) || B3_ID_EQUALS( shapes[i], v->wheels[k].tyreShape );
+		}
+		if ( !ours )
+		{
+			*filter = b3Shape_GetFilter( shapes[i] );
+			found = true;
+		}
+	}
+	if ( shapes != stack )
+	{
+		free( shapes );
+	}
+	return found;
+}
+
+/**
+ * Keep a wheel's tyre shape matching the wheel, and its tread turning with it.
+ *
+ * The shape is the tyre (less the clearance) swept along the suspension from
+ * fully compressed down to LOADED — the sag the spring is rated for, `g / (n k)`, since a spring
+ * here carries `chassisMass * k * compression` and the machine's weight shares
+ * across its n wheels. Rebuilt only when that changes: re-shaping drops the
+ * shape's contacts.
+ *
+ * Its contacts act at the hard point, which is where the suspension pushes the
+ * chassis, and its surface turns at a tenth of the wheel's spin about the axle.
+ */
+static void UpdateTyre( Vehicle* v, Wheel* w, int index )
+{
+	float r = w->radius;
+	if ( r <= TYRE_CLEARANCE || w->width <= 0.0f )
+	{
+		return;
+	}
+
+	// Only a wheel that CARRIES the machine — its suspension within 45 degrees of
+	// the vehicle's down — is a wheel in PhysX's sense. One mounted sideways lies
+	// on the ground on its face; a tyre there held the chassis up while the
+	// wheel's own constraint pushed off the same ground, two supports fighting,
+	// and a light machine never came to rest.
+	b3Vec3 vehicleUp = AxisVector( v->indexUpAxis );
+	if ( -b3Dot( b3Normalize( w->directionCs ), vehicleUp ) < UNDER_THE_WHEEL_COS )
+	{
+		if ( B3_IS_NON_NULL( w->tyreShape ) && b3Shape_IsValid( w->tyreShape ) )
+		{
+			b3MassData before = b3Body_GetMassData( v->chassis );
+			b3DestroyShape( w->tyreShape, false );
+			b3Body_SetMassData( v->chassis, before );
+		}
+		w->tyreShape = b3_nullShapeId;
+		return;
+	}
+
+	float gravity = b3Length( b3World_GetGravity( v->world ) );
+	float sag = w->suspensionStiffness > 0.0f && v->wheelCount > 0
+					? gravity / ( w->suspensionStiffness * (float)v->wheelCount )
+					: 0.0f;
+	if ( sag > w->maxSuspensionTravel )
+	{
+		sag = w->maxSuspensionTravel;
+	}
+	float top = w->suspensionRestLength - w->maxSuspensionTravel - r;
+	float bottom = w->suspensionRestLength - sag + r - TYRE_CLEARANCE;
+
+	bool shaped = B3_IS_NON_NULL( w->tyreShape ) && b3Shape_IsValid( w->tyreShape );
+	if ( !shaped || fabsf( top - w->tyreTop ) > 1.0e-3f || fabsf( bottom - w->tyreBottom ) > 1.0e-3f )
+	{
+		b3Filter machine;
+		if ( !MachineFilter( v, &machine ) )
+		{
+			return;
+		}
+
+		// ROUND, as the tyre is: two treads of `TREAD_SEGMENTS` points around the
+		// axle — the shape the cast already sweeps — one where the tyre sits fully
+		// compressed and one where it sits loaded, and the hull of them: the tyre
+		// over its travel. A box was tried first and its corners stood exactly 45
+		// degrees from the hub, so a step's face read as ground under the wheel
+		// and the machine drove straight up a 0.3 m step.
+		b3Vec3 down = b3Normalize( w->directionCs );
+		b3Vec3 up = Scale( down, -1.0f );
+		b3Vec3 axle = Sub3( w->axleCs, Scale( up, b3Dot( w->axleCs, up ) ) );
+		axle = b3Normalize( axle );
+		b3Vec3 ahead = b3Cross( up, axle );
+		float tread = r - TYRE_CLEARANCE;
+		b3Vec3 points[4 * TREAD_SEGMENTS];
+		int count = 0;
+		for ( int end = 0; end < 2; end++ )
+		{
+			float along = end == 0 ? top + r : bottom - r + TYRE_CLEARANCE;
+			b3Vec3 hub = Add3( w->chassisConnectionPointCs, Scale( down, along ) );
+			for ( int i = 0; i < TREAD_SEGMENTS; i++ )
+			{
+				float a = ( 2.0f * 3.14159265358979f * (float)i ) / (float)TREAD_SEGMENTS;
+				b3Vec3 radial = Add3( Scale( ahead, tread * cosf( a ) ), Scale( up, tread * sinf( a ) ) );
+				points[count++] = Add3( Add3( hub, radial ), Scale( axle, 0.5f * w->width ) );
+				points[count++] = Add3( Add3( hub, radial ), Scale( axle, -0.5f * w->width ) );
+			}
+		}
+		b3HullData* hull = b3CreateHull( points, count, B3_MAX_HULL_VERTICES );
+		if ( hull == NULL )
+		{
+			return;
+		}
+
+		b3ShapeDef def = b3DefaultShapeDef();
+		def.density = 0.0f;
+		def.baseMaterial.friction = TYRE_FRICTION;
+		def.filter = machine;
+		def.filter.categoryBits |= B3W_TYRE_CATEGORY;
+		def.enablePreSolveEvents = true;
+		def.enableCustomFiltering = true;
+		def.userData = (void*)(intptr_t)( B3W_TYRE_TAG | ( v->handle << 12 ) | index );
+
+		// A collider, not a part of the machine: the bump stop's reason, and the
+		// same cure — a shape added to a chassis re-derives its mass.
+		b3MassData before = b3Body_GetMassData( v->chassis );
+		if ( shaped )
+		{
+			b3DestroyShape( w->tyreShape, false );
+		}
+		w->tyreShape = b3CreateHullShape( v->chassis, &def, hull );
+		b3Body_SetMassData( v->chassis, before );
+		b3DestroyHull( hull );
+
+		b3Shape_SetContactAnchor( w->tyreShape, true, w->chassisConnectionPointCs );
+		w->tyreTop = top;
+		w->tyreBottom = bottom;
+	}
+
+	// The tread: the wheel's spin about its (steered) axle, through its centre, as
+	// the body sees it — a tenth of it, as PhysX gives a rigid wheel contact.
+	// Forward is up x axle (see `forwardWs`) and a positive spin rolls that way,
+	// which puts the spin vector at -axle: the bottom of the tyre moves back.
+	b3WorldTransform chassisT = b3Body_GetTransform( v->chassis );
+	b3Vec3 spinWs = Scale( w->wheelAxleWs, -w->angularVelocity * TYRE_TREAD_SHARE );
+	b3Vec3 down;
+	b3Vec3 centre = b3InvRotateVector( chassisT.q, SubPos( WheelCentreNow( v, w, &down ), chassisT.p ) );
+	b3Shape_SetSurfaceSpin( w->tyreShape, true, centre, b3InvRotateVector( chassisT.q, spinWs ) );
+}
+
+/** The wheel a tyre shape belongs to, or NULL for any other shape. */
+static Wheel* TyreWheel( b3ShapeId shapeId, Vehicle** vehicle );
+
+/**
+ * Keep this rigid contact against a tyre, or leave it to the suspension?
+ *
+ * `PxVehicleModifyWheelContacts`, both of its tests, against the wheel where it
+ * is now:
+ *
+ * - the contact is UNDER the wheel — the direction from the wheel's centre to
+ *   the point, in the wheel's plane, within 45 degrees of the suspension's
+ *   down;
+ * - the surface pushes the wheel UP — the normal from what it hit toward the
+ *   wheel within 45 degrees of the suspension's up.
+ *
+ * Either one makes it the suspension's, and the rigid contact is dropped.
+ * Everything else is the tyre running into something, and stays.
+ *
+ * And people are never a tyre's to push: a host marks them never-ground.
+ */
+static bool KeepTyreContact( Vehicle* v, Wheel* w, b3ShapeId other, b3Pos point, b3Vec3 towardWheel )
+{
+	b3BodyId otherBody = b3Shape_GetBody( other );
+	intptr_t tagged = (intptr_t)b3Body_GetUserData( otherBody );
+	if ( tagged > 0 && b3w_owner_of_body( v->worldHandle, (int)( tagged - 1 ) ) == B3W_OWNER_NEVER_GROUND )
+	{
+		return false;
+	}
+
+	// A surface the wheel's sweep is STANDING ON this tick is the suspension's,
+	// whatever angle the tyre now sees it at. PhysX's sweep and contact tests share
+	// their thresholds so one surface can never be both; here they look from
+	// slightly different places (the sweep's swept centre, the contact's live one),
+	// and on a slope right at 45 degrees the same ground was carried by the spring
+	// AND pushed by the tyre, and threw the wheel off it. A kerb's face on the same
+	// body still meets the tyre: its normal is nowhere near the road's.
+	if ( w->info.isInContact && B3_ID_EQUALS( otherBody, w->info.groundBodyId ) )
+	{
+		int count = w->info.contactCount < B3W_MAX_CONTACTS ? w->info.contactCount : B3W_MAX_CONTACTS;
+		for ( int c = 0; c < count; c++ )
+		{
+			if ( b3Dot( w->info.contacts[c].surfaceNormalWs, towardWheel ) > SAME_SURFACE_COS )
+			{
+				return false;
+			}
+		}
+	}
+
+	b3Vec3 down;
+	b3Pos centre = WheelCentreNow( v, w, &down );
+	if ( -b3Dot( towardWheel, down ) > TYRE_WALL_COS )
+	{
+		return false;
+	}
+
+	b3Vec3 toPoint = SubPos( point, centre );
+	toPoint = Sub3( toPoint, Scale( w->wheelAxleWs, b3Dot( toPoint, w->wheelAxleWs ) ) );
+	float length = b3Length( toPoint );
+	if ( length > 1.0e-6f && b3Dot( toPoint, down ) > TYRE_WALL_COS * length )
+	{
+		return false;
+	}
+	return true;
+}
+
+/**
+ * The world's pre-solve, for tyres: -1 when neither shape is a tyre, 0 to drop
+ * the contact, 1 to keep it (the host's own rules still apply after). Box3D's
+ * normal points from A to B, so toward a tyre that is A it is reversed.
+ */
+int b3w_tyre_presolve( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Vec3 normal )
+{
+	Vehicle* va = NULL;
+	Vehicle* vb = NULL;
+	Wheel* wa = TyreWheel( shapeIdA, &va );
+	Wheel* wb = TyreWheel( shapeIdB, &vb );
+	if ( wa == NULL && wb == NULL )
+	{
+		return -1;
+	}
+	if ( wa != NULL && !KeepTyreContact( va, wa, shapeIdB, point, Scale( normal, -1.0f ) ) )
+	{
+		return 0;
+	}
+	if ( wb != NULL && !KeepTyreContact( vb, wb, shapeIdA, point, normal ) )
+	{
+		return 0;
+	}
+	return 1;
+}
+
 void b3w_vehicle_prepare( Vehicle* v, float dt )
 {
 	// Nothing to prepare against a chassis the caller has already destroyed, and
@@ -2914,6 +3301,11 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 		 b3Body_GetMass( v->chassis ) != v->chassisMassAsLeft )
 	{
 		RetakeWheelMass( v );
+	}
+
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		UpdateTyre( v, &v->wheels[i], i );
 	}
 
 	// A fresh friction budget for the tick the substeps are about to share.
@@ -3482,6 +3874,28 @@ static void FreeWheelStorage( Vehicle* v )
 	v->wheelCapacity = 0;
 }
 
+static Wheel* TyreWheel( b3ShapeId shapeId, Vehicle** vehicle )
+{
+	intptr_t tag = (intptr_t)b3Shape_GetUserData( shapeId );
+	if ( ( tag & B3W_TYRE_TAG ) == 0 )
+	{
+		return NULL;
+	}
+	int handle = (int)( ( tag & ~(intptr_t)B3W_TYRE_TAG ) >> 12 );
+	int index = (int)( tag & 0xFFF );
+	if ( handle < 0 || handle >= B3W_MAX_VEHICLES || !g_vehicles[handle].used )
+	{
+		return NULL;
+	}
+	Vehicle* v = &g_vehicles[handle];
+	if ( index >= v->wheelCount || !B3_ID_EQUALS( v->wheels[index].tyreShape, shapeId ) )
+	{
+		return NULL;
+	}
+	*vehicle = v;
+	return &v->wheels[index];
+}
+
 Vehicle* b3w_vehicle_get( int handle )
 {
 	if ( handle < 0 || handle >= B3W_MAX_VEHICLES || !g_vehicles[handle].used )
@@ -3503,6 +3917,7 @@ int b3w_vehicle_create( b3WorldId world, int worldHandle, b3BodyId chassis )
 		Vehicle* v = &g_vehicles[i];
 		memset( v, 0, sizeof( Vehicle ) );
 		v->used = true;
+		v->handle = i;
 		v->world = world;
 		v->worldHandle = worldHandle;
 		v->chassis = chassis;
@@ -3542,6 +3957,16 @@ void b3w_vehicle_destroy( int handle )
 			b3DestroyJoint( v->wheels[i].joint, false );
 		}
 		v->wheels[i].joint = b3_nullJointId;
+
+		// The tyre is ours too, on a chassis that may outlive us (a rebuild hands the
+		// same chassis a new controller). Its mass is restored as it was added.
+		if ( chassisLives && B3_IS_NON_NULL( v->wheels[i].tyreShape ) && b3Shape_IsValid( v->wheels[i].tyreShape ) )
+		{
+			b3MassData before = b3Body_GetMassData( v->chassis );
+			b3DestroyShape( v->wheels[i].tyreShape, false );
+			b3Body_SetMassData( v->chassis, before );
+		}
+		v->wheels[i].tyreShape = b3_nullShapeId;
 
 		// The wheel BODY is ours alone — nothing else destroys it — so it is
 		// still here whatever became of the chassis.
