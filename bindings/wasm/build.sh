@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Build the Box3D WASM binding.
 #
-# Emits three files into $1 (default: this directory's `dist/`):
+# Emits four files into $1 (default: this directory's `dist/`):
 #
-#   box3d.wasm   the engine
-#   box3d.mjs    emscripten's loader glue
-#   build.json   which source produced them
+#   box3d.wasm          the engine, wasm SIMD
+#   box3d-scalar.wasm   the same engine without SIMD, for browsers that refuse
+#                       the v128 opcodes; the consumer picks one at load
+#   box3d.mjs           emscripten's loader glue, shared by both
+#   build.json          which source produced them
 #
 # Consumers commit those artifacts rather than running this script, so that a
 # checkout builds with nothing but npm. `build.json` is what makes that
@@ -64,9 +66,15 @@ EXPORTS='[
 
 # NDEBUG disables Box3D's assert-heavy validation. A build with BOX3D_VALIDATE
 # active measures the validator, not the solver.
+#
+# $1 is the SIMD selection, $2 the directory to emit into. Scalar is NOT just
+# dropping -msimd128: without BOX3D_DISABLE_SIMD, core.h picks the SSE2 path on
+# wasm unconditionally. The define keeps B3_SIMD_WIDTH at 4, so the data layout
+# and every export are identical — which is why one glue file serves both.
+build() {
 emcc \
 	-O3 -flto \
-	-msimd128 -msse2 \
+	$1 \
 	-DNDEBUG \
 	-std=gnu17 \
 	-I"$ROOT/include" \
@@ -74,7 +82,7 @@ emcc \
 	"$ROOT"/src/*.c \
 	"$HERE/shim.c" \
 	"$HERE/vehicle.c" \
-	-o "$OUT/box3d.mjs" \
+	-o "$2/box3d.mjs" \
 	-s MODULARIZE=1 \
 	-s EXPORT_ES6=1 \
 	-s ENVIRONMENT=web,worker,node \
@@ -84,6 +92,21 @@ emcc \
 	-s EXPORTED_RUNTIME_METHODS='["HEAPF32","HEAP32","HEAPU8"]' \
 	-s SINGLE_FILE=0 \
 	-s FILESYSTEM=0
+}
+
+build "-msimd128 -msse2" "$OUT"
+
+SCALAR="$(mktemp -d)"
+trap 'rm -rf "$SCALAR"' EXIT
+build "-DBOX3D_DISABLE_SIMD" "$SCALAR"
+# The consumer loads either binary through the one glue file, so the two builds
+# must have emitted the same glue — if they ever differ, refuse rather than ship
+# a scalar engine behind a loader written for the other one.
+if ! cmp -s "$OUT/box3d.mjs" "$SCALAR/box3d.mjs"; then
+	echo "build.sh: the scalar build emitted different glue from the SIMD build" >&2
+	exit 1
+fi
+cp "$SCALAR/box3d.wasm" "$OUT/box3d-scalar.wasm"
 
 # Provenance or nothing. Built outside a checkout — from a `git archive` tarball,
 # say — `rev-parse` writes an empty commit and the `status` test sees no changes,
