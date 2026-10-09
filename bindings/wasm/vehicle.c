@@ -1672,6 +1672,12 @@ static void UpdateFriction( Vehicle* v, float h, float machineMass )
 		{
 			grounded++;
 		}
+		else
+		{
+			// Nothing under it to remember: a stored point may name a body the
+			// wheel lands on somewhere else entirely.
+			w->hasAnchor = false;
+		}
 	}
 
 	if ( grounded == 0 )
