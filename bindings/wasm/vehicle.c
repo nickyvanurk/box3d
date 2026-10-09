@@ -4,11 +4,13 @@
  *
  * That controller is not upstream Bullet or upstream Rapier: it carries a dozen
  * commits of this game's own development — anti-squat, suspension reject angle,
- * a direct-solve bump stop, static longitudinal friction with a position
- * anchor, airborne droop, side friction shared across grounded wheels, and not
- * driving a sleeping chassis. Every one of those exists because a car did
- * something wrong on screen, so this is a translation that preserves them
- * line for line rather than a reimplementation of "a vehicle controller".
+ * a direct-solve bump stop, airborne droop, and not driving a sleeping chassis.
+ * Every one of those exists because a car did something wrong on screen, so
+ * this is a translation that preserves them line for line rather than a
+ * reimplementation of "a vehicle controller".
+ *
+ * The TYRE is the exception: it is GTA San Andreas's, not that controller's —
+ * see `UpdateFriction`.
  *
  * It lives in C, next to the engine, because the alternative is crossing the
  * WASM boundary once per wheel per step for the shapecast alone — four to eight
@@ -59,8 +61,58 @@
  */
 static const float CONTACT_SPREAD = 0.04f;
 
-/** Below this chassis speed a wheel with no drive or brake grips longitudinally. */
+/*
+ * The tyre, after GTA San Andreas's `CVehicle::ProcessWheel` (gta-reversed,
+ * Vehicle.cpp). Read the comment on `UpdateFriction` for the model; these are
+ * its numbers.
+ */
+
+/** What is left of a tyre's grip once it has let go: kinetic over static
+ *  friction. `fTractionLoss` in handling.cfg — 0.8 on the Infernus, 0.75 to 0.9
+ *  across the ordinary cars. */
+static const float TYRE_TRACTION_LOSS = 0.8f;
+
+/** A tyre's load counts for grip up to this multiple of its share of the
+ *  machine's weight. GTA's `min(..., 2.0f)` on the adhesion's load factor: a
+ *  landing or a kerb strike presses a tyre far harder than it ever grips. */
+static const float TYRE_LOAD_CAP = 2.0f;
+
+/**
+ * The most a drivetrain may ask of a tyre, as a share of what that tyre can hold
+ * right now.
+ *
+ * GTA never asks more by construction: its handling loader divides engine
+ * acceleration among the driven wheels, and first gear then asks 0.61 of a
+ * tyre's adhesion on the Infernus and 0.91 on the Sentinel; higher gears ask
+ * 0.15-0.3. Its cars spin their wheels only in a deliberate burnout.
+ *
+ * The drivetrain here has ONE gear and machines carry any number of engines,
+ * so a light build asks for more than its tyres hold at every speed — the
+ * built-in Car asks 1.33x its grip. With an honest friction circle that is a
+ * permanent burnout: the drive spends the whole circle and nothing is left to
+ * turn with. The tyre therefore takes GTA's share itself. A real gearbox would
+ * make this the drivetrain's job; until there is one, it is this number.
+ */
+static const float TYRE_DRIVE_SHARE = 0.8f;
+
+/** A driven tyre past its grip is SPINNING rather than skidding once drive is
+ *  more than this share of what it can hold. `WS_TRAC_FRAC_LIMIT`. */
+static const float TYRE_SPIN_FRACTION = 0.3f;
+
+/** A brake past the tyre's grip locks the wheel only while it is still
+ *  rolling faster than this, m/s. GTA's 0.005 per 1/50 s step. */
+static const float TYRE_LOCK_MIN_SPEED = 0.25f;
+
+/*
+ * Static friction's memory — see `Wheel::hasAnchor`. A gripping tyre slower than
+ * STATIC_FRICTION_MAX_SPEED (m/s, at the contact) remembers where it grips and
+ * asks to undo any drift from it at STATIC_FRICTION_RATE (1/s), up to
+ * MAX_STATIC_FRICTION_SLIP (m) before it grips somewhere new.
+ */
 static const float STATIC_FRICTION_MAX_SPEED = 0.5f;
+static const float STATIC_FRICTION_RATE = 4.8f;
+static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
+
 /*
  * Error-correction RATES, in 1/s. Not fractions per step.
  *
@@ -77,7 +129,6 @@ static const float STATIC_FRICTION_MAX_SPEED = 0.5f;
  * at, so behaviour at 24 Hz is unchanged by construction and only OTHER rates
  * move — which is the whole point.
  */
-static const float STATIC_FRICTION_RATE = 4.8f;
 static const float BUMP_STOP_RATE = 14.4f;
 
 /**
@@ -139,27 +190,27 @@ static const float MAX_RECOVERY_SPEED = 3.0f;
  *  anyway levitated a parked machine 235 mm into the air. */
 static const float TYRE_TOUCH_CLEARANCE = 0.01f;
 
-
 /** How far under the tyre's radius the bump stop sits. Measured: at 5 mm it
  *  carries a parked car, at 20 mm it levers a machine over on a climb, at 50 mm
  *  most of its value is gone. */
 static const float BUMP_STOP_CLEARANCE = 0.035f;
 
-
-/** Furthest a stuck contact may drift before the tyre is treated as having slipped. */
-static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
-
-/** What is left of a tyre's sideways grip under a brake that has asked for
- *  everything the tyre can give. `ArcadeCarPhysics` uses 0.01 for its handbrake;
- *  this is the same idea, reached by how hard the brake is pulled. */
-static const float BRAKE_SIDE_GRIP = 0.5f;
-
-/** The other two transient states, from the same source: a stab of brake, and
- *  the moment after a landing. The arcade numbers are 0.5 and 0.02. */
-static const float BRAKE_PRESS_SIDE_GRIP = 0.5f;
-static const float BRAKE_PRESS_SLIPPERY_SECONDS = 0.4f;
-static const float LANDING_SIDE_GRIP = 0.1f;
-static const float LANDING_SLIPPERY_SECONDS = 0.5f;
+/**
+ * What a tyre is doing, GTA's `tWheelState`. Every state but GRIP grips with
+ * the KINETIC circle, so a tyre that has let go stays let go until what it is
+ * asked for fits inside that smaller circle again — static friction's
+ * hysteresis.
+ */
+typedef enum
+{
+	TYRE_GRIP = 0,
+	/** Past its grip, sliding. */
+	TYRE_SKID,
+	/** Past its grip under drive: the wheel outruns the road. */
+	TYRE_SPIN,
+	/** Past its grip under a brake: the wheel stops turning. */
+	TYRE_LOCK,
+} TyreState;
 
 /**
  * One place a wheel touches the world.
@@ -408,45 +459,72 @@ typedef struct
 	float suspensionRejectAngle;
 	float surfaceRejectAngle;
 
+	/** What the tyre delivered in the last substep, along and across the
+	 *  contact. Diagnostics, and what the readback publishes. */
 	float forwardImpulse;
 	float sideImpulse;
 	/**
-	 * Friction impulse already spent this TICK, across its substeps.
-	 *
-	 * The friction circle is a budget, and a budget is per tick — the tyre can
-	 * deliver so much before it breaks traction, not so much per substep. Without
-	 * carrying it, the per-substep budget (suspensionForce * h * slip) was
-	 * compared against a lateral impulse that cancels velocity and therefore has
-	 * no time scale at all: the circle broke every substep, skidInfo pinned to
-	 * ~1/32, and a car at full throttle travelled 0.9mm. This is warm starting,
-	 * and it is what makes solving 32 times equivalent to solving once.
+	 * Forward impulse delivered over the tick so far, and over the whole of the
+	 * last one. Odometry for the wheel's own spin, which is integrated once per
+	 * tick against the friction that actually reached the road. It is NOT a
+	 * friction budget: the circle is checked per substep — see `UpdateFriction`.
 	 */
-	float accumForward;
-	float accumSide;
+	float tickForwardImpulse;
+	float lastTickForwardImpulse;
 
 	float steering;
 	float engineForce;
+	/**
+	 * Brake, as a fraction of the tyre's LOAD — dimensionless, like a friction
+	 * coefficient. A brake of 0.6 can resist up to 0.6 x what the tyre presses on
+	 * the ground with; one past the tyre's grip locks the wheel.
+	 *
+	 * Load-relative because GTA's brakes are decelerations, not forces, and a
+	 * machine here can weigh anything and stand on any number of wheels: a force
+	 * tuned on a car is nothing on a tank and everything on a kart.
+	 */
 	float brake;
-
-	bool hasAnchor;
-	b3Pos staticFrictionAnchor;
-	/** The anchor in the GROUND BODY's frame, when that body moves. */
-	bool anchorOnGround;
-	b3Vec3 anchorLocal;
 
 	float clippedInvContactDotSuspension;
 	float suspensionRelativeVelocity;
 	float wheelSuspensionForce;
+	/** The load friction is sized from this substep: `wheelSuspensionForce`
+	 *  capped at TYRE_LOAD_CAP x the wheel's share of the machine's weight. */
+	float tyreLoad;
+	/** Delivered over requested in the last substep, 1 while gripping. */
 	float skidInfo;
-	/** Did the friction circle bind for this tyre this tick? */
-	bool isSliding;
+	/** Whether the tyre is holding or has let go, and how — carried across
+	 *  substeps and ticks, because grip is static until it breaks. */
+	TyreState tyreState;
+	/**
+	 * Where a GRIPPING, standing tyre is gripping, so the drift it has made from
+	 * there is part of what it asks to undo.
+	 *
+	 * The friction here is solved in the substep callback, before Box3D's joint
+	 * and contact solve, and cancels the velocity it sees; what that solve then
+	 * adds is integrated before the tyre sees it again. Box3D's own friction
+	 * needs no memory because it is iterated and warm-started inside the solve;
+	 * this one drifts. Measured without it: a two-wheeled machine resting on its
+	 * hull crept a fraction of a millimetre a tick, re-seated its wheel every 13
+	 * ticks, and never slept.
+	 *
+	 * It is static friction and nothing more. Its pull goes through the brake cap
+	 * and the friction circle with every other request, so it cannot hold past
+	 * what the tyre grips with, and it is dropped the moment the tyre stops
+	 * gripping, is driven, or moves. The old controller's anchor bypassed the
+	 * brake cap and held with the whole circle; under the leaking circle that
+	 * was ~32 of them, and nothing could push a parked car.
+	 *
+	 * In the ground body's frame when the ground moves, so a car parked on a deck
+	 * is carried with it.
+	 */
+	bool hasAnchor;
+	bool anchorOnGround;
+	b3Pos anchor;
+	b3Vec3 anchorLocal;
 	/** How much of this wheel's mass is already off the chassis, so a repeat call
 	 *  moves the difference instead of the whole thing again. */
 	float massTakenFromChassis;
-	/** Seconds left of the two transient slippery states — see `UpdateFriction`. */
-	float landedSlipperyTime;
-	float brakePressSlipperyTime;
-	bool brakeWasHeld;
 	/**
 	 * The friction of the ground under this tyre, from the shape it is standing
 	 * on. 1.0 when it is not standing on anything.
@@ -487,9 +565,6 @@ typedef struct
 	 * good for one step and no more.
 	 */
 	bool armed;
-	/** No tyre latches a static-friction anchor during the next step — see
-	 *  `b3w_vehicle_release_anchors`. Cleared, like `armed`, as it completes. */
-	bool anchorsReleased;
 	b3WorldId world;
 	/** The shim's world handle, for the body-owner table. */
 	int worldHandle;
@@ -1093,12 +1168,6 @@ static b3Vec3 GroundVelocityAt( b3BodyId ground, b3Pos point )
 	return GroundMoves( ground ) ? b3Body_GetWorldPointVelocity( ground, point ) : B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f };
 }
 
-/*
- * The static-friction anchor lives in the ground's own frame when the ground
- * moves. Carrying a world point by the ground's velocity was measured wrong by
- * about a fifth of a tick's travel, which the bias read as slip and turned into
- * a parked car creeping forward at 1.2% of the deck's speed.
- */
 static void LatchAnchor( Wheel* w, b3Pos point )
 {
 	w->hasAnchor = true;
@@ -1109,7 +1178,7 @@ static void LatchAnchor( Wheel* w, b3Pos point )
 	}
 	else
 	{
-		w->staticFrictionAnchor = point;
+		w->anchor = point;
 	}
 }
 
@@ -1119,7 +1188,7 @@ static b3Pos AnchorWs( const Wheel* w )
 	{
 		return b3Body_GetWorldPoint( w->info.groundBodyId, w->anchorLocal );
 	}
-	return w->staticFrictionAnchor;
+	return w->anchor;
 }
 
 /**
@@ -1505,194 +1574,115 @@ static float ImpulseDenominator( b3BodyId body, b3Pos pos, b3Vec3 n )
 }
 
 /**
- * The impulse that cancels a point's velocity along `normal`.
+ * The impulse that cancels the tyre's contact velocity along `dir`, relative to
+ * whatever it stands on.
  *
- * The denominator is how much that point moves along `normal` per unit impulse:
- * `1/m + n . ((I^-1 (r x n)) x r)`. It used to read `1/m + |I^-1 (r x n)|^2`,
- * which is not that quantity — it is the squared magnitude of an angular
- * velocity, and it sized every lateral tyre impulse wrong. Where the wheels sit
- * far from the centre of mass the error is large and the cancel OVERSHOOTS, so
- * each wheel reverses the velocity it was asked to remove; on four wheels
- * sharing one body the surplus lands in the least damped axis. The built-in Car
- * template, spawned and left alone, span at 0.6 rad/s for ever with all four
- * wheels gripping, and its wheels turned with it because a rolling wheel is what
- * the renderer spins. `ImpulseDenominator` above already had the right form.
+ * The denominator is how much the contact point moves along `dir` per unit
+ * impulse: `1/m + dir . ((I^-1 (r x dir)) x r)`, for the chassis and, when the
+ * ground is dynamic, for the ground too. It once read `1/m + |I^-1 (r x n)|^2`,
+ * the squared magnitude of an angular velocity, and the cancel overshot on
+ * every wheel far from the centre of mass: the built-in Car span at 0.6 rad/s
+ * for ever with all four wheels gripping.
+ *
+ * SafeInv, because both denominators are zero for a frozen chassis on static
+ * ground — a static body has no inverse mass and no inverse inertia — and 1/0
+ * here sent the whole world non-finite the moment a machine was frozen with the
+ * physgun. Zero is the physically right answer: a point no impulse can move
+ * needs none.
+ *
+ * `vel` is the contact's velocity against a moving ground (`ContactVelocity`), so
+ * a car parked on a deck doing 25 m/s is parked. A kinematic ground contributes
+ * velocity and no mass; terrain neither.
  */
-static float ResolveSingleUnilateral( b3BodyId body, b3Pos pt, b3Vec3 normal, float biasVelocity )
+static b3Vec3 ContactVelocity( const Vehicle* v, const Wheel* w )
 {
-	b3Vec3 vel = b3Body_GetWorldPointVelocity( body, pt );
-	b3Vec3 dpt = SubPos( pt, CenterOfMass( body ) );
-	b3Vec3 aj = b3Cross( dpt, normal );
-	b3Vec3 iaj = b3MulMV( WorldInvInertia( body ), aj );
-
-	float jacDiagAb = InvMass( body ) + b3Dot( normal, b3Cross( iaj, dpt ) );
-	float jacDiagAbInv = SafeInv( jacDiagAb );
-	float relVel = b3Dot( normal, vel );
-
-	float contactDamping = 0.2f;
-	return -contactDamping * ( relVel + biasVelocity ) * jacDiagAbInv;
+	b3BodyId ground = w->info.groundBodyId;
+	b3Pos p = w->info.contactPointWs;
+	b3Vec3 vel = b3Body_GetWorldPointVelocity( v->chassis, p );
+	if ( GroundIsDynamic( ground ) || GroundMoves( ground ) )
+	{
+		vel = Sub3( vel, b3Body_GetWorldPointVelocity( ground, p ) );
+	}
+	return vel;
 }
 
-static float ResolveSingleBilateral( b3BodyId body1, b3Pos pt1, b3BodyId body2, b3Pos pt2, b3Vec3 normal,
-									 float biasVelocity )
+/** `biasVelocity` is extra contact velocity along `dir` to undo — the anchor's drift. */
+static float ContactCancelImpulse( const Vehicle* v, const Wheel* w, b3Vec3 dir, b3Vec3 vel, float biasVelocity )
 {
-	b3Vec3 vel1 = b3Body_GetWorldPointVelocity( body1, pt1 );
-	b3Vec3 vel2 = b3Body_GetWorldPointVelocity( body2, pt2 );
-	b3Vec3 dvel = Sub3( vel1, vel2 );
+	b3BodyId ground = w->info.groundBodyId;
+	b3Pos p = w->info.contactPointWs;
 
-	b3Vec3 dpt1 = SubPos( pt1, CenterOfMass( body1 ) );
-	b3Vec3 dpt2 = SubPos( pt2, CenterOfMass( body2 ) );
-	b3Vec3 aj = b3Cross( dpt1, normal );
-	b3Vec3 bj = b3Cross( dpt2, Scale( normal, -1.0f ) );
-	b3Vec3 iaj = b3MulMV( WorldInvInertia( body1 ), aj );
-	b3Vec3 ibj = b3MulMV( WorldInvInertia( body2 ), bj );
-
-	// Same denominator as the unilateral case above, for two bodies. The second
-	// body's constraint normal is the negated one — `bj` is built from it — so its
-	// term is measured along -normal, or the two would subtract.
-	float jacDiagAb = InvMass( body1 ) + InvMass( body2 ) + b3Dot( normal, b3Cross( iaj, dpt1 ) ) -
-					  b3Dot( normal, b3Cross( ibj, dpt2 ) );
-	float jacDiagAbInv = SafeInv( jacDiagAb );
-	float relVel = b3Dot( normal, dvel );
-
-	float contactDamping = 0.2f;
-	return -contactDamping * ( relVel + biasVelocity ) * jacDiagAbInv;
-}
-
-/**
- * Longitudinal friction demand, UNCLAMPED.
- *
- * Whether the tyre can actually deliver it is the caller's Coulomb test — a
- * value clamped here could not be told apart from one that merely happens to
- * sit at the limit, and that distinction is what lets a tyre break traction.
- */
-static float CalcRollingFriction( b3BodyId chassis, b3BodyId ground, b3Pos contactPos, b3Vec3 dir,
-								  int numWheelsOnGround, float biasVelocity )
-{
-	float denom0 = ImpulseDenominator( chassis, contactPos, dir );
-	float denom1 = 0.0f;
-
+	float denom = ImpulseDenominator( v->chassis, p, dir );
 	if ( GroundIsDynamic( ground ) )
 	{
-		denom1 = ImpulseDenominator( ground, contactPos, dir );
+		denom += ImpulseDenominator( ground, p, dir );
 	}
 
-	/*
-	 * SafeInv, because both denominators can be zero at once.
-	 *
-	 * `ImpulseDenominator` is `1/m + n . ((I^-1 (r x n)) x r)`, and a STATIC body
-	 * contributes nothing to either term: its mass reads 0, so `InvMass` returns
-	 * 0, and its world inverse inertia is the zero matrix. `denom1` is only ever
-	 * non-zero for a DYNAMIC ground, and terrain is static. So a chassis that has
-	 * been frozen, with its wheels on the ground, divides 1 by 0 here: the
-	 * friction impulse comes back +/-Inf, or NaN when `vrel + biasVelocity` is
-	 * itself 0 and the product is 0 * Inf.
-	 *
-	 * That value is then applied to bodies, and `b3FinalizeBodiesTask` reports
-	 * `unstable` on the next step. In the game it presents as the whole world
-	 * going non-finite the moment a machine is frozen with the physgun.
-	 *
-	 * Zero is the physically right answer, not a fudge: the denominator IS how
-	 * much the contact point moves per unit impulse, so zero means the point
-	 * cannot be moved at all, and no impulse can change it. This is the same
-	 * convention `SafeInv` above already documents.
-	 */
-	float jacDiagAbInv = SafeInv( denom0 + denom1 );
-
-	b3Vec3 vel1 = b3Body_GetWorldPointVelocity( chassis, contactPos );
-	// A DYNAMIC ground keeps the velocity term it always had here; a KINEMATIC
-	// one gains it. Subtracting a dynamic ground's velocity elsewhere in the
-	// controller was tried and measured worse on a rider parked on a driven
-	// ferry, so the kinematic case alone carries the new terms.
-	b3Vec3 vel2 = GroundIsDynamic( ground ) || GroundMoves( ground ) ? b3Body_GetWorldPointVelocity( ground, contactPos )
-																	   : B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f };
-	b3Vec3 vel = Sub3( vel1, vel2 );
-	float vrel = b3Dot( dir, vel );
-
-	return -( vrel + biasVelocity ) * jacDiagAbInv / (float)numWheelsOnGround;
+	return -( b3Dot( dir, vel ) + biasVelocity ) * SafeInv( denom );
 }
 
 /**
- * Longitudinal and lateral tyre friction.
+ * The tyre model: GTA San Andreas's `CVehicle::ProcessWheel`, solved per
+ * substep the way Box3D solves its own contact friction.
  *
- * A port of `update_friction`, keeping its order: latch or release each wheel's
- * static-friction anchor, build the contact frame from the GROUND normal (not
- * the suspension axis, or drive force lifts a pitched chassis), solve lateral,
- * then longitudinal, then apply the friction circle, then apply the impulses.
- */
-/**
- * `dt` is the SUBSTEP here; `v->stepDt` is the whole tick.
+ * Per grounded wheel, every substep `h`:
  *
- * Impulses scale with the substep — a force applied 32 times must each time be
- * worth a 32nd. Position-error correction does NOT: it is a RATE, "remove this
- * fraction of the accumulated slide per second", so dividing it by the substep
- * makes it 32x stronger and then applies it 32 times. That is 1024x, and it
- * pinned the vehicle to the ground so hard that full throttle moved it 0.9mm.
+ *  - REQUEST. Sideways, the impulse that cancels the contact's sideways slip,
+ *    shared across the grounded wheels (GTA divides by `wheelsOnGround`; the
+ *    wheels are solved together, Jacobi-style, so each takes its share).
+ *    Forward, the drive force when driven; otherwise the impulse that would
+ *    stop the contact rolling, capped by the brake — and an idle wheel's brake
+ *    is a small rolling resistance, GTA's `fWheelFriction`.
+ *  - CIRCLE. The tyre can pass `mu * load * h` this substep: static `mu` while
+ *    it grips, `mu * TYRE_TRACTION_LOSS` once it has let go. Load is capped at
+ *    TYRE_LOAD_CAP x the wheel's share of the machine's weight.
+ *  - BREAK. A request outside the circle is scaled onto the KINETIC circle and
+ *    the tyre is marked SKID, SPIN (drive past it) or LOCK (brake past it). It
+ *    stays kinetic until a request fits the kinetic circle again.
+ *
+ * WHY PER SUBSTEP, with no running total. Box3D's own contacts clamp each
+ * substep's friction against that substep's normal impulse
+ * (`contact_solver.c`), so 32 substeps deliver one tick's worth of `mu*N*dt`
+ * between them — exactly. This used to keep a per-TICK budget and a running
+ * total across substeps, and on overflow scaled only the current substep's
+ * impulse: each substep then delivered close to a whole budget, up to ~32 per
+ * tick. A 6 m/s sideways shove on a player's car was gone in one tick and
+ * cutting mu eightfold barely changed it; the same car cornered at 8.5 g and
+ * accelerated at 5.5 g on tyres rated for 1.5. Nothing could be pushed.
+ *
+ * Collisions are not this function's business: the contact solver hands a
+ * struck car its velocity, and the tyres then take it back at most one circle
+ * per substep — a hard hit slides the car, a nudge does not.
+ *
+ * `h` is the substep. `machineMass` includes the wheels, which are bodies of
+ * their own.
  */
-static void UpdateFriction( Vehicle* v, float dt )
+static void UpdateFriction( Vehicle* v, float h, float machineMass )
 {
 	int numWheels = v->wheelCount;
-	if ( numWheels == 0 )
-	{
-		return;
-	}
-
-	float vehicleSpeed = fabsf( v->currentVehicleSpeed );
-	int numWheelsOnGround = 0;
+	int grounded = 0;
 
 	for ( int i = 0; i < numWheels; i++ )
 	{
 		Wheel* w = &v->wheels[i];
-		bool hasGround = w->info.groundBody >= 0;
-
-		if ( hasGround )
-		{
-			numWheelsOnGround++;
-		}
-
-		// Decided once, because BOTH friction axes need it: they are the same
-		// velocity-only constraint and drift the same way. A driven wheel is
-		// meant to travel, and a world anchor on a moving body is meaningless,
-		// so neither gets one.
-		bool groundIsDynamic = hasGround && GroundIsDynamic( w->info.groundBodyId );
-		// Speed RELATIVE TO THE GROUND. A car parked on a deck doing 25 m/s is
-		// parked, and the anchor it latches is carried along with the deck.
-		b3Vec3 groundVel = hasGround ? GroundVelocityAt( w->info.groundBodyId, w->info.contactPointWs )
-									 : B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f };
-		// The tick's own road-speed figure on still ground, exactly as before;
-		// only a moving ground needs the difference taken here.
-		float relSpeed = GroundMoves( w->info.groundBodyId )
-							 ? b3Length( Sub3( b3Body_GetLinearVelocity( v->chassis ), groundVel ) )
-							 : vehicleSpeed;
-		bool canStick = hasGround && w->engineForce == 0.0f && relSpeed < STATIC_FRICTION_MAX_SPEED &&
-						!groundIsDynamic && !v->anchorsReleased;
-
-		if ( canStick )
-		{
-			if ( !w->hasAnchor )
-			{
-				LatchAnchor( w, w->info.contactPointWs );
-			}
-
-			// A tyre sticks only up to a finite slip distance; past that it has
-			// broken traction and grips somewhere new. Without this the anchor
-			// hauls a slow vehicle back to where it stood seconds ago.
-			b3Vec3 drift = SubPos( w->info.contactPointWs, AnchorWs( w ) );
-			if ( b3Length( drift ) > MAX_STATIC_FRICTION_SLIP )
-			{
-				LatchAnchor( w, w->info.contactPointWs );
-			}
-		}
-		else
-		{
-			w->hasAnchor = false;
-		}
-
-		w->sideImpulse = 0.0f;
 		w->forwardImpulse = 0.0f;
-		w->isSliding = false;
+		w->sideImpulse = 0.0f;
+		w->skidInfo = 1.0f;
+		if ( w->info.groundBody >= 0 )
+		{
+			grounded++;
+		}
 	}
 
+	if ( grounded == 0 )
+	{
+		return;
+	}
+
+	float gravity = b3Length( b3World_GetGravity( v->world ) );
+	float loadCap = TYRE_LOAD_CAP * machineMass * gravity / (float)grounded;
+
+	// Requests and the circle, every wheel against the same velocities.
 	for ( int i = 0; i < numWheels; i++ )
 	{
 		Wheel* w = &v->wheels[i];
@@ -1701,338 +1691,96 @@ static void UpdateFriction( Vehicle* v, float dt )
 			continue;
 		}
 
-		// Build the contact frame from the real surface normal, so drive force
-		// stays in the contact plane instead of tilting with the chassis.
-		b3Vec3 surfNormalWs = w->info.groundNormalWs;
-		b3Vec3 axle = w->wheelAxleWs;
-		axle = Sub3( axle, Scale( surfNormalWs, b3Dot( axle, surfNormalWs ) ) );
+		// The contact frame from the real surface normal, so drive force stays
+		// in the contact plane instead of tilting with the chassis.
+		b3Vec3 n = w->info.groundNormalWs;
+		b3Vec3 axle = Sub3( w->wheelAxleWs, Scale( n, b3Dot( w->wheelAxleWs, n ) ) );
 		axle = TryNormalize( axle, B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f } );
+		b3Vec3 forward = TryNormalize( b3Cross( n, axle ), B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f } );
 		v->axle[i] = axle;
-		v->forwardWs[i] = TryNormalize( b3Cross( surfNormalWs, axle ), B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f } );
+		v->forwardWs[i] = forward;
 
-		// How far the anchored contact has slid sideways, as the velocity
-		// needed to undo it this step.
-		float lateralBias = 0.0f;
-		if ( w->hasAnchor )
+		// Static friction's memory, for a tyre standing still and gripping.
+		b3Vec3 vel = ContactVelocity( v, w );
+		bool standing = w->tyreState == TYRE_GRIP && w->engineForce == 0.0f && b3Length( vel ) < STATIC_FRICTION_MAX_SPEED &&
+						!GroundIsDynamic( w->info.groundBodyId );
+		if ( !standing )
 		{
-			b3Vec3 slid = SubPos( w->info.contactPointWs, AnchorWs( w ) );
-			lateralBias = b3Dot( slid, v->axle[i] ) * STATIC_FRICTION_RATE;
+			w->hasAnchor = false;
 		}
+		else if ( !w->hasAnchor || b3Length( SubPos( w->info.contactPointWs, AnchorWs( w ) ) ) > MAX_STATIC_FRICTION_SLIP )
+		{
+			LatchAnchor( w, w->info.contactPointWs );
+		}
+		b3Vec3 drift = w->hasAnchor ? SubPos( w->info.contactPointWs, AnchorWs( w ) ) : B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f };
 
-		// Against the ground's own velocity whenever it has one. A kinematic
-		// ground contributes no mass to the denominator and keeps the anchor
-		// bias, so it is the unilateral solve measured in the ground's frame.
-		if ( GroundIsDynamic( w->info.groundBodyId ) )
+		float load = w->wheelSuspensionForce < loadCap ? w->wheelSuspensionForce : loadCap;
+		w->tyreLoad = load;
+		float grip = w->frictionSlip * w->surfaceFriction * load * h;
+		float adhesion = w->tyreState == TYRE_GRIP ? grip : grip * TYRE_TRACTION_LOSS;
+
+		// How much of the slip a substep removes. 1 is a tyre that holds its
+		// line; a tracked machine runs lower so its tracks can scrub through a
+		// skid-steer. Never above 1, which would reverse the slip it cancels.
+		float stiffness = w->sideFrictionStiffness < 1.0f ? w->sideFrictionStiffness : 1.0f;
+		float side =
+			ContactCancelImpulse( v, w, axle, vel, b3Dot( drift, axle ) * STATIC_FRICTION_RATE ) * stiffness / (float)grounded;
+
+		bool driving = w->engineForce != 0.0f;
+		bool locking = false;
+		float fwd;
+		if ( driving )
 		{
-			w->sideImpulse = ResolveSingleBilateral( v->chassis, w->info.contactPointWs, w->info.groundBodyId,
-													w->info.contactPointWs, v->axle[i], 0.0f );
-		}
-		else if ( GroundMoves( w->info.groundBodyId ) )
-		{
-			w->sideImpulse = ResolveSingleBilateral( v->chassis, w->info.contactPointWs, w->info.groundBodyId,
-													w->info.contactPointWs, v->axle[i], lateralBias );
+			float limit = TYRE_DRIVE_SHARE * adhesion;
+			fwd = w->engineForce * h;
+			fwd = fwd > limit ? limit : ( fwd < -limit ? -limit : fwd );
 		}
 		else
 		{
-			w->sideImpulse =
-				ResolveSingleUnilateral( v->chassis, w->info.contactPointWs, v->axle[i], lateralBias );
-		}
-
-		w->sideImpulse *= w->sideFrictionStiffness;
-
-		/*
-		 * A braked tyre loses SIDEWAYS grip, which is what a handbrake is.
-		 *
-		 * The talk lists it — "handbrake = reduced rear tyre friction" — and it
-		 * was dropped here for measuring 0.8 degrees, because the reduction was
-		 * mild. The arcade controller in ~/dev/ArcadeCarPhysics shows what the
-		 * number wants to be: `handBrakeSlipperyK = 0.01`, a NINETY-NINE percent
-		 * cut to lateral friction, ramped in over a couple of seconds. Nothing
-		 * about slip angles or friction circles; the sideways force is simply
-		 * mostly gone while the brake is held.
-		 *
-		 * Scaled by how hard the brake is asked for against what the tyre could
-		 * hold, so a coasting car's token brake does nothing and a real one
-		 * unsticks the back of the car.
-		 */
-		/*
-		 * Transient slippery states, the way `ArcadeCarPhysics` does it.
-		 *
-		 * Three of them, each a coefficient on the sideways force that decays on
-		 * its own clock, and the SMALLEST wins — held brake, the moment a brake is
-		 * first pressed, and the moment after a landing. None of them is a slip
-		 * angle or a friction circle; they are the arcade admission that a tyre's
-		 * grip is a story about what just happened to it, not only about the load
-		 * on it right now.
-		 */
-		float sideGrip = 1.0f;
-
-		// Held brake: the handbrake. Scaled by how hard the brake is asked for
-		// against what the tyre can hold, so a coasting car's token brake does
-		// nothing and a real one unsticks the back of the car.
-		float hold = w->wheelSuspensionForce * v->stepDt * w->frictionSlip * w->surfaceFriction;
-		if ( w->brake > 0.0f && hold > 0.0f )
-		{
-			float demandRatio = w->brake * SafeInv( hold );
-			if ( demandRatio > 1.0f )
+			// GTA: a brake stronger than the tyre's grip does not cap the request
+			// — the wheel stops turning and the whole cancel goes to the circle,
+			// which is what makes a locked wheel slide rather than stop.
+			fwd = ContactCancelImpulse( v, w, forward, vel, b3Dot( drift, forward ) * STATIC_FRICTION_RATE ) / (float)grounded;
+			float brake = w->brake * load * h;
+			if ( brake > adhesion )
 			{
-				demandRatio = 1.0f;
-			}
-
-			float braked = 1.0f + demandRatio * ( BRAKE_SIDE_GRIP - 1.0f );
-			sideGrip = braked < sideGrip ? braked : sideGrip;
-		}
-
-		// The moment a brake is FIRST pressed: a short, milder loss, so a stab of
-		// brake mid-corner steps the car out before the held-brake term takes
-		// over. `brakeSlipperyK` in the arcade controller, on a rising edge.
-		bool braking = w->brake > 0.0f;
-		if ( braking && !w->brakeWasHeld )
-		{
-			w->brakePressSlipperyTime = BRAKE_PRESS_SLIPPERY_SECONDS;
-		}
-		w->brakeWasHeld = braking;
-
-		if ( w->brakePressSlipperyTime > 0.0f )
-		{
-			w->brakePressSlipperyTime -= v->stepDt;
-			float t = w->brakePressSlipperyTime * SafeInv( BRAKE_PRESS_SLIPPERY_SECONDS );
-			t = t < 0.0f ? 0.0f : t;
-			float pressed = 1.0f + t * ( BRAKE_PRESS_SIDE_GRIP - 1.0f );
-			sideGrip = pressed < sideGrip ? pressed : sideGrip;
-		}
-
-		// And after a landing: full sideways grip the instant a wheel touches is a
-		// constraint appearing under a moving machine, which is what snaps a car
-		// sideways when it comes down on one corner.
-		if ( !w->info.isInContact )
-		{
-			w->landedSlipperyTime = LANDING_SLIPPERY_SECONDS;
-		}
-		else if ( w->landedSlipperyTime > 0.0f )
-		{
-			w->landedSlipperyTime -= v->stepDt;
-			float t = w->landedSlipperyTime * SafeInv( LANDING_SLIPPERY_SECONDS );
-			t = t < 0.0f ? 0.0f : t;
-			// Smoothstep, so grip returns without a step in it.
-			t = t * t * t * ( t * ( t * 6.0f - 15.0f ) + 10.0f );
-			float landed = 1.0f + t * ( LANDING_SIDE_GRIP - 1.0f );
-			sideGrip = landed < sideGrip ? landed : sideGrip;
-		}
-
-		w->sideImpulse *= sideGrip;
-
-		/*
-		 * Share the lateral cancel across wheels ONLY at rest.
-		 *
-		 * Side friction is solved Jacobi-style — every grounded wheel computes
-		 * against the same pre-impulse velocity — so N wheels over-correct the
-		 * shared lateral DOF by ~N. Dividing always is the safe answer and it is
-		 * what shipped, but it also makes the tyre STIFFNESS-limited: the summed
-		 * impulse is small enough that the friction circle rarely binds, and a
-		 * long machine feels like it is on ice. Nick reported exactly that, on
-		 * both the car and the tank.
-		 *
-		 * Left undivided while moving, the impulses saturate against the circle
-		 * instead, so the tyre is GRIP-limited — it holds everything mu*N allows
-		 * and slides past it. That is the behaviour he tested and kept, and it
-		 * leaves a tank's differential steering intact: more engine speed turns
-		 * faster, and lifting the throttle pivots it.
-		 *
-		 * At rest there is no circle to clamp against, and the over-correction
-		 * shows up as creep — a parked tank walked 7.3 cm against a 5 cm limit.
-		 * So the share is applied below the same speed the static-friction
-		 * anchor already uses to decide a wheel is standing still, rather than
-		 * introducing a second idea of "stopped".
-		 */
-		/*
-		 * Side friction is solved Jacobi-style — every grounded wheel computes
-		 * against the same pre-impulse velocity — so N wheels over-correct the
-		 * shared lateral DOF by ~N. Sharing the cancel is what keeps the summed
-		 * impulse right for any wheel count.
-		 *
-		 * Tried and REVERTED: leaving them undivided while moving, on the theory
-		 * that saturating the friction circle would feel grippier. It does, and
-		 * it also inflates the LATERAL term of that same circle by ~N — so a
-		 * sustained turn spends the entire grip budget sideways and starves the
-		 * drive. Holding W and D, a car settled to 1.1 m/s and stayed there;
-		 * with the share restored it circles at 16.1. Nick reported it as tight
-		 * loops slowly coming to a halt.
-		 *
-		 * Grip belongs in the tuning constants, not in an over-correction:
-		 * VEHICLE_SIDE_FRICTION_STIFFNESS_CAR / _TANK are the knobs. This also
-		 * matches what the coupled dense solve produced when it was tried — the
-		 * share is a good approximation of solving the wheels together, not a
-		 * fudge around it.
-		 */
-		w->sideImpulse /= (float)numWheelsOnGround;
-	}
-
-	float sideFactor = 1.0f;
-	/*
-	 * 0.5, as Bullet and Rapier both have it, and REVERTED here after trying 1.0.
-	 *
-	 * 1.0 is the physically honest number — the circle bounds the tyre's total
-	 * force at mu*N whichever way it points. But the game's drive force is
-	 * larger than its own grip (4000 N against mu*N of about 3015 on the Car),
-	 * so an honest circle leaves the tyre permanently SATURATED, and a saturated
-	 * tyre scales `sideImpulse` down by skidInfo along with the forward one.
-	 * Accelerating then eats the lateral grip: Nick reported the car sliding
-	 * "like I'm on ice" and unable to hold a straight line, within minutes.
-	 *
-	 * The honest fix is not this constant — it is that full throttle should not
-	 * ask for more than the tyres can deliver, which is a tuning decision about
-	 * VEHICLE_ENGINE_FORCE and not mine to take. Until then 0.5 keeps the circle
-	 * off the everyday case, and the top-speed taper is what stops the rollover.
-	 */
-	float fwdFactor = 0.5f;
-	bool sliding = false;
-
-	for ( int i = 0; i < numWheels; i++ )
-	{
-		Wheel* w = &v->wheels[i];
-		float rollingFriction = 0.0f;
-		bool hasGround = w->info.groundBody >= 0;
-
-		if ( hasGround )
-		{
-			if ( w->engineForce != 0.0f )
-			{
-				rollingFriction = w->engineForce * dt;
+				locking = fabsf( b3Dot( forward, vel ) ) > TYRE_LOCK_MIN_SPEED;
 			}
 			else
 			{
-				// A brake resists ROTATION; the ground resists SLIDING. They are
-				// different limits and conflating them is why a parked car ran
-				// away downhill: an idle vehicle carries a token brake
-				// (VEHICLE_BRAKE_FORCE, 0.5), and capping the hold at that meant
-				// a stationary tyre could resist half a newton-second while
-				// gravity pulled with a hundred. Measured on a 20 degree slope,
-				// a parked car slid 342 m in 20 s; on 10 degrees, half a metre.
-				//
-				// So a STATIONARY tyre — anchored, undriven, on static ground —
-				// is held by its friction circle, the same limit the combined
-				// impulse is tested against below. A ROLLING one still decays
-				// only as fast as the brake allows, which is what keeps coasting
-				// feeling like coasting.
-				//
-				// Still gated on a brake being asked for at all: the game zeroes
-				// the brake for thruster-driven craft (`hasActiveThruster`), and
-				// that zero is what keeps a free wheel from becoming an immovable
-				// anchor and pinning them in place.
-				/*
-				 * A tyre can never deliver more than its grip, braking included.
-				 *
-				 * This took the LARGER of the brake and the grip, so any brake
-				 * number above the tyre's budget let the wheel cancel the car's
-				 * whole forward velocity outright — braking was a constraint, not
-				 * a force. Measured on the builtin Car from 24 m/s: stopped in
-				 * 0.21 s over 2.2 m, peaking at 16.6 g. A real car manages about
-				 * 1 g and these tyres about 1.5; 16.6 is not a value physics can
-				 * produce, and it is why braking felt like hitting a wall.
-				 *
-				 * A STATIONARY anchored tyre is still held by its full grip —
-				 * that is what stops a parked car sliding downhill, and it is a
-				 * limit rather than a licence, so it stays.
-				 */
-				// dt is the SUBSTEP, not the tick. This budget caps an impulse
-				// applied on every one of the 32 substeps, so charging it a whole
-				// tick's worth each time let a tyre deliver 32 times its own grip.
-				float grip = w->wheelSuspensionForce * dt * w->frictionSlip * w->surfaceFriction;
-				float maxImpulse = w->brake < grip ? w->brake : grip;
-				if ( w->hasAnchor && w->brake > 0.0f )
-				{
-					maxImpulse = grip;
-				}
-
-				float biasVelocity = 0.0f;
-				if ( w->hasAnchor )
-				{
-					b3Vec3 slid = SubPos( w->info.contactPointWs, AnchorWs( w ) );
-					biasVelocity = b3Dot( slid, v->forwardWs[i] ) * STATIC_FRICTION_RATE;
-				}
-
-				float demand = CalcRollingFriction( v->chassis, w->info.groundBodyId, w->info.contactPointWs,
-													v->forwardWs[i], numWheelsOnGround > 0 ? numWheelsOnGround : 1,
-													biasVelocity );
-
-				// Coulomb: the tyre sticks only while what it is asked to
-				// deliver stays inside the friction circle. Past that it BREAKS
-				// — it slides, and only the brake still resists. Clamping here
-				// instead would make the wheel a permanent handbrake.
-				if ( fabsf( demand ) <= maxImpulse )
-				{
-					rollingFriction = demand;
-				}
-				else
-				{
-					// The tyre has broken traction, so what it still delivers is the
-					// CLAMPED impulse — never the raw brake number. Using w->brake
-					// here meant exceeding the limit applied more force than the
-					// limit allowed, so tightening the cap made braking harsher
-					// instead of gentler: 16.6 g became 28.1 g.
-					rollingFriction = ( demand < 0.0f ? -1.0f : 1.0f ) * maxImpulse;
-					w->hasAnchor = false;
-				}
+				fwd = fwd > brake ? brake : ( fwd < -brake ? -brake : fwd );
 			}
 		}
 
-		w->forwardImpulse = 0.0f;
-		w->skidInfo = 1.0f;
-
-		if ( hasGround )
+		float demand = sqrtf( fwd * fwd + side * side );
+		if ( demand <= adhesion )
 		{
-			// The budget is the whole tick's, because what it is being compared
-			// against is: the lateral solve cancels velocity outright and the
-			// longitudinal impulses accumulate over the substeps to engineForce
-			// times the tick. Both sides of this test are now tick-scale.
-			// Tyre grade times what it is standing on, times the load it carries —
-			// the talk's "multiply tire friction by surface friction", then "multiply
-			// this coefficient by the normal force to obtain the maximum friction
-			// force". The surface half was missing, so every ground drove like every
-			// other and a mud slope gripped exactly like tarmac.
-			float maxImp = w->wheelSuspensionForce * v->stepDt * w->frictionSlip * w->surfaceFriction;
-			float maxImpSquared = maxImp * maxImp;
-
-			w->forwardImpulse = rollingFriction;
-
-			float x = ( w->accumForward + w->forwardImpulse ) * fwdFactor;
-			// Lateral IS accumulated, and testing the alternative is how I know:
-			// charging only the current substep's lateral impulse pinned the car
-			// again (0.5mm at full throttle). Both terms describe grip the tick
-			// has committed, so both belong in the same running total.
-			float y = ( w->accumSide + w->sideImpulse ) * sideFactor;
-			float impulseSquared = x * x + y * y;
-
-			if ( impulseSquared > maxImpSquared )
-			{
-				sliding = true;
-				w->isSliding = true;
-				float factor = maxImp * SafeInv( sqrtf( impulseSquared ) );
-				w->skidInfo *= factor;
-			}
+			w->tyreState = TYRE_GRIP;
 		}
-	}
-
-	if ( sliding )
-	{
-		for ( int i = 0; i < numWheels; i++ )
+		else
 		{
-			Wheel* w = &v->wheels[i];
-			// Also diverges: upstream additionally requires `sideImpulse != 0`,
-			// which skips the clamp for a wheel driving dead straight — the one
-			// case where the whole friction budget is being spent forwards.
-			if ( w->skidInfo < 1.0f )
+			if ( locking )
 			{
-				// The friction circle just said this tyre is past what it can
-				// hold, so it is no longer stuck to the point it latched.
-				// Without releasing here, a craft pushed sideways is pinned by a
-				// hold that can never yield.
-				w->hasAnchor = false;
-				w->forwardImpulse *= w->skidInfo;
-				w->sideImpulse *= w->skidInfo;
+				w->tyreState = TYRE_LOCK;
 			}
+			else if ( driving && fabsf( fwd ) > TYRE_SPIN_FRACTION * adhesion )
+			{
+				w->tyreState = TYRE_SPIN;
+			}
+			else
+			{
+				w->tyreState = TYRE_SKID;
+			}
+
+			float scale = grip * TYRE_TRACTION_LOSS / demand;
+			fwd *= scale;
+			side *= scale;
+			w->skidInfo = scale;
+			w->hasAnchor = false;
 		}
+
+		w->forwardImpulse = fwd;
+		w->sideImpulse = side;
 	}
 
 	/*
@@ -2057,7 +1805,7 @@ static void UpdateFriction( Vehicle* v, float dt )
 			continue;
 		}
 
-		float budget = w->rollingResistance * w->wheelSuspensionForce * dt;
+		float budget = w->rollingResistance * w->wheelSuspensionForce * h;
 		if ( budget <= 0.0f )
 		{
 			continue;
@@ -2096,15 +1844,11 @@ static void UpdateFriction( Vehicle* v, float dt )
 		}
 		if ( w->sideImpulse != 0.0f )
 		{
-			b3Vec3 sideImpulse = Scale( v->axle[i], w->sideImpulse );
-			b3Pos sidePoint =
-				AddPosVec( contactPoint, Scale( chassisUp, -toContactUp * ( 1.0f - w->rollInfluence ) ) );
-			b3Body_ApplyLinearImpulse( v->chassis, sideImpulse, sidePoint, false );
+			b3Pos sidePoint = AddPosVec( contactPoint, Scale( chassisUp, -toContactUp * ( 1.0f - w->rollInfluence ) ) );
+			b3Body_ApplyLinearImpulse( v->chassis, Scale( v->axle[i], w->sideImpulse ), sidePoint, false );
 		}
 
-		// Spent, so the next substep sees what this tick has already used.
-		w->accumForward += w->forwardImpulse;
-		w->accumSide += w->sideImpulse;
+		w->tickForwardImpulse += w->forwardImpulse;
 	}
 }
 
@@ -3635,18 +3379,15 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 		UpdateTyre( v, &v->wheels[i], i );
 	}
 
-	// A fresh friction budget for the tick the substeps are about to share.
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
-		v->wheels[i].accumForward = 0.0f;
-		v->wheels[i].accumSide = 0.0f;
-		for ( int c = 0; c < B3W_MAX_CONTACTS; c++ )
-		{
-			// The accumulation MUST be reset. Left running across ticks it is a
-			// total with nothing to discharge it — measured at 1,734,543 N on a
-			// vehicle weighing 2,250.
-			v->wheels[i].info.contacts[c].normalImpulse = 0.0f;
-		}
+		// What the last tick's substeps delivered, for the wheel spin below.
+		v->wheels[i].lastTickForwardImpulse = v->wheels[i].tickForwardImpulse;
+		v->wheels[i].tickForwardImpulse = 0.0f;
+
+		// The accumulation MUST be reset. Left running across ticks it is a total
+		// with nothing to discharge it — measured at 1,734,543 N on a vehicle
+		// weighing 2,250.
 		for ( int c = 0; c < B3W_MAX_CONTACTS; c++ )
 		{
 			v->wheels[i].info.contacts[c].normalImpulse = 0.0f;
@@ -3866,18 +3607,22 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 		 * differentials, the slip feedback loop — needs this number to be able
 		 * to disagree with the chassis.
 		 */
-		float driveTorque = w->engineForce * w->radius;
-		// forwardImpulse is what the contact actually delivered over the tick;
-		// as a force it is the reaction the ground applied back to the tyre.
-		float frictionTorque = ( w->forwardImpulse * SafeInv( dt ) ) * w->radius;
-
-		w->angularVelocity += ( driveTorque - frictionTorque ) * SafeInv( w->inertia ) * dt;
+		// Drive, and what the road actually took of it over the last tick. Both
+		// are measured along the friction frame's forward, `cross(n, axle)`,
+		// which is the OPPOSITE of the direction a positive spin rolls,
+		// `cross(axle, n)` below — so the torque on the wheel is the negated
+		// difference. Unnegated, a tyre that could not pass all its drive to the
+		// road span BACKWARDS, ran into the drivetrain's overspeed gate at
+		// minus its rev limit, and lost its drive mid-corner. The leaking
+		// friction circle hid it: it almost never let a driven tyre slip.
+		float unspent = w->engineForce - w->lastTickForwardImpulse * SafeInv( dt );
+		w->angularVelocity -= unspent * w->radius * SafeInv( w->inertia ) * dt;
 
 		if ( w->brake > 0.0f )
 		{
 			// A brake resists rotation and cannot reverse it, so it is clamped
 			// at the speed that brings the wheel to a stop this tick.
-			float brakeDeltaV = ( w->brake * w->radius ) * SafeInv( w->inertia ) * dt;
+			float brakeDeltaV = ( w->brake * w->tyreLoad * w->radius ) * SafeInv( w->inertia ) * dt;
 			float magnitude = fabsf( w->angularVelocity );
 			if ( brakeDeltaV > magnitude )
 			{
@@ -3914,13 +3659,6 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 			// The spin a rolling tyre would have at this ground speed.
 			float rollingOmega = b3Dot( fwd, vel ) * SafeInv( w->radius );
 
-			// A tyre that still has grip is coupled to the ground: the talk's
-			// "apply an opposing braking force to the wheel's angular velocity so
-			// it slows toward the rotational velocity required by the vehicle's
-			// movement". skidInfo is exactly how much of the friction circle is
-			// left, so it is how hard that coupling pulls — at full grip the
-			// wheel is dragged onto the rolling speed within the tick, and a tyre
-			// that has broken traction is left to spin.
 			// A tyre that has NOT broken traction is locked to the ground — the
 			// talk's "with the clutch applied, the wheels and motor are directly
 			// linked". Relaxing toward the rolling speed instead of onto it left
@@ -3931,15 +3669,22 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 			//
 			// Only once the friction circle has been exceeded is the wheel allowed
 			// to run away from the ground, and then by exactly how much grip it
-			// has lost.
+			// has lost: only a SPINNING tyre outruns the road, pulled back toward it
+			// by how much of its request the circle still delivered. A LOCKED
+			// wheel does not turn — GTA's `WHEEL_STATE_FIXED` — and one skidding
+			// sideways still rolls with the road beneath it.
 			float grip = w->skidInfo > 1.0f ? 1.0f : ( w->skidInfo < 0.0f ? 0.0f : w->skidInfo );
-			if ( !w->isSliding )
+			if ( w->tyreState == TYRE_LOCK )
 			{
-				w->angularVelocity = rollingOmega;
+				w->angularVelocity = 0.0f;
+			}
+			else if ( w->tyreState == TYRE_SPIN )
+			{
+				w->angularVelocity += ( rollingOmega - w->angularVelocity ) * grip;
 			}
 			else
 			{
-				w->angularVelocity += ( rollingOmega - w->angularVelocity ) * grip;
+				w->angularVelocity = rollingOmega;
 			}
 		}
 
@@ -4037,7 +3782,7 @@ void b3w_vehicle_solve( Vehicle* v, float h )
 		SolveWheelContacts( v, w, h );
 	}
 
-	UpdateFriction( v, h );
+	UpdateFriction( v, h, machineMass );
 }
 
 // ---------------------------------------------------------------------------
@@ -4097,7 +3842,6 @@ void b3w_vehicle_disarm_world( b3WorldId world )
 		if ( g_vehicles[i].used && b3StoreWorldId( g_vehicles[i].world ) == stepped )
 		{
 			g_vehicles[i].armed = false;
-			g_vehicles[i].anchorsReleased = false;
 		}
 	}
 }
@@ -4381,34 +4125,6 @@ void b3w_vehicle_set_velocity( int handle, float vx, float vy, float vz, float w
 		// to roll cars onto their roofs in the rear-end and t-bone stagings.
 		b3Vec3 arm = SubPos( b3Body_GetPosition( w->body ), b3Body_GetPosition( v->chassis ) );
 		b3Body_SetLinearVelocity( w->body, Add3( linear, b3Cross( angular, arm ) ) );
-	}
-}
-
-/**
- * The machine was MOVED, not driven: let every tyre grip wherever it now is.
- *
- * A parked tyre latches the point it stands on and hauls the car back to it
- * for any slip under `MAX_STATIC_FRICTION_SLIP`. That is right for a car the
- * solver moves and wrong for one the host moves: a network correction closes a
- * gap a centimetre a tick, every centimetre was pulled straight back, and a
- * remote car at rest sat a quarter metre from where its owner had it,
- * indefinitely.
- *
- * For the WHOLE next step, not only its first substep: friction is solved
- * every substep, and a tyre that re-latched in the first one held the car
- * against the rest of the step's motion. Latched again on the step after.
- */
-void b3w_vehicle_release_anchors( int handle )
-{
-	if ( handle < 0 || handle >= B3W_MAX_VEHICLES || !IsVehicleLive( &g_vehicles[handle] ) )
-	{
-		return;
-	}
-	Vehicle* v = &g_vehicles[handle];
-	v->anchorsReleased = true;
-	for ( int i = 0; i < v->wheelCount; i++ )
-	{
-		v->wheels[i].hasAnchor = false;
 	}
 }
 
