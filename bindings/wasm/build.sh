@@ -53,7 +53,7 @@ EXPORTS='[
 	"_b3w_vehicle_read_wheels","_b3w_vehicle_wheel_count","_b3w_vehicle_wheel_capacity","_b3w_vehicle_set_owner","_b3w_body_set_owner","_b3w_body_set_bullet","_b3w_set_detect_only",
 	"_b3w_vehicle_set_up_axis","_b3w_vehicle_up_axis","_b3w_vehicle_wheel_direction","_b3w_vehicle_wheel_mass",
 	"_b3w_vehicle_set_engine_force","_b3w_vehicle_set_brake","_b3w_vehicle_set_steering",
-	"_b3w_vehicle_set_side_friction","_b3w_vehicle_set_friction_slip",
+	"_b3w_vehicle_set_side_friction","_b3w_vehicle_set_friction_slip","_b3w_vehicle_set_drive_share",
 	"_b3w_vehicle_set_suspension_stiffness","_b3w_vehicle_set_suspension_compression",
 	"_b3w_vehicle_set_suspension_relaxation","_b3w_vehicle_set_suspension_rest_length",
 	"_b3w_vehicle_set_max_suspension_travel","_b3w_vehicle_set_max_suspension_force",

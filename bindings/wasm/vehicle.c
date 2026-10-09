@@ -93,7 +93,7 @@ static const float TYRE_LOAD_CAP = 2.0f;
  * turn with. The tyre therefore takes GTA's share itself. A real gearbox would
  * make this the drivetrain's job; until there is one, it is this number.
  */
-static const float TYRE_DRIVE_SHARE = 0.8f;
+static const float TYRE_DRIVE_SHARE = 0.8f; // the default; see `Wheel::driveShare`
 
 /** A driven tyre past its grip is SPINNING rather than skidding once drive is
  *  more than this share of what it can hold. `WS_TRAC_FRAC_LIMIT`. */
@@ -327,6 +327,10 @@ typedef struct
 	float frictionSlip;
 	float sideFrictionStiffness;
 	float maxSuspensionForce;
+	/** TYRE_DRIVE_SHARE for this wheel; settable so the game can choose it. A share
+	 *  past `1 / TYRE_TRACTION_LOSS` never binds: drive is then free to spin the
+	 *  tyre, GTA's burnout. */
+	float driveShare;
 
 	/**
 	 * The wheel's own rigid body.
@@ -1737,7 +1741,7 @@ static void UpdateFriction( Vehicle* v, float h, float machineMass )
 		float fwd;
 		if ( driving )
 		{
-			float limit = TYRE_DRIVE_SHARE * adhesion;
+			float limit = w->driveShare * adhesion;
 			fwd = w->engineForce * h;
 			fwd = fwd > limit ? limit : ( fwd < -limit ? -limit : fwd );
 		}
@@ -4224,6 +4228,7 @@ int b3w_vehicle_add_wheel( int handle, float cx, float cy, float cz, float dx, f
 	w->inertia = 0.0f; // derived from the radius on first use
 	w->sideFrictionStiffness = 1.0f;
 	w->frictionSlip = 10.5f;
+	w->driveShare = TYRE_DRIVE_SHARE;
 	w->maxSuspensionForce = 6000.0f;
 
 	w->rollInfluence = 0.1f;
@@ -4309,6 +4314,7 @@ void b3w_vehicle_set_steering( int handle, int index, float value )
 }
 WHEEL_SETTER( b3w_vehicle_set_side_friction, sideFrictionStiffness )
 WHEEL_SETTER( b3w_vehicle_set_friction_slip, frictionSlip )
+WHEEL_SETTER( b3w_vehicle_set_drive_share, driveShare )
 /**
  * The rates, which have to reach the JOINT and not just the struct.
  *
