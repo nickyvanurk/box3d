@@ -2769,6 +2769,21 @@ void b3w_body_set_bullet( int handle, int body, int flag )
 	b3Body_SetBullet( BodyOf( world, body ), flag != 0 );
 }
 
+// Lets one body turn faster than a quarter turn per step. Box3D clamps every
+// body's angular speed to B3_MAX_ROTATION * inv_dt so a fast spinner cannot
+// tunnel through what it sweeps; a rotor head has to spin past that to be a
+// rotor at all, and is the only body the game asks this for.
+void b3w_body_allow_fast_rotation( int handle, int body, int flag )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+
+	b3Body_AllowFastRotation( BodyOf( world, body ), flag != 0 );
+}
+
 void b3w_body_set_owner( int handle, int body, unsigned int owner )
 {
 	World* world = GetWorld( handle );
