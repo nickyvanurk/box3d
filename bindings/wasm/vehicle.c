@@ -143,9 +143,6 @@ static const float TYRE_TOUCH_CLEARANCE = 0.01f;
  *  most of its value is gone. */
 static const float BUMP_STOP_CLEARANCE = 0.035f;
 
-/** How far inside the tread the wheel body's extent shape sits. */
-static const float WHEEL_SHAPE_CLEARANCE = 0.06f;
-
 
 /** Furthest a stuck contact may drift before the tyre is treated as having slipped. */
 static const float MAX_STATIC_FRICTION_SLIP = 0.05f;
@@ -241,6 +238,8 @@ typedef struct
 	int contactCount;
 	/** Hits the cast offered this tick, before dedup and the three-slot cap. */
 	int considered;
+	/** The sweep met terrain this tick, whether or not it took any as ground. */
+	bool terrainNear;
 	/** Body index of the ground for reporting, or -1. */
 	int groundBody;
 	/** The ground body itself, so the dynamic-ground branches never look one up. */
@@ -391,6 +390,12 @@ typedef struct
 	 * loaded tread.
 	 */
 	b3ShapeId tyreShape;
+	/**
+	 * The tread on the wheel BODY, and whether it is meeting terrain this tick.
+	 * See `UpdateTread`.
+	 */
+	b3ShapeId treadShape;
+	bool treadOn;
 	float tyreTop;
 	float tyreBottom;
 	b3Filter stopFilter;
@@ -694,6 +699,8 @@ typedef struct
 	 *  shape cast reports the earliest hit PER SHAPE, and terrain is one mesh
 	 *  shape holding every triangle — this is how that was caught. */
 	int considered;
+	/** Whether the sweep met TERRAIN at all, taken or refused — see `UpdateTread`. */
+	bool metTerrain;
 	int count;
 	WheelHit hits[B3W_MAX_CONTACTS];
 } WheelCast;
@@ -776,6 +783,20 @@ static const float TYRE_FRICTION = 0.6f;
 static const float TYRE_TREAD_SHARE = 0.1f;
 /** A tyre's user-data tag: which vehicle and wheel it belongs to. */
 #define B3W_TYRE_TAG 0x40000000
+/** A tread's tag (the collider on the wheel body itself): same layout. */
+#define B3W_TREAD_TAG 0x20000000
+
+/** The world's ground: what a tyre may never touch and a tread touches alone. */
+static bool IsTerrainShape( b3ShapeId shapeId )
+{
+	b3ShapeType type = b3Shape_GetType( shapeId );
+	return type == b3_meshShape || type == b3_heightShape || type == b3_compoundShape;
+}
+
+static bool IsTread( b3ShapeId shapeId )
+{
+	return ( (intptr_t)b3Shape_GetUserData( shapeId ) & B3W_TREAD_TAG ) != 0;
+}
 
 /**
  * PhysX's threshold for "under the wheel", as a cosine: the SDK's contact-
@@ -879,6 +900,13 @@ static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fr
 		{
 			return -1.0f;
 		}
+	}
+
+	// Terrain is noted before any of the tests below can refuse it: refused
+	// terrain is exactly what the tread exists for.
+	if ( IsTerrainShape( shapeId ) )
+	{
+		ctx->metTerrain = true;
 	}
 
 	// Drivability is a world-space property of the surface, so it compares
@@ -1157,6 +1185,7 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 	w->info.groundBody = -1;
 	w->info.groundBodyId = b3_nullBodyId;
 	w->info.considered = cast.considered;
+	w->info.terrainNear = cast.metTerrain;
 	w->info.contactCount = 0;
 	w->surfaceFriction = 1.0f;
 
@@ -2148,7 +2177,16 @@ static void PlaceWheels( Vehicle* v )
 			 * business and the suspension's: moving it here as well put a parked
 			 * car's tyre 234 mm above the ground, because a cast that misses for
 			 * one tick would then yank the wheel out to full droop.
+			 *
+			 * Not while the TREAD is standing it on terrain: then the wheel is a
+			 * body resting on the ground, and turning a polygonal tread in place
+			 * under it changes which corner is down by up to 7 mm, every tick —
+			 * a machine lying on its side jittered and crawled 13 cm in 5 s.
 			 */
+			if ( w->treadOn )
+			{
+				continue;
+			}
 			b3Quat frame = b3MulQuat( chassisT.q, WheelFrameRotation( w->directionCs, w->axleCs ) );
 			b3Body_SetTransform( w->body, b3Body_GetPosition( w->body ), frame );
 			continue;
@@ -2633,21 +2671,9 @@ static void SolveWheelContacts( Vehicle* v, Wheel* w, float h )
 }
 
 
-static void ApplyWheelMass( Vehicle* v, Wheel* w )
+/** Give a wheel body `mass`, with the inertia of a disc about its axle. */
+static void SetWheelBodyMass( Wheel* w, float mass )
 {
-	if ( B3_IS_NULL( w->body ) )
-	{
-		return;
-	}
-
-	// A dynamic body with no shapes has NO MASS until it is given one, and a
-	// zero-mass body makes every effective mass in the contact solve zero: the
-	// matrix goes singular, the fallback divides by its own epsilon floor, and
-	// the machine leaves for infinity. The floor is a solver guard, not a
-	// physical claim — the game sets the real mass in the same breath as
-	// creating the wheel.
-	float mass = w->mass > 0.0f ? w->mass : 0.01f;
-
 	float r = w->radius;
 	float halfWidth = 0.5f * w->width;
 
@@ -2670,60 +2696,94 @@ static void ApplyWheelMass( Vehicle* v, Wheel* w )
 	md.inertia.cy.y = across;
 	md.inertia.cz.z = spin;
 	b3Body_SetMassData( w->body, md );
+}
 
-	// The spin integrator upstream reads this; one definition of the tyre's
-	// inertia now, not two.
-	w->inertia = md.inertia.cz.z;
+/** A disc's inertia about its axle, floored as the body's is. */
+static float DiscSpinInertia( const Wheel* w, float mass )
+{
+	float spin = 0.5f * mass * w->radius * w->radius;
+	float floorInertia = 1.0e-4f * mass;
+	return spin > floorInertia ? spin : floorInertia;
+}
 
-	if ( w->mass <= 0.0f )
+/**
+ * Share the machine's mass out between its chassis and its wheel bodies.
+ *
+ * A wheel becoming a body must not make the machine heavier, so its mass comes
+ * off the chassis — and never more than half the machine between all the
+ * wheels, because a chassis lighter than the wheels hanging off it is not a
+ * vehicle any solver can hold together. (Removing the transfer entirely was
+ * tried and is worse: the machine then weighs its wheels twice and the Car
+ * stops turning. Leaving it unbounded put a tank's chassis at the 0.1 kg floor
+ * under twelve heavy wheels.)
+ *
+ * The wheel BODY weighs its share, not what the part asks for. It used to be
+ * given the part's whole mass while only the capped share came off the chassis,
+ * so every machine the cap bound on got heavier and lighter-hulled, the exact
+ * thing both rules exist to prevent. A 10 kg wheel on a 1 kg block became a
+ * 10 kg wheel on a 0.5 kg chassis, twenty to one across a joint. The heavy,
+ * collision-free wheel sank into the terrain whenever its cast could not
+ * accept the ground under it, then was lifted back out by the placement and
+ * the hard point, and five to ten seconds after the wheel went on the machine
+ * was still being thrown at up to 7 m/s.
+ *
+ * Every wheel is shared against the SAME whole and the same wheel count, so
+ * the result does not depend on the order the wheels were added in. Sharing one
+ * wheel at a time against a chassis the earlier ones had already lightened gave
+ * a tank's first wheels 20 kg and its last 3 kg.
+ *
+ * `massTakenFromChassis` is what each wheel holds, so the whole is always the
+ * chassis plus those, and a repeat call moves nothing that is already right.
+ */
+static void ShareWheelMass( Vehicle* v )
+{
+	b3MassData chassis = b3Body_GetMassData( v->chassis );
+
+	float whole = chassis.mass;
+	for ( int i = 0; i < v->wheelCount; i++ )
 	{
-		// Nothing authored yet: the guard mass is not the machine's, so it is not
-		// taken off the chassis either.
+		whole += v->wheels[i].massTakenFromChassis;
+	}
+
+	int n = v->wheelCount > 0 ? v->wheelCount : 1;
+	float budget = whole / (float)( 2 * n );
+
+	float taken = 0.0f;
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		Wheel* w = &v->wheels[i];
+		if ( B3_IS_NULL( w->body ) )
+		{
+			w->massTakenFromChassis = 0.0f;
+			continue;
+		}
+
+		// No mass authored yet (or a weightless replica's): nothing is taken, and
+		// the body gets a guard mass. A dynamic body with no shapes has NO MASS
+		// until it is given one, and a zero-mass body makes every effective mass
+		// in the contact solve zero: the matrix goes singular, the fallback
+		// divides by its own epsilon floor, and the machine leaves for infinity.
+		float share = w->mass > 0.0f ? ( w->mass < budget ? w->mass : budget ) : 0.0f;
+		SetWheelBodyMass( w, share > 0.0f ? share : 0.01f );
+		w->massTakenFromChassis = share;
+		taken += share;
+
+		// The spring is specified against these masses, so it is stale the moment
+		// they change.
+		ConfigureWheelJoint( v, w );
+	}
+
+	// A machine none of whose wheels has ever taken anything keeps the chassis
+	// the host gave it, untouched.
+	if ( taken == 0.0f && v->chassisMassAsLeft == 0.0f )
+	{
 		return;
 	}
 
-	/*
-	 * ONCE per wheel, and never more than the wheels' share of the machine.
-	 *
-	 * A wheel becoming a body must not make the machine heavier, so its mass
-	 * comes off the chassis. Two things were wrong with doing that here.
-	 *
-	 * It was not idempotent: this runs again every time the game sets a wheel's
-	 * mass, and each call subtracted afresh. And it was unbounded: a tank's
-	 * twelve tracked wheels want more than the whole machine, so the chassis
-	 * ended at the 0.1 kg floor — a paper hull carrying twelve heavy wheels on
-	 * joints, suspensions slammed to their stops, wheels pushing seven times the
-	 * machine's weight.
-	 *
-	 * Removing the transfer entirely was tried and is worse: the machine then
-	 * weighs its wheels twice and the Car stops turning.
-	 *
-	 * `massTakenFromChassis` is what this wheel has already moved, so a repeat
-	 * call moves only the difference. The share is half the machine between all
-	 * the wheels, because a chassis lighter than the wheels hanging off it is not
-	 * a vehicle any solver can hold together.
-	 */
-	int n = v->wheelCount > 0 ? v->wheelCount : 1;
-	b3MassData chassis = b3Body_GetMassData( v->chassis );
-
-	float whole = chassis.mass + w->massTakenFromChassis;
-	float budget = whole / (float)( 2 * n );
-	float want = w->mass < budget ? w->mass : budget;
-
-	float remaining = whole - want;
-	if ( remaining < 0.1f )
-	{
-		remaining = 0.1f;
-	}
-
-	w->massTakenFromChassis = want;
-	chassis.mass = remaining;
+	float remaining = whole - taken;
+	chassis.mass = remaining > 0.1f ? remaining : 0.1f;
 	b3Body_SetMassData( v->chassis, chassis );
-	v->chassisMassAsLeft = remaining;
-
-	// The spring is specified against these masses, so it is stale the moment
-	// they change.
-	ConfigureWheelJoint( v, w );
+	v->chassisMassAsLeft = chassis.mass;
 }
 
 /**
@@ -2747,9 +2807,8 @@ static void RetakeWheelMass( Vehicle* v )
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
 		v->wheels[i].massTakenFromChassis = 0.0f;
-		ApplyWheelMass( v, &v->wheels[i] );
 	}
-	v->chassisMassAsLeft = b3Body_GetMass( v->chassis );
+	ShareWheelMass( v );
 }
 
 /**
@@ -2789,32 +2848,46 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 	def.rotation = b3MulQuat( chassisT.q, frame );
 	w->body = b3CreateBody( v->world, &def );
 
-	// A tyre-shaped collider with its collision OFF, which is what the talk
-	// describes — "the wheels are rigid bodies with their collision disabled" —
-	// and not the same thing as no collider at all. A shapeless dynamic body has
-	// no extent, so the solver cannot decide whether it moved far enough this
-	// step to need a swept test, and a joint into one corrupted the continuous
-	// pass badly enough to trap.
+	/*
+	 * The TREAD: the tyre the sweep casts, as a collider on the wheel itself.
+	 *
+	 * Off while the suspension owns the ground — "the wheels are rigid bodies
+	 * with their collision disabled" — which is nearly always, and switched on
+	 * only for terrain the suspension refuses (`UpdateTread`). It also gives the
+	 * body an EXTENT: a shapeless dynamic body cannot tell the solver whether it
+	 * moved far enough to need a swept test, and a joint into one corrupted the
+	 * continuous pass badly enough to trap.
+	 */
 	b3ShapeDef sd = b3DefaultShapeDef();
 	sd.enableContactEvents = false;
 	sd.density = 0.0f;
 	sd.filter.categoryBits = 0;
 	sd.filter.maskBits = 0;
+	sd.filter.groupIndex = 0;
+	sd.baseMaterial.friction = TYRE_FRICTION;
+	sd.enableCustomFiltering = true;
+	sd.userData = (void*)(intptr_t)( B3W_TREAD_TAG | ( v->handle << 12 ) | (int)( w - v->wheels ) );
 
-	b3Capsule tyre;
-	tyre.center1 = B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, -0.5f * w->width };
-	tyre.center2 = B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.5f * w->width };
-	// A hair under the tread. This shape exists to give the body an EXTENT — a
-	// shapeless one cannot tell the solver whether it moved far enough to need a
-	// swept test — and it collides with nothing, so its exact size is free;
-	// keeping it inside the tyre keeps it clear of everything the placement puts
-	// the wheel against.
-	tyre.radius = w->radius - WHEEL_SHAPE_CLEARANCE;
-	if ( tyre.radius < 0.02f )
+	b3Vec3 ring[2 * TREAD_SEGMENTS];
+	for ( int i = 0; i < TREAD_SEGMENTS; i++ )
 	{
-		tyre.radius = 0.02f;
+		float a = ( 2.0f * 3.14159265358979f * (float)i ) / (float)TREAD_SEGMENTS;
+		b3Vec3 radial = { w->radius * cosf( a ), w->radius * sinf( a ), 0.0f };
+		ring[i] = Add3( radial, B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.5f * w->width } );
+		ring[i + TREAD_SEGMENTS] = Add3( radial, B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, -0.5f * w->width } );
 	}
-	b3CreateCapsuleShape( w->body, &sd, &tyre );
+	b3HullData* treadHull = b3CreateHull( ring, 2 * TREAD_SEGMENTS, B3_MAX_HULL_VERTICES );
+	if ( treadHull != NULL )
+	{
+		w->treadShape = b3CreateHullShape( w->body, &sd, treadHull );
+		b3DestroyHull( treadHull );
+	}
+	else
+	{
+		b3Capsule core = { { 0.0f, 0.0f, -0.5f * w->width }, { 0.0f, 0.0f, 0.5f * w->width }, w->radius };
+		w->treadShape = b3CreateCapsuleShape( w->body, &sd, &core );
+	}
+	w->treadOn = false;
 
 	/*
 	 * The bump stop: a small collider on the CHASSIS, at the hard point.
@@ -2861,7 +2934,7 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 		/*
 		 * Adding a shape RE-DERIVES the body's mass from its shapes, and the
 		 * game's chassis mass is authored, not derived — so creating this sphere
-		 * silently replaced it. What was left after `ApplyWheelMass` took the
+		 * silently replaced it. What was left after `ShareWheelMass` took the
 		 * wheels off it was the 0.1 kg floor, and a machine that weighs 0.1 kg
 		 * answers its first real impact with a velocity of 1e13 and then NaN.
 		 *
@@ -2874,7 +2947,8 @@ static void CreateWheelBody( Vehicle* v, Wheel* w )
 		b3Body_SetMassData( v->chassis, before );
 	}
 
-	ApplyWheelMass( v, w );
+	w->inertia = DiscSpinInertia( w, 0.01f );
+	ShareWheelMass( v );
 
 	/*
 	 * A wheel body does not get a vote on whether its machine is at rest.
@@ -3302,6 +3376,71 @@ int b3w_tyre_presolve( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Ve
 	return 1;
 }
 
+/**
+ * Whether the tread is standing on terrain right now — the solver's own touching
+ * contacts, not the sweep.
+ */
+static bool IsTreadOnTerrain( const Wheel* w )
+{
+	b3ContactData contacts[8];
+	int count = b3Shape_GetContactData( w->treadShape, contacts, 8 );
+	for ( int i = 0; i < count; i++ )
+	{
+		b3ShapeId other = B3_ID_EQUALS( contacts[i].shapeIdA, w->treadShape ) ? contacts[i].shapeIdB : contacts[i].shapeIdA;
+		if ( contacts[i].manifoldCount > 0 && IsTerrainShape( other ) )
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Terrain the suspension refuses is the TREAD's to stand off.
+ *
+ * The sweep takes ground only under the wheel (PhysX's 45 degrees), and the
+ * tyre shape that answers everything else may not touch terrain at all —
+ * Box3D cannot judge a mesh contact, so `b3w_tyre_should_pair` keeps it off.
+ * Between the two, terrain beside or above a tilted wheel belonged to nothing,
+ * and the wheel, a body with its collision off, fell into it. A 1 kg block
+ * with one wheel rests tilted 45-58 degrees, right across that line: past it
+ * the sweep let go, the wheel drooped 0.25 m into the ground and rolled the
+ * machine back inside the cone, where the sweep found the tyre buried and the
+ * placement and the hard point threw it out again, every nine ticks, for ever.
+ *
+ * So the tread meets terrain while the sweep met terrain and took none of it
+ * as ground, and KEEPS it for as long as it is standing on it: the sweep only
+ * looks along the suspension, and at the edge of its reach it met the ground
+ * one tick and missed it the next. Every miss dropped the tread's contacts,
+ * the wheel sagged into the ground and was pushed back out — 239 switches in
+ * 30 s, and a machine on its side that never stopped trembling. Where the
+ * suspension stands on something, or no terrain is near — driving, or in the
+ * air — the tread is off and nothing changes; the two never support the wheel
+ * on the same ground.
+ */
+static void UpdateTread( Vehicle* v, Wheel* w )
+{
+	if ( B3_IS_NULL( w->treadShape ) || !b3Shape_IsValid( w->treadShape ) )
+	{
+		return;
+	}
+
+	b3Filter want = { 0 };
+	b3Filter machine;
+	bool standing = w->treadOn && IsTreadOnTerrain( w );
+	if ( !w->info.isInContact && ( w->info.terrainNear || standing ) && MachineFilter( v, &machine ) )
+	{
+		want = machine;
+	}
+
+	b3Filter had = b3Shape_GetFilter( w->treadShape );
+	if ( had.categoryBits != want.categoryBits || had.maskBits != want.maskBits || had.groupIndex != want.groupIndex )
+	{
+		b3Shape_SetFilter( w->treadShape, want, true );
+	}
+	w->treadOn = want.maskBits != 0;
+}
+
 void b3w_vehicle_prepare( Vehicle* v, float dt )
 {
 	// Nothing to prepare against a chassis the caller has already destroyed, and
@@ -3499,6 +3638,7 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
 		ShapeCastWheel( v, i, dt );
+		UpdateTread( v, &v->wheels[i] );
 
 		// The cast has just said how far the ground is from the hard point, which
 		// is the one measurement that says whether the stop is clear of it. See
@@ -3917,23 +4057,33 @@ static void FreeWheelStorage( Vehicle* v )
  * on convex contacts only, never on a mesh's. So a tyre never pairs with
  * terrain, and meets machines and frozen builds — convex, and judged by
  * `b3w_tyre_presolve`.
+ *
+ * And the complement: a wheel's TREAD meets terrain and nothing else. It is on
+ * only where the sweep refused the terrain (`UpdateTread`), so the two never
+ * claim the same ground, and everything that is not terrain stays the tyre's.
  */
 bool b3w_tyre_should_pair( b3ShapeId shapeIdA, b3ShapeId shapeIdB )
 {
-	bool tyreA = b3w_is_tyre( shapeIdA );
-	bool tyreB = b3w_is_tyre( shapeIdB );
+	if ( IsTread( shapeIdA ) || IsTread( shapeIdB ) )
+	{
+		return IsTerrainShape( IsTread( shapeIdA ) ? shapeIdB : shapeIdA );
+	}
+
+	Vehicle* v = NULL;
+	bool tyreA = TyreWheel( shapeIdA, &v ) != NULL;
+	bool tyreB = TyreWheel( shapeIdB, &v ) != NULL;
 	if ( !tyreA && !tyreB )
 	{
 		return true;
 	}
-	b3ShapeType other = b3Shape_GetType( tyreA ? shapeIdB : shapeIdA );
-	return other != b3_meshShape && other != b3_heightShape && other != b3_compoundShape;
+	return !IsTerrainShape( tyreA ? shapeIdB : shapeIdA );
 }
 
+/** A tyre or a tread: where a wheel is, which nothing stands on or picks. */
 bool b3w_is_tyre( b3ShapeId shapeId )
 {
 	Vehicle* v = NULL;
-	return TyreWheel( shapeId, &v ) != NULL;
+	return IsTread( shapeId ) || TyreWheel( shapeId, &v ) != NULL;
 }
 
 static Wheel* TyreWheel( b3ShapeId shapeId, Vehicle** vehicle )
@@ -4238,23 +4388,15 @@ void b3w_vehicle_set_wheel_mass( int handle, int index, float mass )
 	}
 
 	Wheel* w = &v->wheels[index];
-	if ( w->massTakenFromChassis > 0.0f )
-	{
-		// Give back what this wheel TOOK — not its mass, which the share capped,
-		// and which a weightless wheel (a placed replica's) never took at all —
-		// so a second call is not a second subtraction. Giving back `w->mass`
-		// left `massTakenFromChassis` standing after a wheel went to zero, and
-		// the next call counted it into the machine again: every placed and
-		// simulated round trip made a car 10 kg a wheel heavier.
-		b3MassData chassis = b3Body_GetMassData( v->chassis );
-		chassis.mass += w->massTakenFromChassis;
-		b3Body_SetMassData( v->chassis, chassis );
-		w->massTakenFromChassis = 0.0f;
-		v->chassisMassAsLeft = chassis.mass;
-	}
-
 	w->mass = mass;
-	ApplyWheelMass( v, w );
+
+	// The TYRE's spin inertia, which the drivetrain integrates, is the part's:
+	// how fast a wheel spins up is a property of the wheel the player fitted,
+	// not of how much of the machine its body is allowed to carry. Taken from
+	// the share, a 20 kg tracked wheel on a light hull spun up like a 4 kg one
+	// and hit the rev limiter in a single tick.
+	w->inertia = DiscSpinInertia( w, mass > 0.0f ? mass : 0.01f );
+	ShareWheelMass( v );
 }
 
 WHEEL_SETTER( b3w_vehicle_set_engine_force, engineForce )
