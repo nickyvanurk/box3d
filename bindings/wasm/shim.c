@@ -1768,6 +1768,10 @@ int b3w_add_distance_joint( int handle, int bodyA, int bodyB, float ax, float ay
 	def.enableSpring = true;
 	def.hertz = hertz;
 	def.dampingRatio = dampingRatio;
+	// A rope only limits how far apart its ends get. The joint default switches
+	// off contact between the joined bodies, which let a towed trailer pass
+	// straight through the truck; same-machine filtering is the shape group's job.
+	def.base.collideConnected = true;
 
 	return RetainJoint( world, b3CreateDistanceJoint( world->id, &def ) );
 }
