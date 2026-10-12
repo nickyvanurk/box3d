@@ -108,28 +108,6 @@ static const float STEERING_DAMPING_RATIO = 5.0f;
  *  against the travel available. */
 static const float HARD_POINT_FORCE_SCALE = 3.0f;
 
-/**
- * The progressive bump stop: where in the compression it begins, as a fraction
- * of the rest length, and how many g of the machine's weight it adds by the
- * time the suspension is fully compressed.
- *
- * The spring is sized from SAG, so it holds about 2.5 g at full compression —
- * right for a road and nowhere near a loop, which loads a car 4-8 g. Past the
- * end of the spring the old answer was rigid: the wheel's joint stop and the
- * hard-point force carried the machine, and with no travel left the chassis
- * itself met the track and its friction took 15-20 m/s out of the car in one
- * tick. A real car has a rubber stop in its last few centimetres for exactly
- * this, and GTA's lines do the same job by turning a big compression jump into
- * a collision at the WHEEL (`CAutomobile::ProcessEntityCollision`,
- * m_fSuspensionHighSpdComDamp), never at the body.
- *
- * Quadratic from its start, so it is zero AND flat where it engages: ordinary
- * driving, which lives around the sag at 40% of the rest length, never reaches
- * it and feels exactly as before.
- */
-static const float PROGRESSIVE_STOP_START = 0.6f;
-static const float PROGRESSIVE_STOP_G = 6.0f;
-
 /** Penetration a tyre is left to the constraint to resolve rather than being
  *  placed out of. Box3D's own linear slop. */
 static const float PLACEMENT_DEADBAND = 0.005f;
@@ -2465,17 +2443,6 @@ static void ApplySuspensionForce( Vehicle* v, Wheel* w, float chassisMass, float
 	float implicit = 1.0f / ( 1.0f + h * damping );
 
 	float force = chassisMass * ( w->suspensionStiffness * compression + damping * compressionRate * implicit );
-
-	// Shared by the wheels the way the spring is (`k = g / (N * sag)`), so the
-	// stop holds the same multiple of the machine's weight on any build.
-	float stopStart = PROGRESSIVE_STOP_START * w->suspensionRestLength;
-	float stopRun = w->suspensionRestLength - stopStart;
-	if ( compression > stopStart && stopRun > 0.0f && v->wheelCount > 0 )
-	{
-		float into = ( compression - stopStart ) / stopRun;
-		float gravity = b3Length( b3World_GetGravity( v->world ) );
-		force += chassisMass * PROGRESSIVE_STOP_G * gravity / (float)v->wheelCount * into * into;
-	}
 
 	// A suspension pushes apart and never pulls together, and it has a ceiling.
 	if ( force <= 0.0f )
