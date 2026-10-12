@@ -668,8 +668,9 @@ typedef struct
 	uint32_t owner;
 	int worldHandle;
 	/** The surface filter, applied here rather than after the cast: a hit on a
-	 *  wall must not occupy a slot a drivable surface behind it could use. */
-	b3Vec3 worldUp;
+	 *  wall must not occupy a slot a drivable surface behind it could use.
+	 *  Judged against the vehicle's GROUND up — see `GroundUp`. */
+	b3Vec3 groundUp;
 	float minSurfaceUpFacing;
 	/**
 	 * The hard point this cast started above, and the suspension's own down.
@@ -909,10 +910,10 @@ static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fr
 		ctx->metTerrain = true;
 	}
 
-	// Drivability is a world-space property of the surface, so it compares
-	// against world up rather than the suspension direction — otherwise chassis
-	// tilt would move the accept boundary around.
-	if ( b3Dot( normal, ctx->worldUp ) <= ctx->minSurfaceUpFacing )
+	// Drivability is a property of the surface the vehicle is ON, so it compares
+	// against that surface's up rather than the suspension direction — otherwise
+	// chassis tilt would move the accept boundary around. See `GroundUp`.
+	if ( b3Dot( normal, ctx->groundUp ) <= ctx->minSurfaceUpFacing )
 	{
 		return -1.0f;
 	}
@@ -937,14 +938,14 @@ static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fr
 	 * the tyre can legitimately reach is below it, including terrain a wheel has
 	 * sunk into on a climb, which is the case the head start was added for.
 	 *
-	 * Against WORLD UP, for exactly the reason written above the surface filter:
-	 * chassis tilt must not move the accept boundary around. Measured with the
-	 * suspension direction instead — a T-boned car slid 164 m rather than 16,
-	 * because once it was knocked askew the rejection plane swung with it and
-	 * threw away the ground the car was sitting on, leaving it to coast with no
-	 * wheel touching anything.
+	 * Against the GROUND's up, for exactly the reason written above the surface
+	 * filter: chassis tilt must not move the accept boundary around. Measured
+	 * with the suspension direction instead — a T-boned car slid 164 m rather
+	 * than 16, because once it was knocked askew the rejection plane swung with
+	 * it and threw away the ground the car was sitting on, leaving it to coast
+	 * with no wheel touching anything. The ground does not swing with the car.
 	 */
-	if ( b3Dot( SubPos( point, ctx->hardPoint ), ctx->worldUp ) > 0.0f )
+	if ( b3Dot( SubPos( point, ctx->hardPoint ), ctx->groundUp ) > 0.0f )
 	{
 		return -1.0f;
 	}
@@ -1054,9 +1055,50 @@ static b3Pos AnchorWs( const Wheel* w )
 	return w->staticFrictionAnchor;
 }
 
-static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
+/**
+ * "Up" for the wheels' acceptance tests: the surface the vehicle is standing on,
+ * and world up only when it is standing on nothing.
+ *
+ * GTA judges a suspension line by whether it hits, nothing else
+ * (`CAutomobile::ProcessEntityCollision`): no wheel there is ever refused for the
+ * way the world is turned, which is how its cars drive the stunt parks' loops.
+ * Ours were judged against WORLD up in three places — the pose filter, the
+ * surface filter and the hard-point filter — so past 80 degrees of loop every
+ * loaded tyre was thrown away at once and the car fell off the wall at speed.
+ *
+ * Those filters exist for real cases (a car T-boned on flat ground, a wheel on
+ * another car's roof), and every one of those happens on ground whose up IS
+ * world up, so measuring against the ground's own up leaves each of them exactly
+ * as it was. What changes is a surface that curves away from world up under a
+ * car already on it: a loop turns its normal about 9 degrees per tick at speed,
+ * well inside the 80-degree tests, so contact carries from tick to tick all the
+ * way round. A surface met from the AIR is still judged against world up — there
+ * is no ground to continue from — and a wall the car drives into is a 90-degree
+ * step, never a continuation.
+ *
+ * The mean of every wheel's surface as the last cast found it, taken once before
+ * a pass so all the wheels in it agree — and before `UpdateWheelTransforms`,
+ * which forgets them.
+ */
+static b3Vec3 GroundUp( const Vehicle* v )
 {
-	b3Vec3 worldUp = AxisVector( v->indexUpAxis );
+	b3Vec3 sum = { 0.0f, 0.0f, 0.0f };
+	for ( int i = 0; i < v->wheelCount; i++ )
+	{
+		const Wheel* w = &v->wheels[i];
+		// The COUNT, not `isInContact`: `UpdateWheelTransforms` clears that flag
+		// ahead of every cast, while the count holds until the cast replaces it.
+		if ( w->info.contactCount > 0 )
+		{
+			sum = Add3( sum, w->info.contacts[0].surfaceNormalWs );
+		}
+	}
+	float length = b3Length( sum );
+	return length > 1.0e-3f ? Scale( sum, 1.0f / length ) : AxisVector( v->indexUpAxis );
+}
+
+static void ShapeCastWheel( Vehicle* v, int wheelId, float dt, b3Vec3 groundUp )
+{
 	Wheel* w = &v->wheels[wheelId];
 	b3Pos source = w->info.hardPointWs;
 
@@ -1142,7 +1184,7 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 	WheelCast cast = { .chassis = v->chassis,
 					   .owner = v->owner,
 					   .worldHandle = v->worldHandle,
-					   .worldUp = worldUp,
+					   .groundUp = groundUp,
 					   .minSurfaceUpFacing = cosf( w->surfaceRejectAngle ),
 					   .hardPoint = source,
 					   .castStart = castStart,
@@ -1163,10 +1205,10 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt )
 						  &cast );
 
 	// Filter: chassis pose. Drop every hit when the suspension does not point
-	// broadly downward — sideways, nose-standing or inverted, where a
+	// broadly INTO the ground — sideways, nose-standing or inverted, where a
 	// heightfield's always-outward normal would mislead a normal-only test. The
 	// surface filter is applied per hit, inside the cast callback.
-	float suspensionDownward = -b3Dot( direction, worldUp );
+	float suspensionDownward = -b3Dot( direction, groundUp );
 	/*
 	 * Where the cast WENT, recorded whether or not it found anything.
 	 *
@@ -3540,6 +3582,7 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 		return;
 	}
 
+	b3Vec3 groundUp = GroundUp( v );
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
 		UpdateWheelTransforms( v, i );
@@ -3637,7 +3680,7 @@ void b3w_vehicle_prepare( Vehicle* v, float dt )
 	// second of speed the driver never asked for.
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
-		ShapeCastWheel( v, i, dt );
+		ShapeCastWheel( v, i, dt, groundUp );
 		UpdateTread( v, &v->wheels[i] );
 
 		// The cast has just said how far the ground is from the hard point, which
@@ -4705,10 +4748,11 @@ int b3w_vehicle_debug_draw( int worldHandle, float* verts, float* colors, int ca
  */
 static void CastAndPlaceWheels( Vehicle* v )
 {
+	b3Vec3 groundUp = GroundUp( v );
 	for ( int i = 0; i < v->wheelCount; i++ )
 	{
 		UpdateWheelTransforms( v, i );
-		ShapeCastWheel( v, i, v->stepDt );
+		ShapeCastWheel( v, i, v->stepDt, groundUp );
 	}
 
 	PlaceWheels( v );
