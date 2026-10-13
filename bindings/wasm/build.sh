@@ -60,7 +60,7 @@ EXPORTS='[
 	"_b3w_vehicle_set_wheel_inertia","_b3w_vehicle_set_wheel_mass",
 	"_b3w_vehicle_debug_draw","_b3w_vehicle_awake_wheels","_b3w_vehicle_wheel_speeds","_b3w_vehicle_wheel_sleep","_b3w_body_sleep_state",
 	"_b3w_vehicle_place_wheels",
-	"_b3w_vehicle_set_anti_squat",
+	"_b3w_vehicle_set_anti_squat","_b3w_set_surface","_b3w_vehicle_wheel_surface",
 	"_malloc","_free"
 ]'
 

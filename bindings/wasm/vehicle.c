@@ -43,6 +43,8 @@
 #define B3W_MAX_CONTACTS 3
 /** Floats per wheel in `b3w_vehicle_read_wheels`. */
 #define WHEEL_READBACK_STRIDE 25
+/** Surface ids a triangle can carry: one byte, as Box3D's mesh material index. */
+#define B3W_MAX_SURFACES 256
 /** Rows the bump-stop system will solve simultaneously. Bounds the dense
  *  matrix on the stack; beyond it the extra bottomed contacts simply wait for
  *  the next substep. */
@@ -455,8 +457,16 @@ typedef struct
 	 * friction." A tyre grade is then a property of the build and the ground is
 	 * a property of the world, which is what lets ice be slippery for everyone
 	 * without touching a single vehicle.
+	 *
+	 * Includes the struck surface's tyre grip from `b3w_set_surface`, so every
+	 * budget that reads this — the friction circle, the brake hold, the
+	 * handbrake — sees mud as mud without a second multiplier at each site.
 	 */
 	float surfaceFriction;
+	/** The surface id of the triangle under this tyre, 0 when untagged or airborne. */
+	int surface;
+	/** That surface's rolling resistance, as a fraction of the tyre's load. */
+	float rollingResistance;
 } Wheel;
 
 typedef struct
@@ -647,6 +657,61 @@ static float SafeInv( float x )
 }
 
 // ---------------------------------------------------------------------------
+// Surfaces
+// ---------------------------------------------------------------------------
+
+/**
+ * What a tyre makes of each kind of ground, by surface id — GTA's
+ * `SurfaceInfos_c`, where a triangle's surface type indexes a table of tyre grip
+ * and the car is resisted on soft ground (`CAutomobile::DoSoftGroundResistance`).
+ *
+ * The HOST owns the numbers and registers them once; the mechanism lives here
+ * because the cast is the only place that knows which triangle a tyre struck,
+ * and the friction circle is solved every substep on this side of the boundary.
+ * Process-wide rather than per world: it is the game's constant data, and every
+ * world in the process is the same game.
+ *
+ * Id 0 is "untagged" — props, machines, any shape built without surfaces — and
+ * is neutral: full grip, no resistance. An id never registered is neutral too.
+ */
+typedef struct
+{
+	float grip;
+	float rollingResistance;
+	bool registered;
+} SurfaceParams;
+
+static SurfaceParams s_surfaces[B3W_MAX_SURFACES];
+
+/**
+ * Register surface `id`: `grip` multiplies the tyre's friction budget,
+ * `rollingResistance` is the force opposing rolling as a fraction of the tyre's
+ * load (a real tyre's rolling resistance coefficient: ~0.015 on tarmac, ~0.3 in
+ * deep sand). Id 0 cannot be changed.
+ */
+void b3w_set_surface( int id, float grip, float rollingResistance )
+{
+	if ( id <= 0 || id >= B3W_MAX_SURFACES )
+	{
+		return;
+	}
+
+	s_surfaces[id].grip = grip > 0.0f ? grip : 0.0f;
+	s_surfaces[id].rollingResistance = rollingResistance > 0.0f ? rollingResistance : 0.0f;
+	s_surfaces[id].registered = true;
+}
+
+static float SurfaceGrip( int id )
+{
+	return s_surfaces[id].registered ? s_surfaces[id].grip : 1.0f;
+}
+
+static float SurfaceRollingResistance( int id )
+{
+	return s_surfaces[id].registered ? s_surfaces[id].rollingResistance : 0.0f;
+}
+
+// ---------------------------------------------------------------------------
 // Shape cast
 // ---------------------------------------------------------------------------
 
@@ -655,6 +720,8 @@ typedef struct
 	float fraction;
 	/** The friction of the SURFACE that was hit — mud, rock, road. */
 	float surfaceFriction;
+	/** Its surface id, from the struck triangle's material; 0 untagged. */
+	int surface;
 	b3Vec3 normal;
 	b3Pos point;
 	int body;
@@ -871,7 +938,6 @@ static bool IsUnderTheWheel( const WheelCast* ctx, b3Pos point, b3Vec3 normal, f
 static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction, uint64_t userMaterialId,
 						 int triangleIndex, int childIndex, void* context )
 {
-	(void)userMaterialId;
 	(void)triangleIndex;
 	(void)childIndex;
 
@@ -965,6 +1031,7 @@ static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fr
 
 	WheelHit hit = { .fraction = fraction,
 					 .surfaceFriction = b3Shape_GetFriction( shapeId ),
+					 .surface = userMaterialId < B3W_MAX_SURFACES ? (int)userMaterialId : 0,
 					 .normal = normal,
 					 .point = point,
 					 .body = body,
@@ -1230,6 +1297,8 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt, b3Vec3 groundUp )
 	w->info.terrainNear = cast.metTerrain;
 	w->info.contactCount = 0;
 	w->surfaceFriction = 1.0f;
+	w->surface = 0;
+	w->rollingResistance = 0.0f;
 
 	if ( accepted )
 	{
@@ -1328,7 +1397,11 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt, b3Vec3 groundUp )
 		 * `PlacementAlongSuspension`.
 		 */
 
-		w->surfaceFriction = cast.hits[0].surfaceFriction > 0.0f ? cast.hits[0].surfaceFriction : 1.0f;
+		// The nearest hit's surface, like its friction: the patch the tyre rests on.
+		w->surface = cast.hits[0].surface;
+		w->rollingResistance = SurfaceRollingResistance( w->surface );
+		w->surfaceFriction = ( cast.hits[0].surfaceFriction > 0.0f ? cast.hits[0].surfaceFriction : 1.0f ) *
+							 SurfaceGrip( w->surface );
 
 		w->info.lastToi = cast.hits[0].fraction * maxToi;
 		w->info.lastCastOffset = offset;
@@ -1959,6 +2032,46 @@ static void UpdateFriction( Vehicle* v, float dt )
 				w->forwardImpulse *= w->skidInfo;
 				w->sideImpulse *= w->skidInfo;
 			}
+		}
+	}
+
+	/*
+	 * Soft ground resists rolling, whatever the tyre is doing.
+	 *
+	 * GTA does this per car in `CAutomobile::DoSoftGroundResistance`: on sand it
+	 * pushes against the car's ground-plane velocity, separately from tyre grip.
+	 * Here it is per TYRE, as a rolling resistance coefficient times the load the
+	 * tyre carries, so a car with two wheels in the mud is pulled toward it and
+	 * a car landing hard digs in harder.
+	 *
+	 * Applied straight to the chassis and kept out of `forwardImpulse`: it is
+	 * the ground deforming, not the tyre gripping, so it must not spend the
+	 * friction circle. Bounded by what stops the contact's rolling this substep,
+	 * so it slows a car to a stand and never pushes it backwards.
+	 */
+	for ( int i = 0; i < numWheels; i++ )
+	{
+		Wheel* w = &v->wheels[i];
+		if ( w->info.groundBody < 0 || w->rollingResistance <= 0.0f )
+		{
+			continue;
+		}
+
+		float budget = w->rollingResistance * w->wheelSuspensionForce * dt;
+		if ( budget <= 0.0f )
+		{
+			continue;
+		}
+
+		b3Pos contact = w->info.contactPointWs;
+		b3Vec3 dir = v->forwardWs[i];
+		b3Vec3 rel = Sub3( b3Body_GetWorldPointVelocity( v->chassis, contact ),
+						   GroundVelocityAt( w->info.groundBodyId, contact ) );
+		float stop = -b3Dot( rel, dir ) * SafeInv( ImpulseDenominator( v->chassis, contact, dir ) );
+		float impulse = stop < -budget ? -budget : stop > budget ? budget : stop;
+		if ( impulse != 0.0f )
+		{
+			b3Body_ApplyLinearImpulse( v->chassis, Scale( dir, impulse ), contact, false );
 		}
 	}
 
@@ -4630,6 +4743,21 @@ float b3w_vehicle_wheel_mass( int handle, int index )
 		return 0.0f;
 	}
 	return b3Body_GetMass( v->wheels[index].body );
+}
+
+/**
+ * The surface id under a wheel as of the last cast, 0 when untagged or in the
+ * air. A call of its own rather than a readback column, so the bulk layout —
+ * which the host reads every frame — did not change when surfaces arrived.
+ */
+int b3w_vehicle_wheel_surface( int handle, int index )
+{
+	Vehicle* v = b3w_vehicle_get( handle );
+	if ( v == NULL || index < 0 || index >= v->wheelCount )
+	{
+		return 0;
+	}
+	return v->wheels[index].surface;
 }
 
 /**

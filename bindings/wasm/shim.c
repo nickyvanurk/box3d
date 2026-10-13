@@ -1846,9 +1846,17 @@ float b3w_joint_force( int handle, int joint )
  *
  * Box3D keeps a reference to the mesh (see b3CreateMeshShape), so the data is
  * copied into memory we own and outlives the shape.
+ *
+ * `surfacesPtr`, when non-zero, is one byte per triangle naming the SURFACE it
+ * is — mud, rock, road — and 0 means untagged. Each id becomes a material whose
+ * `userMaterialId` is that id, which is how a cast reports what it struck: GTA's
+ * colpoint carries a surface type per triangle for exactly this. Every material
+ * keeps the shape's friction and restitution, so a surface changes what a TYRE
+ * makes of the ground (see `b3w_set_surface` in vehicle.c) and nothing about
+ * how a crate slides on it.
  */
 int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, int indicesPtr, int triangleCount,
-						 float friction, float restitution, int group, int isSensor )
+						 float friction, float restitution, int group, int isSensor, int surfacesPtr )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || body < 0 || body >= world->bodyCount )
@@ -1866,10 +1874,24 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 	int32_t* indices = (int32_t*)malloc( sizeof( int32_t ) * 3 * triangleCount );
 	memcpy( indices, (const void*)(intptr_t)indicesPtr, sizeof( int32_t ) * 3 * triangleCount );
 
+	// The highest surface named decides how many materials there are: a mesh
+	// whose triangles are all untagged needs none, and keeps the single-material
+	// path every mesh took before surfaces existed.
+	const uint8_t* surfaces = (const uint8_t*)(intptr_t)surfacesPtr;
+	int surfaceCount = 0;
+	if ( surfaces != NULL )
+	{
+		for ( int i = 0; i < triangleCount; ++i )
+		{
+			surfaceCount = surfaces[i] + 1 > surfaceCount ? surfaces[i] + 1 : surfaceCount;
+		}
+	}
+	bool tagged = surfaceCount > 1;
+
 	b3MeshDef def = { 0 };
 	def.vertices = vertices;
 	def.indices = indices;
-	def.materialIndices = NULL;
+	def.materialIndices = tagged ? (uint8_t*)surfaces : NULL;
 	def.weldTolerance = 1e-4f;
 	def.vertexCount = vertexCount;
 	def.triangleCount = triangleCount;
@@ -1882,6 +1904,19 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 	shapeDef.enableCustomFiltering = true;
 	shapeDef.baseMaterial.friction = friction;
 	shapeDef.baseMaterial.restitution = restitution;
+
+	// Copied by the shape on creation, so a stack array is enough.
+	b3SurfaceMaterial materials[256];
+	if ( tagged )
+	{
+		for ( int i = 0; i < surfaceCount; ++i )
+		{
+			materials[i] = shapeDef.baseMaterial;
+			materials[i].userMaterialId = (uint64_t)i;
+		}
+		shapeDef.materials = materials;
+		shapeDef.materialCount = surfaceCount;
+	}
 	shapeDef.isSensor = isSensor != 0;
 	shapeDef.enableSensorEvents = isSensor != 0;
 	shapeDef.filter.groupIndex = group;
