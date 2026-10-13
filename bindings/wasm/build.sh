@@ -51,7 +51,7 @@ EXPORTS='[
 	"_b3w_cast_ray_filtered","_b3w_cast_sphere_filtered","_b3w_set_body_mass","_b3w_set_sleep_threshold","_b3w_body_contacts","_b3w_body_max_approach_speed","_b3w_body_aabb","_b3w_body_inertia_tensor","_b3w_body_shape_states","_b3w_debug_draw",
 	"_b3w_create_vehicle","_b3w_step_vehicle","_b3w_vehicle_destroy","_b3w_vehicle_add_wheel",
 	"_b3w_vehicle_read_wheels","_b3w_vehicle_wheel_count","_b3w_vehicle_wheel_capacity","_b3w_vehicle_set_owner","_b3w_body_set_owner","_b3w_body_set_bullet","_b3w_set_detect_only",
-	"_b3w_vehicle_set_up_axis","_b3w_vehicle_up_axis","_b3w_vehicle_wheel_direction",
+	"_b3w_vehicle_set_up_axis","_b3w_vehicle_up_axis","_b3w_vehicle_wheel_direction","_b3w_vehicle_wheel_mass",
 	"_b3w_vehicle_set_engine_force","_b3w_vehicle_set_brake","_b3w_vehicle_set_steering",
 	"_b3w_vehicle_set_side_friction","_b3w_vehicle_set_friction_slip",
 	"_b3w_vehicle_set_suspension_stiffness","_b3w_vehicle_set_suspension_compression",

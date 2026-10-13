@@ -4618,6 +4618,21 @@ void b3w_vehicle_wheel_direction( int handle, int index, float* out )
 }
 
 /**
+ * The mass a wheel's BODY carries — its share of the machine, see
+ * `ShareWheelMass`. With the chassis and every other body, it adds up to what
+ * the host asked the machine to weigh. 0 for no such wheel, or one with no body.
+ */
+float b3w_vehicle_wheel_mass( int handle, int index )
+{
+	Vehicle* v = b3w_vehicle_get( handle );
+	if ( v == NULL || index < 0 || index >= v->wheelCount || B3_IS_NULL( v->wheels[index].body ) )
+	{
+		return 0.0f;
+	}
+	return b3Body_GetMass( v->wheels[index].body );
+}
+
+/**
  * Draw every wheel body of every vehicle in a world, appended to the shim's
  * debug buffers.
  *
