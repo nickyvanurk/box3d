@@ -3880,6 +3880,29 @@ void b3w_vehicle_destroy_world( b3WorldId world )
 }
 
 /**
+ * The host just set this body's mass: if it is a vehicle's chassis, that is
+ * the WHOLE machine, so the wheels' share comes off it now.
+ *
+ * The step's own check — "the chassis weighs something this vehicle did not
+ * leave" — cannot see a whole that happens to equal the last share: a 10 kg
+ * block removed from a chassis whose wheel took 10 kg wrote exactly the figure
+ * the wheels had left, and the block's mass stayed on the car for good. Told
+ * at the write, there is nothing to infer, and the share lands before anything
+ * reads the mass instead of a tick later.
+ */
+void b3w_vehicle_chassis_mass_set( b3BodyId body )
+{
+	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	{
+		Vehicle* v = &g_vehicles[i];
+		if ( IsVehicleLive( v ) && B3_ID_EQUALS( v->chassis, body ) && b3Body_GetType( body ) == b3_dynamicBody )
+		{
+			RetakeWheelMass( v );
+		}
+	}
+}
+
+/**
  * Make room for one more wheel, doubling. False only when the heap is out.
  *
  * The three arrays grow together and are indexed in lockstep by every solver

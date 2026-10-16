@@ -2982,6 +2982,8 @@ float b3w_prismatic_translation( int handle, int joint )
 // ---------------------------------------------------------------------------
 
 int b3w_vehicle_create( b3WorldId world, int worldHandle, b3BodyId chassis );
+/** Defined in vehicle.c: the host set a body's mass; a chassis re-shares to its wheels. */
+void b3w_vehicle_chassis_mass_set( b3BodyId body );
 void b3w_vehicle_prepare( void* vehicle, float dt );
 void b3w_vehicle_substep( float h, void* context );
 void* b3w_vehicle_get( int handle );
@@ -3055,7 +3057,13 @@ void b3w_set_body_mass( int handle, int body, float mass )
 		return;
 	}
 
+	// From the shapes, every time, never from the mass the body has now. That
+	// is only the shapes' when they were just re-derived; a vehicle's chassis
+	// sits at the whole less its wheels' share, so scaling from it inflated the
+	// inertia by whole/share on every write that re-derived nothing first — a
+	// car released from the physgun turned twice as heavily each time.
 	b3BodyId id = BodyOf( world, body );
+	b3Body_ApplyMassFromShapes( id );
 	b3MassData md = b3Body_GetMassData( id );
 	if ( md.mass <= 0.0f )
 	{
@@ -3068,6 +3076,9 @@ void b3w_set_body_mass( int handle, int body, float mass )
 	md.inertia.cy = b3MulSV( scale, md.inertia.cy );
 	md.inertia.cz = b3MulSV( scale, md.inertia.cz );
 	b3Body_SetMassData( id, md );
+
+	// A chassis's mass is the whole machine's: its wheels take their share now.
+	b3w_vehicle_chassis_mass_set( id );
 }
 
 /**
