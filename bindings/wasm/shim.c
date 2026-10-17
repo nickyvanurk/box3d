@@ -2981,14 +2981,16 @@ float b3w_prismatic_translation( int handle, int joint )
 // JavaScript's world handle and body index into the ids it works in.
 // ---------------------------------------------------------------------------
 
-int b3w_vehicle_create( b3WorldId world, int worldHandle, b3BodyId chassis );
+int b3w_vehicle_create( b3WorldId world, int worldHandle, b3BodyId chassis, b3Filter filter );
 /** Defined in vehicle.c: the host set a body's mass; a chassis re-shares to its wheels. */
 void b3w_vehicle_chassis_mass_set( b3BodyId body );
 void b3w_vehicle_prepare( void* vehicle, float dt );
 void b3w_vehicle_substep( float h, void* context );
 void* b3w_vehicle_get( int handle );
 
-int b3w_create_vehicle( int handle, int chassis )
+/// The machine's collision filter is stated here, in the same terms the host
+/// gives its structure shapes (category, mask, group), and its tyres wear it.
+int b3w_create_vehicle( int handle, int chassis, int category, int mask, int group )
 {
 	World* world = GetWorld( handle );
 	b3BodyId chassisBody = BodyOf( world, chassis );
@@ -2996,7 +2998,11 @@ int b3w_create_vehicle( int handle, int chassis )
 	{
 		return -1;
 	}
-	return b3w_vehicle_create( world->id, handle, chassisBody );
+	b3Filter filter = b3DefaultFilter();
+	filter.categoryBits = (uint64_t)(uint32_t)category;
+	filter.maskBits = (uint64_t)(uint32_t)mask;
+	filter.groupIndex = group;
+	return b3w_vehicle_create( world->id, handle, chassisBody, filter );
 }
 
 /**

@@ -626,9 +626,25 @@ typedef struct
 	float chassisMassAsLeft;
 	/** This vehicle's slot, so a tyre shape can name its wheel. */
 	int handle;
+	/**
+	 * The machine's collision filter, which its tyres and treads wear: STATED by
+	 * the host at creation, never read off a chassis shape.
+	 *
+	 * It used to be "the first chassis shape that is not a tyre or bump stop".
+	 * Box3D lists a body's shapes newest first, so any shape the host added
+	 * after the build won — a seated rider's capsule is a character with no
+	 * group, and every tyre that copied it met the machine's own jointed parts:
+	 * a seated bus kicked itself sideways every half second, its joints
+	 * stretched a quarter metre, and it crept away. The host owns its filters;
+	 * the engine never infers one.
+	 *
+	 * (The bump stops still copy the chassis's first shape at `add_wheel`, so
+	 * every stop after the first wheel's carries a zero mask and has never
+	 * stopped anything. Reviving them is a tuning change — a ballasted tank
+	 * then drags on them — and is left to be made on its own.)
+	 */
+	b3Filter filter;
 } Vehicle;
-
-static bool MachineFilter( const Vehicle* v, b3Filter* filter );
 
 static b3Vec3 AxisVector( int index )
 {
@@ -3016,46 +3032,6 @@ static b3Pos WheelCentreNow( const Vehicle* v, const Wheel* w, b3Vec3* down )
 }
 
 /**
- * The collision filter of the MACHINE: any chassis shape that is not one of this
- * vehicle's own bump stops or tyres.
- *
- * Box3D lists a body's shapes newest first, so "the chassis's first shape" is
- * whatever the vehicle added last — a bump stop, held out of the world with a
- * zero mask, or a tyre. A tyre that copied it collided with nothing.
- *
- * (The bump stops copy "the first shape" themselves, so every stop after the
- * first wheel's carries a zero mask and has never stopped anything. Reviving
- * them is a tuning change — a ballasted tank then drags on them — and is left
- * to be made on its own.)
- */
-static bool MachineFilter( const Vehicle* v, b3Filter* filter )
-{
-	int capacity = b3Body_GetShapeCount( v->chassis );
-	b3ShapeId stack[64];
-	b3ShapeId* shapes = capacity <= 64 ? stack : (b3ShapeId*)malloc( sizeof( b3ShapeId ) * (size_t)capacity );
-	int count = b3Body_GetShapes( v->chassis, shapes, capacity );
-	bool found = false;
-	for ( int i = 0; i < count && !found; i++ )
-	{
-		bool ours = false;
-		for ( int k = 0; k < v->wheelCount && !ours; k++ )
-		{
-			ours = B3_ID_EQUALS( shapes[i], v->wheels[k].stopShape ) || B3_ID_EQUALS( shapes[i], v->wheels[k].tyreShape );
-		}
-		if ( !ours )
-		{
-			*filter = b3Shape_GetFilter( shapes[i] );
-			found = true;
-		}
-	}
-	if ( shapes != stack )
-	{
-		free( shapes );
-	}
-	return found;
-}
-
-/**
  * Keep a wheel's tyre shape matching the wheel, and its tread turning with it.
  *
  * The shape is the tyre (less the clearance) swept along the suspension from
@@ -3107,12 +3083,6 @@ static void UpdateTyre( Vehicle* v, Wheel* w, int index )
 	bool shaped = B3_IS_NON_NULL( w->tyreShape ) && b3Shape_IsValid( w->tyreShape );
 	if ( !shaped || fabsf( top - w->tyreTop ) > 1.0e-3f || fabsf( bottom - w->tyreBottom ) > 1.0e-3f )
 	{
-		b3Filter machine;
-		if ( !MachineFilter( v, &machine ) )
-		{
-			return;
-		}
-
 		// ROUND, as the tyre is: two treads of `TREAD_SEGMENTS` points around the
 		// axle — the shape the cast already sweeps — one where the tyre sits fully
 		// compressed and one where it sits loaded, and the hull of them: the tyre
@@ -3148,7 +3118,7 @@ static void UpdateTyre( Vehicle* v, Wheel* w, int index )
 		b3ShapeDef def = b3DefaultShapeDef();
 		def.density = 0.0f;
 		def.baseMaterial.friction = TYRE_FRICTION;
-		def.filter = machine;
+		def.filter = v->filter;
 		def.enablePreSolveEvents = true;
 		def.enableCustomFiltering = true;
 		def.userData = (void*)(intptr_t)( B3W_TYRE_TAG | ( v->handle << 12 ) | index );
@@ -3167,19 +3137,6 @@ static void UpdateTyre( Vehicle* v, Wheel* w, int index )
 		b3Shape_SetContactAnchor( w->tyreShape, true, w->chassisConnectionPointCs );
 		w->tyreTop = top;
 		w->tyreBottom = bottom;
-	}
-
-	// The machine's collision as it is NOW: a host rewrites its machine's filters
-	// (a placed copy meets no other placed copy) and knows nothing of a tyre the
-	// engine made, so the tyre follows.
-	b3Filter now;
-	if ( MachineFilter( v, &now ) )
-	{
-		b3Filter had = b3Shape_GetFilter( w->tyreShape );
-		if ( had.categoryBits != now.categoryBits || had.maskBits != now.maskBits || had.groupIndex != now.groupIndex )
-		{
-			b3Shape_SetFilter( w->tyreShape, now, true );
-		}
 	}
 
 	// The tread: the wheel's spin about its (steered) axle, through its centre, as
@@ -3335,11 +3292,10 @@ static void UpdateTread( Vehicle* v, Wheel* w )
 	}
 
 	b3Filter want = { 0 };
-	b3Filter machine;
 	bool standing = w->treadOn && IsTreadOnTerrain( w );
-	if ( !w->info.isInContact && ( w->info.terrainNear || standing ) && MachineFilter( v, &machine ) )
+	if ( !w->info.isInContact && ( w->info.terrainNear || standing ) )
 	{
-		want = machine;
+		want = v->filter;
 	}
 
 	b3Filter had = b3Shape_GetFilter( w->treadShape );
@@ -4050,7 +4006,7 @@ Vehicle* b3w_vehicle_get( int handle )
 	return &g_vehicles[handle];
 }
 
-int b3w_vehicle_create( b3WorldId world, int worldHandle, b3BodyId chassis )
+int b3w_vehicle_create( b3WorldId world, int worldHandle, b3BodyId chassis, b3Filter filter )
 {
 	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
 	{
@@ -4069,6 +4025,7 @@ int b3w_vehicle_create( b3WorldId world, int worldHandle, b3BodyId chassis )
 		v->indexUpAxis = 1;
 		v->indexForwardAxis = 0;
 		v->owner = 0;
+		v->filter = filter;
 		return i;
 	}
 	return -1;

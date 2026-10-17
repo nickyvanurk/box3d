@@ -527,7 +527,7 @@ static WheelRig CreateRig( float slopeRadians, int wheelCount )
 	b3BoxHull chassisBox = b3MakeBoxHull( 0.6f, 0.3f, 0.4f );
 	b3CreateHullShape( rig.chassis, &chassisShape, &chassisBox.base );
 
-	rig.vehicle = b3w_vehicle_create( rig.world, 0, rig.chassis );
+	rig.vehicle = b3w_vehicle_create( rig.world, 0, rig.chassis, chassisShape.filter );
 	// The tyre's rules, as the shim installs them for every game world.
 	b3World_SetPreSolveCallback( rig.world, RigPreSolve, NULL );
 	b3World_SetCustomFilterCallback( rig.world, RigPairFilter, NULL );
@@ -2295,7 +2295,7 @@ static int RebuildingAVehicleManyTimes( void )
 	b3BoxHull otherBox = b3MakeBoxHull( 0.6f, 0.3f, 0.4f );
 	b3CreateHullShape( other.chassis, &otherShape, &otherBox.base );
 
-	other.vehicle = b3w_vehicle_create( rig.world, 0, other.chassis );
+	other.vehicle = b3w_vehicle_create( rig.world, 0, other.chassis, otherShape.filter );
 	AddRigWheels( &other, 4 );
 
 	for ( int round = 0; round < 200; round++ )
@@ -2316,7 +2316,7 @@ static int RebuildingAVehicleManyTimes( void )
 		b3BoxHull box = b3MakeBoxHull( 0.6f, 0.3f, 0.4f );
 		b3CreateHullShape( rig.chassis, &shapeDef, &box.base );
 
-		rig.vehicle = b3w_vehicle_create( rig.world, 0, rig.chassis );
+		rig.vehicle = b3w_vehicle_create( rig.world, 0, rig.chassis, shapeDef.filter );
 		AddRigWheels( &rig, 4 );
 		b3World_SetSubStepCallback( rig.world, RigSubstep, (void*)(intptr_t)rig.vehicle );
 
