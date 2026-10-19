@@ -2881,13 +2881,17 @@ void b3w_body_defer_mass( int handle, int body, int deferred )
 /**
  * Destroy one shape, leaving its body alone.
  *
- * `updateBodyMass` is true because the game rebuilds a body's colliders in
+ * The body's mass is updated because the game rebuilds a body's colliders in
  * place — a structure that loses a block must lose its mass with it, or every
  * force applied afterwards is computed against a body heavier than it looks.
+ * While the body's mass is deferred (`b3w_body_defer_mass`) the update waits for
+ * the deferral to end, as it does for shapes added: tearing down a batch of
+ * shapes is then linear, not quadratic, in the body's shape count.
  */
 void b3w_destroy_shape( int handle, int shape )
 {
-	b3ShapeId* id = ResolveShape( GetWorld( handle ), shape );
+	World* world = GetWorld( handle );
+	b3ShapeId* id = ResolveShape( world, shape );
 	if ( id == NULL )
 	{
 		return;
@@ -2895,7 +2899,9 @@ void b3w_destroy_shape( int handle, int shape )
 
 	if ( b3Shape_IsValid( *id ) )
 	{
-		b3DestroyShape( *id, true );
+		int body = (int)(intptr_t)b3Body_GetUserData( b3Shape_GetBody( *id ) ) - 1;
+		bool deferred = body >= 0 && body < world->bodyCount && world->massDeferred[body] != 0;
+		b3DestroyShape( *id, deferred == false );
 	}
 }
 
