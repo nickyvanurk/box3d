@@ -4,6 +4,7 @@
 #include "gfx/debug_adapter.h"
 #include "gfx/draw.h"
 #include "gfx/keycodes.h"
+#include "gfx/shadow.h"
 #include "gfx/text.h"
 #include "imgui.h"
 #include "sample.h"
@@ -215,7 +216,7 @@ enum SelectionKind
 //   - right info panel (DrawControls): Show Timeline button, view toggles, frame counter, and the
 //     selection detail
 //   - left Outline window (DrawSampleWindows): the recorded scene tree
-//   - Timeline tab in the diagnostics drawer (DrawMetricsTab): transport, scrubber, keyframe readout
+//   - Timeline tab in the metrics drawer (DrawMetricsTab): transport, scrubber, keyframe readout
 class ReplayViewer : public Sample
 {
 public:
@@ -300,7 +301,7 @@ public:
 	{
 		if ( m_player != nullptr )
 		{
-			b3RecPlayer_Destroy( m_player );
+			b3DestroyPlayer( m_player );
 			m_player = nullptr;
 		}
 		m_replayWorldId = b3_nullWorldId;
@@ -336,7 +337,7 @@ public:
 		if ( recording != nullptr )
 		{
 			m_player =
-				b3RecPlayer_Create( b3Recording_GetData( recording ), b3Recording_GetSize( recording ), m_context->workerCount );
+				b3CreatePlayer( b3Recording_GetData( recording ), b3Recording_GetSize( recording ), m_context->workerCount );
 			b3DestroyRecording( recording );
 		}
 		else
@@ -394,6 +395,14 @@ public:
 			m_camera->SetRenderTransform( b3GetLengthUnitsPerMeter(), m_context->viewZUp );
 			float aspect = m_camera->m_height > 0 ? (float)m_camera->m_width / (float)m_camera->m_height : 1.0f;
 			m_camera->Frame( m_info.bounds, aspect, 0.75f );
+
+			// The bounds include static geometry, and a large ground plate can push the fit past the
+			// draw distance, which culls the whole scene. Pull in so the middle of the scene still draws.
+			float maxRadius = 0.75f * m_context->drawDistance;
+			if ( m_camera->m_radius > maxRadius )
+			{
+				m_camera->SetOrbit( m_camera->m_yaw, m_camera->m_pitch, maxRadius );
+			}
 		}
 	}
 
@@ -522,7 +531,8 @@ public:
 	}
 
 	// , steps backward. Forward is the global single step on . so it works in every sample, and the
-	// step count lands in the context. Shift moves five frames, matching that key.
+	// step count lands in the context. Shift moves five frames, matching that key. Esc drops the
+	// selection.
 	void Keyboard( int key, int action, int mods ) override
 	{
 		if ( m_generating )
@@ -535,7 +545,11 @@ public:
 			return;
 		}
 
-		if ( key == KEY_COMMA )
+		if ( key == KEY_ESCAPE )
+		{
+			m_selKind = SelNone;
+		}
+		else if ( key == KEY_COMMA )
 		{
 			int back = ( mods & MOD_SHIFT ) ? 5 : 1;
 			SeekTo( b3RecPlayer_GetFrame( m_player ) - back );
@@ -613,8 +627,19 @@ public:
 		b3DebugDraw debugDraw;
 		MakeDebugDraw( &debugDraw );
 		ApplyGuiFlags( &debugDraw );
-		debugDraw.drawingBounds = m_camera->DrawBounds(); // view-distance box in length units around the eye
-		SetViewBounds( debugDraw.drawingBounds );
+		const b3AABB drawBox = m_camera->DrawBounds(); // view-distance box in length units around the eye
+
+		// Reach past the view box for casters between it and the sun, see Sample::Draw.
+		b3Vec3 casterLo, casterHi;
+		const Mat4 viewInv = m_camera->ViewInverse();
+		const Mat4 projInv = m_camera->ProjInverse();
+		GetShadowCasterBounds( &viewInv, &projInv, &casterLo, &casterHi );
+		const b3AABB casterBox = b3OffsetAABB( { casterLo, casterHi }, m_camera->DrawOrigin() );
+
+		debugDraw.drawingBounds.lowerBound = b3Min( drawBox.lowerBound, casterBox.lowerBound );
+		debugDraw.drawingBounds.upperBound = b3Max( drawBox.upperBound, casterBox.upperBound );
+
+		SetViewBounds( drawBox );
 
 		// Drive the shared outline highlight from the selection. A shape selection outlines that
 		// shape alone, a body selection outlines the whole body. Set before the draw so the mask
@@ -666,6 +691,11 @@ public:
 	// A replay re-runs recorded inputs, so the live solver sliders would do nothing. This also hides
 	// the Solver and Recording sections in the right info panel.
 	bool HasSolverControls() const override
+	{
+		return false;
+	}
+
+	bool HasProfile() const override
 	{
 		return false;
 	}
@@ -1064,7 +1094,7 @@ public:
 		float menuBarHeight = ImGui::GetFrameHeight();
 		float top = menuBarHeight + 0.5f * fontSize;
 
-		// Stop above the diagnostics drawer when it is open so the panels do not overlap. The 16 em
+		// Stop above the metrics drawer when it is open so the panels do not overlap. The 16 em
 		// drawer height mirrors DrawMetrics.
 		float bottom = m_context->showMetrics ? ( m_camera->m_height - 16.0f * fontSize - fontSize )
 											  : ( m_camera->m_height - 0.5f * fontSize );
@@ -1508,6 +1538,20 @@ public:
 		b3AABB aabb = b3Shape_GetAABB( shape );
 		ImGui::Text( "aabb (%.2f, %.2f, %.2f)", aabb.lowerBound.x, aabb.lowerBound.y, aabb.lowerBound.z );
 		ImGui::Text( "     (%.2f, %.2f, %.2f)", aabb.upperBound.x, aabb.upperBound.y, aabb.upperBound.z );
+
+		if ( b3Shape_GetType( shape ) == b3_compoundShape )
+		{
+			const b3CompoundData* compound = b3Shape_GetCompound( shape );
+			int childCount = compound->capsuleCount + compound->hullCount + compound->meshCount + compound->sphereCount;
+			ImGui::Text( "children %d", childCount );
+			ImGui::Text( "  capsules %d", compound->capsuleCount );
+			ImGui::Text( "  hulls    %d (%d unique)", compound->hullCount, compound->sharedHullCount );
+			ImGui::Text( "  meshes   %d (%d unique)", compound->meshCount, compound->sharedMeshCount );
+			ImGui::Text( "  spheres  %d", compound->sphereCount );
+			ImGui::Text( "materials %d", compound->materialCount );
+			ImGui::Text( "tree height %d  nodes %d", compound->treeHeight, compound->nodeCount );
+			ImGui::Text( "bytes %d", compound->byteCount );
+		}
 	}
 
 	void DrawContactDetail( b3BodyId body )
@@ -1642,7 +1686,7 @@ public:
 		}
 	}
 
-	// Timeline tab in the diagnostics drawer: file, transport, keyframe readout, scrubber, divergence.
+	// Timeline tab in the metrics drawer: file, transport, keyframe readout, scrubber, divergence.
 	void DrawMetricsTab() override
 	{
 		ImGuiTabItemFlags flags = m_selectTimelineTab ? ImGuiTabItemFlags_SetSelected : 0;
@@ -1729,7 +1773,12 @@ public:
 		b3Counters c = b3World_GetCounters( m_replayWorldId );
 		ImGui::Text( "frames %d", m_info.frameCount );
 		ImGui::SameLine();
-		ImGui::Text( "   %.0f hz, %d sub-steps", hz, m_info.subStepCount );
+		ImGui::Text( "   %.0f Hz, %d sub-steps", hz, m_info.subStepCount );
+		if ( m_info.lengthScale > 0.0f )
+		{
+			ImGui::SameLine();
+			ImGui::Text( "   %g units/m", m_info.lengthScale );
+		}
 		ImGui::SameLine();
 		ImGui::Text( "   bodies %d  shapes %d  contacts %d  joints %d", c.bodyCount, c.shapeCount, c.contactCount, c.jointCount );
 

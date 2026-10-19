@@ -411,121 +411,126 @@ void b3SolveRevoluteJoint( b3JointSim* base, b3StepContext* context, bool useBia
 
 	b3Quat relQ = b3InvMulQuat( quatA, quatB );
 
-	// Solve spring
-	if ( joint->enableSpring && fixedRotation == false )
+	if ( fixedRotation == false && ( joint->enableSpring || joint->enableMotor || joint->enableLimit ) )
 	{
-		// Get the substep relative rotation
-		float targetAngle = joint->targetAngle;
-		float angle = b3GetTwistAngle( relQ );
-
-		// The SHORTEST arc to the target, never the raw difference.
-		//
-		// Both terms live on a circle: `b3GetTwistAngle` returns (-pi, pi] and the
-		// target is asserted into the same range, so their difference reaches 2*pi
-		// and the spring then drives the joint the LONG way round. A servo tracking
-		// a continuously rotating command crosses the +/-pi seam every revolution,
-		// where the target flips sign and the error jumps from ~0 to ~2*pi.
-		//
-		// Found on the game's mouse-look tank turret: sweeping the camera spun the
-		// chassis at 53 rad/s — eight revolutions a second — because every seam
-		// crossing asked the turret for a full extra turn and the reaction torque
-		// went into the vehicle. It only became visible once the servo was strong
-		// enough to obey (its damping ratio had been wrong by ~150x), which is why
-		// a correct spring made a quiet bug violent.
-		float c = b3UnwindAngle( angle - targetAngle );
-
-		float bias = joint->springSoftness.biasRate * c;
-		float massScale = joint->springSoftness.massScale;
-		float impulseScale = joint->springSoftness.impulseScale;
-		float cdot = b3Dot( b3Sub( wB, wA ), joint->rotationAxisZ );
-
-		float deltaImpulse = -massScale * joint->axialMass * ( cdot + bias ) - impulseScale * joint->springImpulse;
-		joint->springImpulse += deltaImpulse;
-
-		wA = b3MulSub( wA, deltaImpulse, b3MulMV( iA, joint->rotationAxisZ ) );
-		wB = b3MulAdd( wB, deltaImpulse, b3MulMV( iB, joint->rotationAxisZ ) );
-	}
-
-	if ( joint->enableMotor && fixedRotation == false )
-	{
-		float cdot = b3Dot( b3Sub( wB, wA ), joint->rotationAxisZ ) - joint->motorSpeed;
-
-		float deltaImpulse = -joint->axialMass * cdot;
-		float newImpulse = joint->motorImpulse + deltaImpulse;
-		float maxImpulse = joint->maxMotorTorque * context->h;
-		newImpulse = b3ClampFloat( newImpulse, -maxImpulse, maxImpulse );
-		deltaImpulse = newImpulse - joint->motorImpulse;
-		joint->motorImpulse = newImpulse;
-
-		wA = b3MulSub( wA, deltaImpulse, b3MulMV( iA, joint->rotationAxisZ ) );
-		wB = b3MulAdd( wB, deltaImpulse, b3MulMV( iB, joint->rotationAxisZ ) );
-	}
-
-	if ( joint->enableLimit && fixedRotation == false )
-	{
-		float angle = b3GetTwistAngle( relQ );
-
-		// todo does an updated twist axis help?
-
 		b3Vec3 axis = joint->rotationAxisZ;
+		b3Vec3 gA = b3MulMV( iA, axis );
+		b3Vec3 gB = b3MulMV( iB, axis );
+		float k = b3Dot( axis, b3Add( gA, gB ) );
+		float axialCdot = b3Dot( b3Sub( wB, wA ), axis );
+		float axialImpulse = 0.0f;
 
-		// Lower limit
+		// Solve spring
+		if ( joint->enableSpring )
 		{
-			float c = angle - joint->lowerAngle;
-			float bias = 0.0f;
-			float massScale = 1.0f;
-			float impulseScale = 0.0f;
-			if ( c > 0.0f )
-			{
-				// speculation
-				bias = b3RigidAngularBias( c, context );
-			}
-			else if ( useBias )
-			{
-				bias = base->constraintSoftness.biasRate * c;
-				massScale = base->constraintSoftness.massScale;
-				impulseScale = base->constraintSoftness.impulseScale;
-			}
+			// Get the substep relative rotation
+			float targetAngle = joint->targetAngle;
+			float angle = b3GetTwistAngle( relQ );
 
-			float cdot = b3Dot( b3Sub( wB, wA ), axis );
-			float oldImpulse = joint->lowerImpulse;
-			float deltaImpulse = -massScale * joint->axialMass * ( cdot + bias ) - impulseScale * oldImpulse;
-			joint->lowerImpulse = b3MaxFloat( oldImpulse + deltaImpulse, 0.0f );
-			deltaImpulse = joint->lowerImpulse - oldImpulse;
+			// The SHORTEST arc to the target, never the raw difference.
+			//
+			// Both terms live on a circle: `b3GetTwistAngle` returns (-pi, pi] and the
+			// target is asserted into the same range, so their difference reaches 2*pi
+			// and the spring then drives the joint the LONG way round. A servo tracking
+			// a continuously rotating command crosses the +/-pi seam every revolution,
+			// where the target flips sign and the error jumps from ~0 to ~2*pi.
+			//
+			// Found on the game's mouse-look tank turret: sweeping the camera spun the
+			// chassis at 53 rad/s — eight revolutions a second — because every seam
+			// crossing asked the turret for a full extra turn and the reaction torque
+			// went into the vehicle. It only became visible once the servo was strong
+			// enough to obey (its damping ratio had been wrong by ~150x), which is why
+			// a correct spring made a quiet bug violent.
+			float c = b3UnwindAngle( angle - targetAngle );
 
-			wA = b3MulSub( wA, deltaImpulse, b3MulMV( iA, axis ) );
-			wB = b3MulAdd( wB, deltaImpulse, b3MulMV( iB, axis ) );
+			float bias = joint->springSoftness.biasRate * c;
+			float massScale = joint->springSoftness.massScale;
+			float impulseScale = joint->springSoftness.impulseScale;
+
+			float deltaImpulse = -massScale * joint->axialMass * ( axialCdot + bias ) - impulseScale * joint->springImpulse;
+			joint->springImpulse += deltaImpulse;
+
+			axialCdot += k * deltaImpulse;
+			axialImpulse += deltaImpulse;
 		}
 
-		// Upper limit
+		if ( joint->enableMotor )
 		{
-			float c = joint->upperAngle - angle;
-			float bias = 0.0f;
-			float massScale = 1.0f;
-			float impulseScale = 0.0f;
-			if ( c > 0.0f )
-			{
-				// speculation
-				bias = b3RigidAngularBias( c, context );
-			}
-			else if ( useBias )
-			{
-				bias = base->constraintSoftness.biasRate * c;
-				massScale = base->constraintSoftness.massScale;
-				impulseScale = base->constraintSoftness.impulseScale;
-			}
+			float cdot = axialCdot - joint->motorSpeed;
+			float oldImpulse = joint->motorImpulse;
+			float maxImpulse = joint->maxMotorTorque * context->h;
+			float deltaImpulse = b3ClampFloat( -joint->axialMass * cdot, -maxImpulse - oldImpulse, maxImpulse - oldImpulse );
+			joint->motorImpulse = oldImpulse + deltaImpulse;
 
-			// sign flipped on Cdot
-			float cdot = b3Dot( b3Sub( wA, wB ), axis );
-			float oldImpulse = joint->upperImpulse;
-			float deltaImpulse = -massScale * joint->axialMass * ( cdot + bias ) - impulseScale * oldImpulse;
-			joint->upperImpulse = b3MaxFloat( oldImpulse + deltaImpulse, 0.0f );
-			deltaImpulse = joint->upperImpulse - oldImpulse;
-
-			// sign flipped on applied impulse
-			wA = b3MulAdd( wA, deltaImpulse, b3MulMV( iA, axis ) );
-			wB = b3MulSub( wB, deltaImpulse, b3MulMV( iB, axis ) );
+			axialCdot += k * deltaImpulse;
+			axialImpulse += deltaImpulse;
 		}
+
+		if ( joint->enableLimit )
+		{
+			float angle = b3GetTwistAngle( relQ );
+
+			// todo does an updated twist axis help?
+
+			// Lower limit
+			{
+				float c = angle - joint->lowerAngle;
+				float bias = 0.0f;
+				float massScale = 1.0f;
+				float impulseScale = 0.0f;
+				if ( c > 0.0f )
+				{
+					// speculation
+					bias = b3RigidAngularBias( c, context );
+				}
+				else if ( useBias )
+				{
+					bias = base->constraintSoftness.biasRate * c;
+					massScale = base->constraintSoftness.massScale;
+					impulseScale = base->constraintSoftness.impulseScale;
+				}
+
+				float oldImpulse = joint->lowerImpulse;
+				float deltaImpulse =
+					b3MaxFloat( -massScale * joint->axialMass * ( axialCdot + bias ) - impulseScale * oldImpulse, -oldImpulse );
+				joint->lowerImpulse = oldImpulse + deltaImpulse;
+
+				axialCdot += k * deltaImpulse;
+				axialImpulse += deltaImpulse;
+			}
+
+			// Upper limit
+			{
+				float c = joint->upperAngle - angle;
+				float bias = 0.0f;
+				float massScale = 1.0f;
+				float impulseScale = 0.0f;
+				if ( c > 0.0f )
+				{
+					// speculation
+					bias = b3RigidAngularBias( c, context );
+				}
+				else if ( useBias )
+				{
+					bias = base->constraintSoftness.biasRate * c;
+					massScale = base->constraintSoftness.massScale;
+					impulseScale = base->constraintSoftness.impulseScale;
+				}
+
+				// sign flipped on Cdot
+				float cdot = -axialCdot;
+				float oldImpulse = joint->upperImpulse;
+				float deltaImpulse =
+					b3MaxFloat( -massScale * joint->axialMass * ( cdot + bias ) - impulseScale * oldImpulse, -oldImpulse );
+				joint->upperImpulse = oldImpulse + deltaImpulse;
+
+				// sign flipped on applied impulse
+				axialImpulse -= deltaImpulse;
+			}
+		}
+
+		wA = b3MulSub( wA, axialImpulse, gA );
+		wB = b3MulAdd( wB, axialImpulse, gB );
 	}
 
 	// Collinearity constraint
@@ -592,17 +597,7 @@ void b3SolveRevoluteJoint( b3JointSim* base, b3StepContext* context, bool useBia
 			impulseScale = base->constraintSoftness.impulseScale;
 		}
 
-		//// K = [(1/m1 + 1/m2) * eye(2) - skew(r1) * invI1 * skew(r1) - skew(r2) * invI2 * skew(r2)]
-		b3Matrix3 sA = b3Skew( rA );
-		b3Matrix3 sB = b3Skew( rB );
-		b3Matrix3 kA = b3MulMM( sA, b3MulMM( base->invIA, sA ) );
-		b3Matrix3 kB = b3MulMM( sB, b3MulMM( base->invIB, sB ) );
-		b3Matrix3 k = b3NegateMat3( b3AddMM( kA, kB ) );
-		k.cx.x += mA + mB;
-		k.cy.y += mA + mB;
-		k.cz.z += mA + mB;
-
-		b3Vec3 b = b3Solve3( k, b3Add( cdot, bias ) );
+		b3Vec3 b = b3SolvePointConstraint( mA, mB, base->invIA, base->invIB, rA, rB, b3Add( cdot, bias ) );
 
 		b3Vec3 impulse = b3Sub( b3MulSV( -massScale, b ), b3MulSV( impulseScale, joint->linearImpulse ) );
 		joint->linearImpulse = b3Add( joint->linearImpulse, impulse );

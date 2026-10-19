@@ -7,8 +7,14 @@
 
 #include <stddef.h>
 
-// Content hash and equality over the whole baked hull. Shared by every hull
-// de-duplication map so they agree on identity.
+// Big enough to handle AVX2.
+#define B3_HULL_SOA_PADDING 8
+
+static inline int b3GetHullSoaStride( int count )
+{
+	return ( count + B3_HULL_SOA_PADDING - 1 ) & ~( B3_HULL_SOA_PADDING - 1 );
+}
+
 uint64_t b3HashHullData( const b3HullData* hull );
 bool b3CompareHullData( const b3HullData* hull1, const b3HullData* hull2 );
 

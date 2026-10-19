@@ -80,6 +80,20 @@ set_target_properties(implot PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
+# ImGuizmo vendored from github.com/CedricGuillemet/ImGuizmo at 18cef5e (2026-08-08), ImGuizmo.cpp/.h only.
+add_library(imguizmo STATIC
+    "${CMAKE_SOURCE_DIR}/extern/imguizmo/ImGuizmo.cpp"
+    "${CMAKE_SOURCE_DIR}/extern/imguizmo/ImGuizmo.h"
+)
+target_link_libraries(imguizmo PUBLIC imgui)
+target_include_directories(imguizmo SYSTEM PUBLIC "${CMAKE_SOURCE_DIR}/extern/imguizmo")
+set_target_properties(imguizmo PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+    POSITION_INDEPENDENT_CODE ON
+)
+
 # --- sokol: vendored headers INTERFACE target + per-platform backend. --------
 set(sokol_SOURCE_DIR "${CMAKE_SOURCE_DIR}/extern/sokol")
 add_library(sokol INTERFACE)
@@ -177,6 +191,7 @@ set(SAMPLE_FILES
     sample_mesh.cpp
     sample_ragdoll.cpp
     sample_replay.cpp
+    sample_restitution.cpp
     sample_robustness.cpp
     sample_shapes.cpp
     sample_stacking.cpp
@@ -194,14 +209,16 @@ endif()
 
 # Include root is the samples dir so "gfx/..." and "host/..." prefixes resolve.
 # The data dir is on the path too so samples can #include recorded dumps
-# (sample_issues pulls dumps/.../box3d_dump.inl at compile time).
+# (sample_issues pulls dumps/.../box3d_dump.inl at compile time). src is on the
+# path so sample_tree.cpp can reach dynamic_tree.h for the node layout helpers.
 target_include_directories(samples PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../data")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../data"
+    "${CMAKE_SOURCE_DIR}/src")
 
 # gfx: the renderer + Draw*/adapter. shared: human, utils (Random*), the
 # benchmark/determinism helpers the samples lean on.
-target_link_libraries(samples PRIVATE gfx shared imgui implot sokol nfd)
+target_link_libraries(samples PRIVATE gfx shared imgui implot imguizmo sokol nfd)
 
 # MSVC auto-links winmm via a #pragma comment in main.cpp. MinGW ignores that
 # pragma, so link the timeBeginPeriod/timeEndPeriod library explicitly.

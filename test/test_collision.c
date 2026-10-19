@@ -9,6 +9,7 @@
 #include "box3d/math_functions.h"
 
 #include <float.h>
+#include <stdio.h>
 
 static int AABBTest( void )
 {
@@ -298,9 +299,54 @@ static int LargeWorldAABBTest( void )
 	return 0;
 }
 
+// Every-hit mesh casts skip triangle backsides, like b3ShapeCastMesh, under either winding.
+static int ShapeCastMeshAllIgnoresBacksides( void )
+{
+	b3Vec3 vertices[4] = { { -5.0f, 0.0f, -5.0f }, { 5.0f, 0.0f, -5.0f }, { 5.0f, 0.0f, 5.0f }, { -5.0f, 0.0f, 5.0f } };
+	int32_t indices[6] = { 0, 3, 2, 0, 2, 1 };
+	b3MeshDef meshDef = { 0 };
+	meshDef.vertices = vertices;
+	meshDef.indices = indices;
+	meshDef.vertexCount = 4;
+	meshDef.triangleCount = 2;
+	b3MeshData* data = b3CreateMesh( &meshDef, NULL, 0 );
+
+	b3Vec3 point = { 1.0f, 2.0f, -2.0f };
+	b3ShapeCastInput down = { 0 };
+	down.proxy = (b3ShapeProxy){ &point, 1, 0.25f };
+	down.translation = (b3Vec3){ 0.0f, -4.0f, 0.0f };
+	down.maxFraction = 1.0f;
+
+	b3Vec3 below = { 1.0f, -2.0f, -2.0f };
+	b3ShapeCastInput up = down;
+	up.proxy.points = &below;
+	up.translation = (b3Vec3){ 0.0f, 4.0f, 0.0f };
+
+	b3Vec3 scales[2] = { { 1.0f, 1.0f, 1.0f }, { -1.0f, 1.0f, 1.0f } };
+	for ( int i = 0; i < 2; ++i )
+	{
+		b3Mesh mesh = { data, scales[i] };
+		b3CastOutput outputs[4];
+
+		b3CastOutput nearest = b3ShapeCastMesh( &mesh, &down );
+		int count = b3ShapeCastMeshAll( &mesh, &down, outputs, 4 );
+		printf( "    scale %+.0f: nearest %.4f, all %d first %.4f\n", scales[i].x, nearest.fraction, count, outputs[0].fraction );
+		ENSURE( nearest.hit );
+		ENSURE( count == 1 );
+		ENSURE_SMALL( outputs[0].fraction - nearest.fraction, 1e-5f );
+
+		ENSURE( b3ShapeCastMesh( &mesh, &up ).hit == false );
+		ENSURE( b3ShapeCastMeshAll( &mesh, &up, outputs, 4 ) == 0 );
+	}
+
+	b3DestroyMesh( data );
+	return 0;
+}
+
 int CollisionTest( void )
 {
 	RUN_SUBTEST( AABBTest );
+	RUN_SUBTEST( ShapeCastMeshAllIgnoresBacksides );
 	RUN_SUBTEST( TestRayAABBIntersection );
 	RUN_SUBTEST( LargeWorldManifoldTest );
 	RUN_SUBTEST( LargeWorldAABBTest );

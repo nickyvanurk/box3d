@@ -15,7 +15,7 @@ jobs:
   test:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.timeout || 4 }}
+    timeout-minutes: ${{ matrix.timeout || 10 }}
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     strategy:
       fail-fast: false
@@ -28,11 +28,13 @@ jobs:
             os: ubuntu-latest
             args: '-DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_C_COMPILER=clang-18 -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"'
             test: ./bin/test
+          # Runner speed varies about 3x by region and MSan at -O0 can exceed the timeout on the slow ones.
+          # -O1 is the level MSan recommends and Debug keeps asserts. Line buffering shows per test timing.
           - name: ubuntu-clang-msan
             os: ubuntu-latest
             timeout: 10
-            args: '-DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_C_COMPILER=clang-18 -DCMAKE_C_FLAGS="-fsanitize=memory -fsanitize-memory-track-origins=1 -fno-omit-frame-pointer" -DCMAKE_CXX_FLAGS="-fsanitize=memory -fsanitize-memory-track-origins=1 -fno-omit-frame-pointer" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=memory"'
-            test: ./bin/test
+            args: '-DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_C_COMPILER=clang-18 -DCMAKE_C_FLAGS="-O1 -fsanitize=memory -fsanitize-memory-track-origins=1 -fno-omit-frame-pointer" -DCMAKE_CXX_FLAGS="-O1 -fsanitize=memory -fsanitize-memory-track-origins=1 -fno-omit-frame-pointer" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=memory"'
+            test: lscpu | grep 'Model name'; nproc; stdbuf -oL ./bin/test
             msan-options: abort_on_error=1:halt_on_error=1
           - name: macos
             os: macos-latest
@@ -51,6 +53,8 @@ jobs:
             test: ./bin/Debug/test
           - name: windows-arm64
             os: windows-11-arm
+            msvc: true
+            msvc-arch: arm64
             args: -A arm64 -DBOX3D_DISABLE_SIMD=TRUE -DBOX3D_SANITIZE=ON
             test: ./bin/Debug/test
           # Optimized runs. The determinism golden hashes are otherwise only checked at -O0,
@@ -80,13 +84,13 @@ jobs:
       if: ${{ matrix.msvc }}
       uses: TheMrMilchmann/setup-msvc-dev@v4
       with:
-        arch: x64
+        arch: ${{ matrix['msvc-arch'] || 'x64' }}
 
     - name: Configure CMake
       run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{ matrix.config || env.BUILD_TYPE }} -DBOX3D_SAMPLES=OFF -DBUILD_SHARED_LIBS=OFF -DBOX3D_VALIDATE=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON ${{ matrix.args }}
 
     - name: Build
-      run: cmake --build ${{github.workspace}}/build --config ${{ matrix.config || env.BUILD_TYPE }}
+      run: cmake --build ${{github.workspace}}/build --config ${{ matrix.config || env.BUILD_TYPE }} --parallel
 
     - name: Test
       working-directory: ${{github.workspace}}/build
@@ -102,7 +106,7 @@ jobs:
   build-windows-mingw:
     name: windows-mingw
     runs-on: windows-latest
-    timeout-minutes: 4
+    timeout-minutes: 10
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     defaults:
       run:
@@ -124,7 +128,7 @@ jobs:
       run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBOX3D_SAMPLES=OFF -DBUILD_SHARED_LIBS=OFF -DBOX3D_VALIDATE=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
 
     - name: Build
-      run: cmake --build build --config RelWithDebInfo
+      run: cmake --build build --config RelWithDebInfo --parallel
 
     - name: Test
       working-directory: build
@@ -135,7 +139,7 @@ jobs:
   emscripten:
     name: emscripten
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     steps:
     - uses: actions/checkout@v6
@@ -146,12 +150,12 @@ jobs:
       run: emcmake cmake -B build -DCMAKE_BUILD_TYPE=Debug -DBOX3D_SAMPLES=OFF -DBUILD_SHARED_LIBS=OFF -DBOX3D_VALIDATE=ON
 
     - name: Build
-      run: cmake --build build --config Debug
+      run: cmake --build build --config Debug --parallel
 
   samples:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 8
+    timeout-minutes: 10
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     strategy:
       fail-fast: false
@@ -197,4 +201,4 @@ jobs:
       run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release -DBOX3D_SAMPLES=ON -DBOX3D_UNIT_TESTS=OFF ${{ matrix.args }}
 
     - name: Build
-      run: cmake --build ${{github.workspace}}/build --config Release
+      run: cmake --build ${{github.workspace}}/build --config Release --parallel

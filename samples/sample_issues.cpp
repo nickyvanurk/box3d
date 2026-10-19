@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2025 Erin Catto
+// SPDX-FileCopyrightText: 2026 Erin Catto
 // SPDX-License-Identifier: MIT
 
 #include "gfx/draw.h"
@@ -8,6 +8,10 @@
 
 #include "box3d/box3d.h"
 
+#include <ctype.h>
+#include <iterator>
+#include <stdio.h>
+#include <stdlib.h>
 #include <vector>
 
 class Crash : public Sample
@@ -132,65 +136,164 @@ public:
 
 static int sampleMultiplePrismatic = RegisterSample( "Issues", "Multiple Prismatic", MultiplePrismatic::Create );
 
+// bad hull SM_Waterfall_MED_Wide_01
+static const b3Vec3 waterfallPoints[] = {
+	{ 0.100183107, -498.925385, -1275.39966 }, { 0.100183107, -498.925415, 0.125000000 },
+	{ 0.100183107, 486.343750, 0.125000000 },  { 0.100183107, 486.343719, -1275.39966 },
+	{ -395.117462, 486.343781, -1462.43750 },  { -395.117462, 486.343750, -96.7426758 },
+	{ -395.117462, -498.925415, -96.7424469 }, { -395.117462, -498.925446, -1462.52612 },
+	{ -186.979691, 486.294891, -1462.47949 },  { -298.250000, 486.294891, 0.125000000 },
+	{ -395.121216, 486.294891, -1462.52612 },  { -186.984360, -498.913361, -1462.48413 },
+	{ -298.250000, -498.913361, 0.125000000 },
+};
+
+static const b3Vec3 quadPoints[] = {
+	{ 100.000000, -142.292389, 130.826111 },  { 99.5354385, -71.3011093, 130.826111 },
+	{ 99.5930862, -80.1112213, -100.000000 }, { 100.000000, -142.292389, -100.000000 },
+	{ 99.5930862, -80.1112213, 130.826111 },
+};
+
+static const b3Vec3 thinBoxPoints[] = {
+	{ -11.3861933, -24.2451687, -12.0037909 }, { -11.3889809, -24.2466526, -11.9013014 },
+	{ -11.3804407, -24.3151531, -12.0046492 }, { -11.3832273, -24.3166409, -11.9021587 },
+	{ -14.4396200, -24.3636723, -12.1324549 }, { -14.4432650, -24.3655701, -12.0299988 },
+	{ -14.4356947, -24.4337788, -12.1336164 }, { -14.4393377, -24.4356804, -12.0311594 },
+};
+
+// Inline point sets are scaled from centimeters. A null point array is a file in data/hulls.
+struct HullSource
+{
+	const char* name;
+	const b3Vec3* points;
+	int count;
+	float scale;
+};
+
+static const HullSource hullSources[] = {
+	{ "waterfall", waterfallPoints, (int)std::size( waterfallPoints ), 0.01f },
+	{ "quad", quadPoints, (int)std::size( quadPoints ), 0.01f },
+	{ "thin box", thinBoxPoints, (int)std::size( thinBoxPoints ), 0.01f },
+	{ "axe.txt", nullptr, 0, 1.0f },
+};
+
+static constexpr int hullSourceCount = (int)std::size( hullSources );
+
+// Reads x, y, z triples separated by commas or whitespace. A C source repro is
+// also accepted: only the first initializer list is parsed, so counts and other
+// numbers in the surrounding code are ignored.
+static bool LoadHullPoints( const char* path, std::vector<b3Vec3>* points )
+{
+	points->clear();
+
+	FILE* file = fopen( path, "rb" );
+	if ( file == nullptr )
+	{
+		fprintf( stderr, "Failed to open '%s'\n", path );
+		return false;
+	}
+
+	fseek( file, 0, SEEK_END );
+	long size = ftell( file );
+	fseek( file, 0, SEEK_SET );
+	if ( size < 0 )
+	{
+		fprintf( stderr, "Failed to read '%s'\n", path );
+		fclose( file );
+		return false;
+	}
+
+	std::vector<char> text( size + 1 );
+	size_t readCount = fread( text.data(), 1, size, file );
+	fclose( file );
+	text[readCount] = '\0';
+
+	char* begin = text.data();
+	char* end = begin + readCount;
+	for ( char* c = begin; *c != '\0'; ++c )
+	{
+		if ( *c != '{' )
+		{
+			continue;
+		}
+
+		char* prev = c - 1;
+		while ( prev >= begin && isspace( (unsigned char)*prev ) )
+		{
+			--prev;
+		}
+
+		if ( prev < begin || *prev != '=' )
+		{
+			continue;
+		}
+
+		begin = c + 1;
+		int depth = 1;
+		for ( end = begin; *end != '\0'; ++end )
+		{
+			if ( *end == '{' )
+			{
+				depth += 1;
+			}
+			else if ( *end == '}' && --depth == 0 )
+			{
+				break;
+			}
+		}
+
+		break;
+	}
+
+	*end = '\0';
+
+	std::vector<float> values;
+	char* cursor = begin;
+	while ( *cursor != '\0' )
+	{
+		char* stop;
+		float value = strtof( cursor, &stop );
+		if ( stop == cursor )
+		{
+			cursor += 1;
+			continue;
+		}
+
+		values.push_back( value );
+		cursor = stop;
+	}
+
+	if ( values.size() % 3 != 0 )
+	{
+		fprintf( stderr, "'%s' has %d values, not a multiple of 3\n", path, (int)values.size() );
+	}
+
+	int count = (int)values.size() / 3;
+	points->resize( count );
+	for ( int i = 0; i < count; ++i )
+	{
+		( *points )[i] = { values[3 * i], values[3 * i + 1], values[3 * i + 2] };
+	}
+
+	return count > 0;
+}
+
 class HullCrash : public Sample
 {
 public:
 	explicit HullCrash( SampleContext* context )
 		: Sample( context )
 	{
+		m_hull = nullptr;
+		m_sourceIndex = 3;
+		m_maxVertexCount = B3_MAX_HULL_VERTICES;
+
+		LoadPoints();
+		CreateHull();
+
 		if ( m_context->restart == false )
 		{
-			m_camera->SetView( 0.0f, 15.0f, 5.0f, b3Pos_zero );
+			FrameView();
 		}
-
-		m_hull = nullptr;
-
-#if 0
-		// bad hull SM_Waterfall_MED_Wide_01
-		b3Vec3 points[] = {
-			{ 0.100183107, -498.925385, -1275.39966 }, { 0.100183107, -498.925415, 0.125000000 },
-			{ 0.100183107, 486.343750, 0.125000000 },  { 0.100183107, 486.343719, -1275.39966 },
-			{ -395.117462, 486.343781, -1462.43750 },  { -395.117462, 486.343750, -96.7426758 },
-			{ -395.117462, -498.925415, -96.7424469 }, { -395.117462, -498.925446, -1462.52612 },
-			{ -186.979691, 486.294891, -1462.47949 },  { -298.250000, 486.294891, 0.125000000 },
-			{ -395.121216, 486.294891, -1462.52612 },  { -186.984360, -498.913361, -1462.48413 },
-			{ -298.250000, -498.913361, 0.125000000 },
-		};
-
-#elif 1
-		b3Vec3 points[] = {
-			{ 100.000000, -142.292389, 130.826111 },  { 99.5354385, -71.3011093, 130.826111 },
-			{ 99.5930862, -80.1112213, -100.000000 }, { 100.000000, -142.292389, -100.000000 },
-			{ 99.5930862, -80.1112213, 130.826111 },
-		};
-#else
-		b3Vec3 points[] = {
-			{ -11.3861933, -24.2451687, -12.0037909 }, { -11.3889809, -24.2466526, -11.9013014 },
-			{ -11.3804407, -24.3151531, -12.0046492 }, { -11.3832273, -24.3166409, -11.9021587 },
-			{ -14.4396200, -24.3636723, -12.1324549 }, { -14.4432650, -24.3655701, -12.0299988 },
-			{ -14.4356947, -24.4337788, -12.1336164 }, { -14.4393377, -24.4356804, -12.0311594 },
-		};
-#endif
-
-		static_assert( sizeof( points ) / sizeof( points[0] ) < m_capacity, "bad" );
-
-		m_count = sizeof( points ) / sizeof( points[0] );
-		for ( int i = 0; i < m_count; ++i )
-		{
-			m_points[i] = 0.01f * points[i];
-		}
-
-		// This shift shouldn't be necessary but I'm doing it so the hull
-		// appears on the screen.
-		// for ( int i = 0; i < m_count; ++i )
-		//{
-		//	m_points[i] -= m_points[0];
-		//	m_points[i] *= 0.01f;
-		//}
-
-		m_hull = b3CreateHull( m_points, m_count, m_count );
-
-		(void)m_hull;
 	}
 
 	~HullCrash() override
@@ -201,6 +304,94 @@ public:
 		}
 	}
 
+	void LoadPoints()
+	{
+		const HullSource& source = hullSources[m_sourceIndex];
+		if ( source.points != nullptr )
+		{
+			m_points.assign( source.points, source.points + source.count );
+		}
+		else
+		{
+			char path[64];
+			snprintf( path, sizeof( path ), "data/hulls/%s", source.name );
+			LoadHullPoints( path, &m_points );
+		}
+
+		for ( b3Vec3& point : m_points )
+		{
+			point = source.scale * point;
+		}
+
+		// The reported failure used the point count as the limit
+		m_maxVertexCount = b3ClampInt( (int)m_points.size(), 4, B3_MAX_HULL_VERTICES );
+	}
+
+	void CreateHull()
+	{
+		if ( m_hull != nullptr )
+		{
+			b3DestroyHull( m_hull );
+			m_hull = nullptr;
+		}
+
+		int count = (int)m_points.size();
+		if ( count >= 4 )
+		{
+			m_hull = b3CreateHull( m_points.data(), count, m_maxVertexCount );
+		}
+	}
+
+	void FrameView()
+	{
+		if ( m_points.empty() )
+		{
+			return;
+		}
+
+		b3AABB bounds = b3MakeAABB( m_points.data(), (int)m_points.size(), 0.0f );
+		float radius = b3Length( b3AABB_Extents( bounds ) );
+		m_camera->SetView( 0.0f, 15.0f, b3MaxFloat( 3.0f * radius, 1.0f ), b3ToPos( b3AABB_Center( bounds ) ) );
+	}
+
+	bool DrawControls() override
+	{
+		DrawTextLine( "points = %d", (int)m_points.size() );
+
+		if ( m_hull != nullptr )
+		{
+			DrawTextLine( "hull: vertices = %d, edges = %d, faces = %d", m_hull->vertexCount, m_hull->edgeCount / 2,
+						  m_hull->faceCount );
+		}
+		else
+		{
+			DrawTextLine( "hull creation failed" );
+		}
+
+		if ( ImGui::BeginCombo( "Source", hullSources[m_sourceIndex].name ) )
+		{
+			for ( int i = 0; i < hullSourceCount; ++i )
+			{
+				if ( ImGui::Selectable( hullSources[i].name, i == m_sourceIndex ) )
+				{
+					m_sourceIndex = i;
+					LoadPoints();
+					CreateHull();
+					FrameView();
+				}
+			}
+
+			ImGui::EndCombo();
+		}
+
+		if ( ImGui::SliderInt( "Max Vertices", &m_maxVertexCount, 4, B3_MAX_HULL_VERTICES ) )
+		{
+			CreateHull();
+		}
+
+		return true;
+	}
+
 	void Render() override
 	{
 		if ( m_hull != nullptr )
@@ -209,9 +400,9 @@ public:
 		}
 		else
 		{
-			for ( int i = 0; i < m_count; ++i )
+			for ( const b3Vec3& point : m_points )
 			{
-				DrawPoint( b3ToPos( m_points[i] ), 5.0f, MakeColor( b3_colorWhite ) );
+				DrawPoint( b3ToPos( point ), 5.0f, MakeColor( b3_colorWhite ) );
 			}
 		}
 
@@ -225,10 +416,10 @@ public:
 		return new HullCrash( sampleContext );
 	}
 
-	static constexpr int m_capacity = 64;
+	std::vector<b3Vec3> m_points;
 	b3HullData* m_hull;
-	b3Vec3 m_points[m_capacity];
-	int m_count;
+	int m_sourceIndex;
+	int m_maxVertexCount;
 };
 
 static int sampleHullCrash = RegisterSample( "Issues", "Hull Crash", HullCrash::Create );
@@ -1146,6 +1337,7 @@ public:
 
 static int sampleWheelStack = RegisterSample( "Issues", "GMod Wheel Stack", WheelStack::Create );
 
+// There was a problem where this bouncing box could gain energy. This has been fixed by the deferred restitution update.
 class RestitutionOvershoot : public Sample
 {
 public:
@@ -1176,6 +1368,7 @@ public:
 		b3BodyDef boxDef = b3DefaultBodyDef();
 		boxDef.type = b3_dynamicBody;
 		boxDef.position = { 0.0f, m_dropHeight, 0.0f };
+		boxDef.safetyFactor = 0.1f;
 		m_boxBody = b3CreateBody( m_worldId, &boxDef );
 
 		b3ShapeDef boxShape = b3DefaultShapeDef();
@@ -1186,6 +1379,9 @@ public:
 		m_maxBounceY = 0.0f;
 		m_bounced = false;
 		m_failed = false;
+		m_startEnergy = MeasureEnergy( m_worldId, &m_boxBody, 1 ).Total();
+		m_maxEnergy = m_startEnergy;
+		m_energyFailed = false;
 	}
 
 	void Step() override
@@ -1221,9 +1417,29 @@ public:
 		b3Pos markerPoint = { 0.0f, m_dropHeight + m_boxHalf, 0.0f };
 		DrawPlane( b3Vec3_axisY, markerPoint, MakeColor( b3_colorYellow ) );
 
+		// Perfect restitution and no friction, so the total energy may only decrease. It is the honest
+		// invariant here: the height check cannot tell a bounce that gained potential energy from one
+		// that converted it into spin, and this drop does both.
+		MechanicalEnergy energy = MeasureEnergy( m_worldId, &m_boxBody, 1 );
+		float total = energy.Total();
+
+		if ( total > m_maxEnergy )
+		{
+			m_maxEnergy = total;
+		}
+
+		if ( m_bounced && total > m_startEnergy * ( 1.0f + m_energyTolerance ) )
+		{
+			m_energyFailed = true;
+		}
+
 		DrawTextLine( "drop height = %.2f m", m_dropHeight );
 		DrawTextLine( "current y   = %.2f m", m_currentY );
 		DrawTextLine( "max bounce  = %.2f m", m_maxBounceY );
+		DrawTextLine( "kinetic     = %.0f J linear + %.0f J angular", energy.linear, energy.angular );
+		DrawTextLine( "potential   = %.0f J", energy.potential );
+		DrawTextLine( "total       = %.0f J (%.2f%% of start, peak %.2f%%)", total, 100.0f * total / m_startEnergy,
+					  100.0f * m_maxEnergy / m_startEnergy );
 
 		if ( m_bounced == false )
 		{
@@ -1237,6 +1453,15 @@ public:
 		{
 			DrawTextLine( "PASS: bounce stays at or below drop height" );
 		}
+
+		if ( m_energyFailed )
+		{
+			DrawTextLine( "FAIL: total energy increased" );
+		}
+		else if ( m_bounced )
+		{
+			DrawTextLine( "PASS: total energy did not increase" );
+		}
 	}
 
 	static Sample* Create( SampleContext* context )
@@ -1244,11 +1469,16 @@ public:
 		return new RestitutionOvershoot( context );
 	}
 
+	static constexpr float m_energyTolerance = 0.001f;
+
 	b3BodyId m_boxBody = {};
 	float m_currentY = 0.0f;
 	float m_maxBounceY = 0.0f;
+	float m_startEnergy = 0.0f;
+	float m_maxEnergy = 0.0f;
 	bool m_bounced = false;
 	bool m_failed = false;
+	bool m_energyFailed = false;
 };
 
 static int sampleRestitutionOvershoot = RegisterSample( "Issues", "Restitution Overshoot", RestitutionOvershoot::Create );
@@ -1302,3 +1532,211 @@ public:
 
 static int sampleSlideTwistOffCenterShape =
 	RegisterSample( "Issues", "Slide Twist Off Center Shape", SlideTwistOffCenterShape::Create );
+
+// Very large dynamic bodies have overflow when computing the inertia tensor.
+class HugeBox : public Sample
+{
+public:
+	explicit HugeBox( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 0.0f, 25.0f, 10.0f, b3Pos_zero );
+		}
+
+		AddGroundBox( 400.0f );
+
+		{
+			float a = 100.0f;
+
+			b3BoxHull cube = b3MakeCubeHull( a );
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.name = "cube";
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.position = { 0.0f, a, 0.0f };
+			bodyDef.rotation = b3MakeQuatFromAxisAngle( { 0.0f, 0.0f, 1.0f }, 0.2f );
+			m_bodyId = b3CreateBody( m_worldId, &bodyDef );
+
+			b3ShapeDef shapeDef = b3DefaultShapeDef();
+			b3CreateHullShape( m_bodyId, &shapeDef, &cube.base );
+		}
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new HugeBox( context );
+	}
+
+	b3BodyId m_bodyId;
+};
+
+static int sampleHugeBox = RegisterSample( "Issues", "Huge Box", HugeBox::Create );
+
+// This demonstrates this cap on mesh complexity. B3_MAX_MESH_CONTACT_TRIANGLES
+// It generates this warning:
+// Box3D: WARNING: complex mesh detected, triangle buffer capacity of 256 reached
+class HeightfieldIssue : public Sample
+{
+public:
+	explicit HeightfieldIssue( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( -90.0f, 5.0f, 50.0f, { 50.0f, 10.0f, 50.0f } );
+		}
+
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+
+		m_heightField = b3CreateGrid( 100, 100, { 1, 1, 1 }, false );
+		b3BodyId groundId = b3CreateBody( m_worldId, &bodyDef );
+		b3CreateHeightFieldShape( groundId, &shapeDef, m_heightField );
+
+		b3HullData* hull = b3CreateCylinder( 20, 5, -10, 24 );
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.position = { 50, 20, 50 };
+		bodyDef.rotation = b3MakeQuatFromAxisAngle( b3Vec3_axisX, B3_PI / 4 );
+		b3BodyId bodyId = b3CreateBody( m_worldId, &bodyDef );
+		b3CreateHullShape( bodyId, &shapeDef, hull );
+		b3DestroyHull( hull );
+	}
+
+	~HeightfieldIssue() override
+	{
+		b3DestroyHeightField( m_heightField );
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new HeightfieldIssue( context );
+	}
+
+	b3HeightFieldData* m_heightField;
+};
+static int sampleIssueIndex = RegisterSample( "Issues", "Heightfield", HeightfieldIssue::Create );
+
+// Issue #135: the quasi static push out idiom, zero the velocity then step, drives a deeply
+// overlapping body out through a thin static wall instead of back into the room. The solver
+// resolves along the shallow exit, so once the mover center crosses the wall mid plane every
+// step compounds the error outward. Interior is -x, exterior is +x. The wire box marks where
+// a mover resting flush against the interior face belongs.
+// This is NOT a bug. This is just how the separating axis works. I'm keeping this sample
+// in case there is further discussion.
+class ThinWallPushOut : public Sample
+{
+public:
+	static constexpr float m_wallHalfThickness = 0.1f;
+	static constexpr float m_wallHalfHeight = 1.5f;
+	static constexpr float m_moverHalfExtent = 0.5f;
+	static constexpr float m_tolerance = 0.01f;
+
+	explicit ThinWallPushOut( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 20.0f, 15.0f, 6.0f, { 0.0f, m_wallHalfHeight, 0.0f } );
+		}
+
+		// Furniture is dragged into place, never dropped
+		b3World_SetGravity( m_worldId, b3Vec3_zero );
+
+		AddGroundBox( 20.0f );
+
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+
+		bodyDef.name = "wall";
+		bodyDef.position = { 0.0f, m_wallHalfHeight, 0.0f };
+		b3BodyId wallId = b3CreateBody( m_worldId, &bodyDef );
+
+		b3BoxHull wall = b3MakeBoxHull( m_wallHalfThickness, m_wallHalfHeight, 2.0f );
+		b3CreateHullShape( wallId, &shapeDef, &wall.base );
+
+		bodyDef.name = "mover";
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.position = { m_startX, m_wallHalfHeight, 0.0f };
+
+		// Velocity is zeroed every step, so without this the mover falls asleep on the first one
+		bodyDef.enableSleep = false;
+
+		// A room planner slides items on the floor plane and yaws them to face a wall
+		bodyDef.motionLocks = { false, true, false, true, false, true };
+		m_moverId = b3CreateBody( m_worldId, &bodyDef );
+
+		b3BoxHull mover = b3MakeBoxHull( m_moverHalfExtent, m_moverHalfExtent, m_moverHalfExtent );
+		shapeDef.baseMaterial.friction = 0.0f;
+		b3CreateHullShape( m_moverId, &shapeDef, &mover.base );
+	}
+
+	void PlaceMover()
+	{
+		b3Body_SetTransform( m_moverId, { m_startX, m_wallHalfHeight, 0.0f }, b3Quat_identity );
+		b3Body_SetLinearVelocity( m_moverId, b3Vec3_zero );
+		b3Body_SetAngularVelocity( m_moverId, b3Vec3_zero );
+	}
+
+	bool DrawControls() override
+	{
+		ImGui::PushItemWidth( 6.0f * ImGui::GetFontSize() );
+
+		// Anywhere past the wall mid plane tunnels out, even while the near face is far deeper
+		bool changed = ImGui::SliderFloat( "Start X", &m_startX, -0.6f, 0.6f, "%.2f" );
+		changed = changed || ImGui::Button( "Reset Mover" );
+
+		if ( changed )
+		{
+			PlaceMover();
+		}
+
+		ImGui::PopItemWidth();
+		return true;
+	}
+
+	void Step() override
+	{
+		// The reported idiom. Zeroing the velocity leaves the penetration correction as the
+		// only thing that can move the body.
+		b3Body_SetLinearVelocity( m_moverId, b3Vec3_zero );
+		b3Body_SetAngularVelocity( m_moverId, b3Vec3_zero );
+
+		Sample::Step();
+
+		float interiorRestX = -m_wallHalfThickness - m_moverHalfExtent;
+		float exteriorRestX = m_wallHalfThickness + m_moverHalfExtent;
+
+		b3Vec3 lower = { interiorRestX - m_moverHalfExtent, m_wallHalfHeight - m_moverHalfExtent, -m_moverHalfExtent };
+		b3Vec3 upper = { interiorRestX + m_moverHalfExtent, m_wallHalfHeight + m_moverHalfExtent, m_moverHalfExtent };
+		DrawAabb( lower, upper, MakeColor( b3_colorLime ) );
+
+		float x = (float)b3Body_GetPosition( m_moverId ).x;
+		DrawTextLine( "start x         = %.3f m", m_startX );
+		DrawTextLine( "current x       = %.3f m", x );
+		DrawTextLine( "interior rest x = %.3f m", interiorRestX );
+
+		if ( b3AbsFloat( x - exteriorRestX ) < m_tolerance )
+		{
+			DrawTextLine( "FAIL: mover pushed out of the room" );
+		}
+		else if ( b3AbsFloat( x - interiorRestX ) < m_tolerance )
+		{
+			DrawTextLine( "PASS: mover pushed back into the room" );
+		}
+		else
+		{
+			DrawTextLine( "relaxing ..." );
+		}
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new ThinWallPushOut( context );
+	}
+
+	b3BodyId m_moverId = {};
+	float m_startX = 0.2f;
+};
+
+static int sampleThinWallPushOut = RegisterSample( "Issues", "Thin Wall Push Out", ThinWallPushOut::Create );

@@ -38,6 +38,9 @@ B3_REC_OP( 0x0A, WorldSetMaximumLinearSpeed, RET_NONE, ARG( WORLDID, world ) ARG
 B3_REC_OP( 0x0B, WorldEnableWarmStarting, RET_NONE, ARG( WORLDID, world ) ARG( BOOL, flag ) )
 B3_REC_OP( 0x0C, WorldRebuildStaticTree, RET_NONE, ARG( WORLDID, world ) )
 B3_REC_OP( 0x0D, WorldEnableSpeculative, RET_NONE, ARG( WORLDID, world ) ARG( BOOL, flag ) )
+B3_REC_OP( 0x0E, WorldSetRestitutionIterations, RET_NONE, ARG( WORLDID, world ) ARG( I32, iterations ) )
+B3_REC_OP( 0x0F, WorldEnableRestitutionPropagation, RET_NONE, ARG( WORLDID, world ) ARG( BOOL, flag ) )
+B3_REC_OP( 0x70, WorldSetIsotropicInertiaTolerance, RET_NONE, ARG( WORLDID, world ) ARG( F32, tolerance ) )
 
 // Body
 B3_REC_OP( 0x10, CreateBody, RET_BODYID, ARG( WORLDID, world ) ARG( BODYDEF, def ) )
@@ -69,7 +72,8 @@ B3_REC_OP( 0x37, BodySetBullet, RET_NONE, ARG( BODYID, body ) ARG( BOOL, flag ) 
 B3_REC_OP( 0x38, BodyEnableContactRecycling, RET_NONE, ARG( BODYID, body ) ARG( BOOL, flag ) )
 B3_REC_OP( 0x39, BodyEnableHitEvents, RET_NONE, ARG( BODYID, body ) ARG( BOOL, flag ) )
 B3_REC_OP( 0x3A, BodyAllowFastRotation, RET_NONE, ARG( BODYID, body ) ARG( BOOL, flag ) )
-B3_REC_OP( 0x3B, BodyKeepAwake, RET_NONE, ARG( BODYID, body ) )
+B3_REC_OP( 0x3B, BodySetSafetyFactor, RET_NONE, ARG( BODYID, body ) ARG( F32, value ) )
+B3_REC_OP( 0x3C, BodyKeepAwake, RET_NONE, ARG( BODYID, body ) )
 
 // Shape create/destroy
 B3_REC_OP( 0x40, CreateSphereShape, RET_SHAPEID, ARG( BODYID, body ) ARG( SHAPEDEF, def ) ARG( SPHERE, sphere ) )
