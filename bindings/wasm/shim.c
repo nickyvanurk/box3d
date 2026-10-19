@@ -97,6 +97,14 @@ typedef struct World
 	 * attaching a batch defers the update and applies it once at the end.
 	 */
 	uint8_t* massDeferred;
+	/**
+	 * Bodies whose mass, centre and inertia the caller stated outright
+	 * (`b3w_set_body_mass_data`), parallel to `bodies`. Their shapes carry
+	 * collision only: adding or destroying one never re-derives the mass from
+	 * shapes, it re-applies the stated mass so the extents follow the shapes.
+	 */
+	uint8_t* massStated;
+	b3MassData* statedMass;
 	int bodyCount;
 	int bodyCapacity;
 
@@ -232,6 +240,9 @@ static void ReserveBodies( World* world, int needed )
 	memset( world->placed + world->bodyCapacity, 0, sizeof( uint8_t ) * (size_t)( capacity - world->bodyCapacity ) );
 	world->massDeferred = (uint8_t*)realloc( world->massDeferred, sizeof( uint8_t ) * capacity );
 	memset( world->massDeferred + world->bodyCapacity, 0, sizeof( uint8_t ) * (size_t)( capacity - world->bodyCapacity ) );
+	world->massStated = (uint8_t*)realloc( world->massStated, sizeof( uint8_t ) * capacity );
+	memset( world->massStated + world->bodyCapacity, 0, sizeof( uint8_t ) * (size_t)( capacity - world->bodyCapacity ) );
+	world->statedMass = (b3MassData*)realloc( world->statedMass, sizeof( b3MassData ) * capacity );
 	world->bodyCapacity = capacity;
 }
 
@@ -332,6 +343,8 @@ void b3w_destroy_world( int handle )
 	free( world->excludedFrom );
 	free( world->placed );
 	free( world->massDeferred );
+	free( world->massStated );
+	free( world->statedMass );
 	memset( world, 0, sizeof( World ) );
 }
 
@@ -398,6 +411,7 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
 	world->excludedFrom[body] = -1;
 	world->placed[body] = 0;
 	world->massDeferred[body] = 0;
+	world->massStated[body] = 0;
 
 	// The handle rides ON the body, so a query result can name it without a
 	// reverse scan of the table. Offset by one so that a body whose user data
@@ -496,8 +510,47 @@ static bool ReserveShapeSlot( World* world )
 	return true;
 }
 
+/** The body's mass is re-derived from its shapes on each add or destroy. */
+static bool MassFromShapes( World* world, int body )
+{
+	if ( body < 0 || body >= world->bodyCount )
+	{
+		return true;
+	}
+	return world->massDeferred[body] == 0 && world->massStated[body] == 0;
+}
+
+/** Bring the body's mass up to date: the stated mass if there is one, else its shapes'. */
+static void ApplyMass( World* world, int body )
+{
+	b3BodyId id = BodyOf( world, body );
+	if ( B3_IS_NULL( id ) || !b3Body_IsValid( id ) )
+	{
+		return;
+	}
+	if ( world->massStated[body] != 0 && b3Body_GetType( id ) == b3_dynamicBody )
+	{
+		b3Body_SetMassData( id, world->statedMass[body] );
+	}
+	else
+	{
+		b3Body_ApplyMassFromShapes( id );
+	}
+}
+
+static int BodyIndexOfShape( b3ShapeId shapeId );
+
 static int RetainShape( World* world, b3ShapeId shape, b3HullData* hull )
 {
+	if ( !B3_IS_NULL( shape ) && b3Shape_IsValid( shape ) )
+	{
+		int body = BodyIndexOfShape( shape );
+		if ( body >= 0 && body < world->bodyCount && world->massStated[body] != 0 && world->massDeferred[body] == 0 )
+		{
+			ApplyMass( world, body );
+		}
+	}
+
 	int slot = -1;
 
 	if ( world->shapeCount < world->shapeCapacity )
@@ -601,7 +654,7 @@ int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
-	def.updateBodyMass = world->massDeferred[body] == 0;
+	def.updateBodyMass = MassFromShapes( world, body );
 	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
@@ -1028,6 +1081,11 @@ void b3w_set_rotation_lock( int handle, int body, int locked )
 	locks.angularX = locked != 0;
 	locks.angularZ = locked != 0;
 	b3Body_SetMotionLocks( id, locks );
+	// Box3D re-derives the mass from shapes when the locks change.
+	if ( GetWorld( handle )->massStated[body] != 0 )
+	{
+		ApplyMass( GetWorld( handle ), body );
+	}
 }
 
 void b3w_set_damping( int handle, int body, float linear, float angular )
@@ -1110,6 +1168,11 @@ void b3w_set_body_type( int handle, int body, int type )
 {
 	BODY_OR_RETURN( id, handle, body )
 	b3Body_SetType( id, (b3BodyType)type );
+	// Box3D re-derives the mass from shapes on a type change.
+	if ( GetWorld( handle )->massStated[body] != 0 )
+	{
+		ApplyMass( GetWorld( handle ), body );
+	}
 }
 
 void b3w_set_gravity_scale( int handle, int body, float scale )
@@ -1148,7 +1211,7 @@ int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius,
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
-	def.updateBodyMass = world->massDeferred[body] == 0;
+	def.updateBodyMass = MassFromShapes( world, body );
 	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
@@ -2138,7 +2201,7 @@ int b3w_add_sphere_shape( int handle, int body, float radius, float ox, float oy
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
-	def.updateBodyMass = world->massDeferred[body] == 0;
+	def.updateBodyMass = MassFromShapes( world, body );
 	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
@@ -2168,7 +2231,7 @@ int b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
-	def.updateBodyMass = world->massDeferred[body] == 0;
+	def.updateBodyMass = MassFromShapes( world, body );
 	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
@@ -2215,7 +2278,7 @@ int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int
 	}
 
 	b3ShapeDef def = b3DefaultShapeDef();
-	def.updateBodyMass = world->massDeferred[body] == 0;
+	def.updateBodyMass = MassFromShapes( world, body );
 	def.enableCustomFiltering = true;
 	def.density = density;
 	def.baseMaterial.friction = friction;
@@ -2869,11 +2932,7 @@ void b3w_body_defer_mass( int handle, int body, int deferred )
 		return;
 	}
 
-	b3BodyId bodyId = BodyOf( world, body );
-	if ( !B3_IS_NULL( bodyId ) && b3Body_IsValid( bodyId ) )
-	{
-		b3Body_ApplyMassFromShapes( bodyId );
-	}
+	ApplyMass( world, body );
 }
 
 // --- shape mutation ------------------------------------------------------
@@ -2899,9 +2958,12 @@ void b3w_destroy_shape( int handle, int shape )
 
 	if ( b3Shape_IsValid( *id ) )
 	{
-		int body = (int)(intptr_t)b3Body_GetUserData( b3Shape_GetBody( *id ) ) - 1;
-		bool deferred = body >= 0 && body < world->bodyCount && world->massDeferred[body] != 0;
-		b3DestroyShape( *id, deferred == false );
+		int body = BodyIndexOfShape( *id );
+		b3DestroyShape( *id, MassFromShapes( world, body ) );
+		if ( body >= 0 && body < world->bodyCount && world->massStated[body] != 0 && world->massDeferred[body] == 0 )
+		{
+			ApplyMass( world, body );
+		}
 	}
 }
 
@@ -3069,6 +3131,19 @@ void b3w_set_body_mass( int handle, int body, float mass )
 		return;
 	}
 
+	// A stated mass is scaled as stated: its shapes carry none to derive from.
+	if ( world->massStated[body] != 0 )
+	{
+		b3MassData* md = &world->statedMass[body];
+		float scale = mass / md->mass;
+		md->mass = mass;
+		md->inertia.cx = b3MulSV( scale, md->inertia.cx );
+		md->inertia.cy = b3MulSV( scale, md->inertia.cy );
+		md->inertia.cz = b3MulSV( scale, md->inertia.cz );
+		ApplyMass( world, body );
+		return;
+	}
+
 	// From the shapes, every time, never from the mass the body has now. That
 	// is only the shapes' when they were just re-derived; a vehicle's chassis
 	// sits at the whole less its wheels' share, so scaling from it inflated the
@@ -3091,6 +3166,42 @@ void b3w_set_body_mass( int handle, int body, float mass )
 
 	// A chassis's mass is the whole machine's: its wheels take their share now.
 	b3w_vehicle_chassis_mass_set( id );
+}
+
+/**
+ * State a body's mass outright: total mass, centre of mass in the body frame,
+ * and the symmetric inertia tensor about that centre (the tensor's entries, so
+ * the off-diagonals are minus the products of inertia).
+ *
+ * The body keeps it whatever shapes are added or destroyed afterwards, deferred
+ * or not: its shapes carry collision only. A mass of zero or less hands the
+ * mass back to the shapes.
+ */
+void b3w_set_body_mass_data( int handle, int body, float mass, float cx, float cy, float cz, float ixx, float iyy,
+							 float izz, float ixy, float ixz, float iyz )
+{
+	World* world = GetWorld( handle );
+	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	{
+		return;
+	}
+
+	if ( mass <= 0.0f )
+	{
+		world->massStated[body] = 0;
+		ApplyMass( world, body );
+		return;
+	}
+
+	b3MassData md;
+	md.mass = mass;
+	md.center = ( b3Vec3 ){ cx, cy, cz };
+	md.inertia.cx = ( b3Vec3 ){ ixx, ixy, ixz };
+	md.inertia.cy = ( b3Vec3 ){ ixy, iyy, iyz };
+	md.inertia.cz = ( b3Vec3 ){ ixz, iyz, izz };
+	world->statedMass[body] = md;
+	world->massStated[body] = 1;
+	ApplyMass( world, body );
 }
 
 /**
