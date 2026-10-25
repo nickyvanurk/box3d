@@ -19,6 +19,7 @@
 
 #include "box3d/box3d.h"
 
+#include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1240,6 +1241,19 @@ int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius,
 int b3w_alloc_floats( int count )
 {
 	return (int)(intptr_t)malloc( sizeof( float ) * count );
+}
+
+/**
+ * Bytes the allocator has handed out and not had back.
+ *
+ * The heap's LENGTH only ever grows — wasm memory cannot shrink — so it is a
+ * high-water mark and cannot tell a leak from a peak. This can: under steady
+ * churn it is flat when everything allocated is also freed.
+ */
+int b3w_heap_in_use( void )
+{
+	struct mallinfo info = mallinfo();
+	return (int)info.uordblks;
 }
 
 /**

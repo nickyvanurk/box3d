@@ -38,7 +38,7 @@ EXPORTS='[
 	"_b3w_mass","_b3w_principal_inertia",
 	"_b3w_body_type","_b3w_set_body_type","_b3w_set_gravity_scale",
 	"_b3w_wake","_b3w_keep_awake","_b3w_is_valid","_b3w_add_capsule_shape",
-	"_b3w_add_height_field","_b3w_cast_ray_y","_b3w_alloc_floats",
+	"_b3w_add_height_field","_b3w_cast_ray_y","_b3w_alloc_floats","_b3w_heap_in_use",
 	"_b3w_add_revolute_joint","_b3w_add_prismatic_joint","_b3w_add_weld_joint","_b3w_add_ball_joint","_b3w_joint_force","_b3w_add_motor_joint","_b3w_add_mesh_shape",
 	"_b3w_add_distance_joint","_b3w_set_distance_limits","_b3w_set_distance_motor","_b3w_distance_length",
 	"_b3w_set_revolute_motor","_b3w_set_revolute_limits","_b3w_set_joint_constraint_tuning","_b3w_wake_joint_bodies",
