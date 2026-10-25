@@ -68,11 +68,14 @@ static void b3w_throw_heap_exhausted( double requested )
 // --- held allocations ----------------------------------------------------
 //
 // The throw unwinds every C frame without running any of them, so whatever a
-// call still owned when the heap ran out would be lost: a scratch array, or
-// geometry not yet handed to the shape about to be made over it. Such an
-// allocation is HELD for exactly that window, and running out releases every
-// held one before it throws. Nothing held is referenced by the world — it is
-// unheld the moment something else owns it — so releasing it is always safe.
+// call still owned when the heap ran out would be lost: a scratch array, or a
+// hull not yet cloned into a shape. Such an allocation is HELD for exactly that
+// window, and running out releases every held one before it throws.
+//
+// Only what nothing else can ever point at is held. Mesh and height-field
+// geometry is not: the shape create takes its reference before it allocates.
+// That rule is also what keeps a stale entry — left by a trap that unwound
+// without passing here — safe to release on a later throw.
 
 typedef struct Held
 {
@@ -150,17 +153,9 @@ static void FreeHeld( void* p )
 	free( p );
 }
 
-// Geometry not yet given to a shape, released as Box3D frees it.
-static void ReleaseMesh( void* p )
-{
-	b3DestroyMesh( (b3MeshData*)p );
-}
-
-static void ReleaseHeightField( void* p )
-{
-	b3DestroyHeightField( (b3HeightFieldData*)p );
-}
-
+// A hull not yet given to a shape. Safe to release even from inside the shape
+// create: Box3D clones a hull into its database before it allocates anything
+// else, so no shape ever points at this one.
 static void ReleaseHull( void* p )
 {
 	b3DestroyHull( (b3HullData*)p );
@@ -1814,7 +1809,8 @@ int b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int 
 	{
 		return -1;
 	}
-	b3HeightFieldData* field = Hold( b3CreateHeightField( &def ), ReleaseHeightField );
+	// Not held, for the reason the mesh is not (see b3w_add_mesh_shape).
+	b3HeightFieldData* field = b3CreateHeightField( &def );
 
 	// Terrain is a surface the game tunes like any other: it states a friction
 	// and a collision group, and taking the library defaults instead left the
@@ -1826,7 +1822,6 @@ int b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int 
 	shapeDef.baseMaterial.restitution = restitution;
 
 	b3ShapeId shape = b3CreateHeightFieldShape( bodyId, &shapeDef, field );
-	Unhold( field );
 	return RetainShape( world, slot, AttachOwned( shape, b3_heightShape, field ) );
 }
 
@@ -2514,7 +2509,10 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 	def.vertexCount = vertexCount;
 	def.triangleCount = triangleCount;
 
-	b3MeshData* mesh = Hold( b3CreateMesh( &def, NULL, 0 ), ReleaseMesh );
+	// Not held: nothing allocates between here and the shape create, and that
+	// call takes the reference before it allocates — releasing the mesh on a
+	// throw from inside it would free geometry a shape already points at.
+	b3MeshData* mesh = b3CreateMesh( &def, NULL, 0 );
 	FreeHeld( vertices );
 	FreeHeld( indices );
 	if ( mesh == NULL )
@@ -2575,7 +2573,6 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 	shapeDef.enableSpeculativeContact = true;
 
 	b3ShapeId shape = b3CreateMeshShape( bodyId, &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } );
-	Unhold( mesh );
 	return RetainShape( world, slot, AttachOwned( shape, b3_meshShape, mesh ) );
 }
 
