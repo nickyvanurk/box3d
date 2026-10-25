@@ -293,7 +293,9 @@ typedef struct
 	int considered;
 	/** The sweep met terrain this tick, whether or not it took any as ground. */
 	bool terrainNear;
-	/** Body index of the ground for reporting, or -1. */
+	/** The ground's body HANDLE for reporting, or -1. Taken when the cast
+	 *  finds it, so a body destroyed since reads as gone, never as whichever
+	 *  body its storage slot went to next. */
 	int groundBody;
 	/** The ground body itself, so the dynamic-ground branches never look one up. */
 	b3BodyId groundBodyId;
@@ -924,7 +926,8 @@ static void KeepWheelHit( WheelCast* ctx, WheelHit hit )
 }
 
 /** Defined in shim.c — the body-owner table lives with the body table. */
-uint32_t b3w_owner_of_body( int handle, int body );
+uint32_t b3w_owner_of_slot( int handle, int slot );
+int b3w_handle_of_slot( int handle, int slot );
 
 /**
  * Is this shape a vehicle's tyre? Nothing stands on, picks or places onto one
@@ -1057,7 +1060,7 @@ static float OnWheelHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fr
 	// never ground for anyone, which is what the player is.
 	if ( body >= 0 )
 	{
-		uint32_t owner = b3w_owner_of_body( ctx->worldHandle, body );
+		uint32_t owner = b3w_owner_of_slot( ctx->worldHandle, body );
 		if ( owner != 0 && ( owner == ctx->owner || owner == B3W_OWNER_NEVER_GROUND ) )
 		{
 			return -1.0f;
@@ -1477,7 +1480,7 @@ static void ShapeCastWheel( Vehicle* v, int wheelId, float dt, b3Vec3 groundUp )
 		w->info.bottomOutOvershoot = primary->bottomOutOvershoot;
 		w->clippedInvContactDotSuspension = primary->clippedInvContactDotSuspension;
 		w->info.isInContact = true;
-		w->info.groundBody = cast.hits[0].body;
+		w->info.groundBody = b3w_handle_of_slot( v->worldHandle, cast.hits[0].body );
 		w->info.groundBodyId = cast.hits[0].bodyId;
 
 		/*
@@ -3174,7 +3177,7 @@ static bool KeepTyreContact( Vehicle* v, Wheel* w, b3ShapeId other, b3Pos point,
 {
 	b3BodyId otherBody = b3Shape_GetBody( other );
 	intptr_t tagged = (intptr_t)b3Body_GetUserData( otherBody );
-	if ( tagged > 0 && b3w_owner_of_body( v->worldHandle, (int)( tagged - 1 ) ) == B3W_OWNER_NEVER_GROUND )
+	if ( tagged > 0 && b3w_owner_of_slot( v->worldHandle, (int)( tagged - 1 ) ) == B3W_OWNER_NEVER_GROUND )
 	{
 		return false;
 	}
@@ -3758,9 +3761,35 @@ void b3w_vehicle_solve( Vehicle* v, float h )
 // layer: it turns JavaScript's integers into ids and calls straight through.
 // ---------------------------------------------------------------------------
 
-#define B3W_MAX_VEHICLES 64
+/*
+ * The registry GROWS. It was a static array of 64 for the whole module, and
+ * nothing in the game knew: a 65th wheeled machine in one session's worlds —
+ * eight production sessions reached it — threw "no free vehicle slot" out of a
+ * build. Every vehicle is its own allocation, so a Vehicle* stays valid while
+ * the array of them is reallocated; a destroyed vehicle's struct is kept for
+ * the next one (its wheel arrays are freed), so the registry costs the most
+ * vehicles alive at once, like every other table here. Handles are still the
+ * lowest free slot, exactly as they were.
+ *
+ * The one real limit is the tyre tag: a shape's userData packs the handle
+ * above 12 bits of wheel index and below the tag bits (29, 30), which leaves
+ * 17 bits — 131,072 vehicles alive at once.
+ */
+#define B3W_VEHICLE_HANDLE_LIMIT ( 1 << 17 )
 
-static Vehicle g_vehicles[B3W_MAX_VEHICLES];
+/** Defined in shim.c: every allocation in the binding is checked there. */
+void* CheckedAlloc( size_t size );
+void* CheckedRealloc( void* old, size_t size );
+
+static Vehicle** g_vehicles;
+/** Slots ever used: the registry's length. */
+static int g_vehicleSlots;
+static int g_vehicleCapacity;
+
+static Vehicle* VehicleAt( int handle )
+{
+	return handle >= 0 && handle < g_vehicleSlots ? g_vehicles[handle] : NULL;
+}
 
 static bool ReserveWheel( Vehicle* v );
 static void FreeWheelStorage( Vehicle* v );
@@ -3781,12 +3810,12 @@ void b3w_vehicle_substep( float h, void* context )
 {
 	uint32_t stepping = (uint32_t)(uintptr_t)context;
 
-	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	for ( int i = 0; i < g_vehicleSlots; i++ )
 	{
-		if ( IsVehicleLive( &g_vehicles[i] ) && g_vehicles[i].armed && b3StoreWorldId( g_vehicles[i].world ) == stepping )
+		if ( IsVehicleLive( g_vehicles[i] ) && g_vehicles[i]->armed && b3StoreWorldId( g_vehicles[i]->world ) == stepping )
 		{
-			DropDeadHandles( &g_vehicles[i] );
-			b3w_vehicle_solve( &g_vehicles[i], h );
+			DropDeadHandles( g_vehicles[i] );
+			b3w_vehicle_solve( g_vehicles[i], h );
 		}
 	}
 }
@@ -3803,11 +3832,11 @@ void b3w_vehicle_disarm_world( b3WorldId world )
 {
 	uint32_t stepped = b3StoreWorldId( world );
 
-	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	for ( int i = 0; i < g_vehicleSlots; i++ )
 	{
-		if ( g_vehicles[i].used && b3StoreWorldId( g_vehicles[i].world ) == stepped )
+		if ( g_vehicles[i]->used && b3StoreWorldId( g_vehicles[i]->world ) == stepped )
 		{
-			g_vehicles[i].armed = false;
+			g_vehicles[i]->armed = false;
 		}
 	}
 }
@@ -3816,21 +3845,21 @@ void b3w_vehicle_disarm_world( b3WorldId world )
  * Release every vehicle belonging to a world, called as that world is destroyed.
  *
  * A vehicle holds a chassis id and nothing owns it but this registry, so without
- * this a destroyed world leaks its slots permanently — 64 of them — and leaves
+ * this a destroyed world leaks its slots permanently and leaves
  * entries pointing at freed bodies.
  */
 void b3w_vehicle_destroy_world( b3WorldId world )
 {
 	uint32_t dying = b3StoreWorldId( world );
 
-	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	for ( int i = 0; i < g_vehicleSlots; i++ )
 	{
-		if ( g_vehicles[i].used && b3StoreWorldId( g_vehicles[i].world ) == dying )
+		if ( g_vehicles[i]->used && b3StoreWorldId( g_vehicles[i]->world ) == dying )
 		{
 			// The bodies die with the world, but the wheel ARRAYS are ours and
 			// outlive it. Flipping `used` alone leaked them on every teardown.
-			FreeWheelStorage( &g_vehicles[i] );
-			g_vehicles[i].used = false;
+			FreeWheelStorage( g_vehicles[i] );
+			g_vehicles[i]->used = false;
 		}
 	}
 }
@@ -3848,9 +3877,9 @@ void b3w_vehicle_destroy_world( b3WorldId world )
  */
 void b3w_vehicle_chassis_mass_set( b3BodyId body )
 {
-	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	for ( int i = 0; i < g_vehicleSlots; i++ )
 	{
-		Vehicle* v = &g_vehicles[i];
+		Vehicle* v = g_vehicles[i];
 		if ( IsVehicleLive( v ) && B3_ID_EQUALS( v->chassis, body ) && b3Body_GetType( body ) == b3_dynamicBody )
 		{
 			RetakeWheelMass( v );
@@ -3859,11 +3888,11 @@ void b3w_vehicle_chassis_mass_set( b3BodyId body )
 }
 
 /**
- * Make room for one more wheel, doubling. False only when the heap is out.
+ * Make room for one more wheel, doubling.
  *
  * The three arrays grow together and are indexed in lockstep by every solver
- * loop, so a partial grow would be worse than no grow: it is all three or the
- * add fails.
+ * loop, so a partial grow would be worse than no grow: each allocation is
+ * checked and a full heap throws before any of them is used.
  */
 static bool ReserveWheel( Vehicle* v )
 {
@@ -3875,26 +3904,9 @@ static bool ReserveWheel( Vehicle* v )
 	int prev = v->wheelCapacity;
 	int next = prev > 0 ? prev * 2 : 8;
 
-	Wheel* wheels = (Wheel*)realloc( v->wheels, (size_t)next * sizeof( Wheel ) );
-	if ( wheels == NULL )
-	{
-		return false;
-	}
-	v->wheels = wheels;
-
-	b3Vec3* forwardWs = (b3Vec3*)realloc( v->forwardWs, (size_t)next * sizeof( b3Vec3 ) );
-	if ( forwardWs == NULL )
-	{
-		return false;
-	}
-	v->forwardWs = forwardWs;
-
-	b3Vec3* axle = (b3Vec3*)realloc( v->axle, (size_t)next * sizeof( b3Vec3 ) );
-	if ( axle == NULL )
-	{
-		return false;
-	}
-	v->axle = axle;
+	v->wheels = (Wheel*)CheckedRealloc( v->wheels, (size_t)next * sizeof( Wheel ) );
+	v->forwardWs = (b3Vec3*)CheckedRealloc( v->forwardWs, (size_t)next * sizeof( b3Vec3 ) );
+	v->axle = (b3Vec3*)CheckedRealloc( v->axle, (size_t)next * sizeof( b3Vec3 ) );
 
 	/*
 	 * ZERO the new tail. These were inline arrays inside `Vehicle`, so the
@@ -3984,11 +3996,11 @@ static Wheel* TyreWheel( b3ShapeId shapeId, Vehicle** vehicle )
 	}
 	int handle = (int)( ( tag & ~(intptr_t)B3W_TYRE_TAG ) >> 12 );
 	int index = (int)( tag & 0xFFF );
-	if ( handle < 0 || handle >= B3W_MAX_VEHICLES || !g_vehicles[handle].used )
+	Vehicle* v = VehicleAt( handle );
+	if ( v == NULL || !v->used )
 	{
 		return NULL;
 	}
-	Vehicle* v = &g_vehicles[handle];
 	if ( index >= v->wheelCount || !B3_ID_EQUALS( v->wheels[index].tyreShape, shapeId ) )
 	{
 		return NULL;
@@ -3999,36 +4011,77 @@ static Wheel* TyreWheel( b3ShapeId shapeId, Vehicle** vehicle )
 
 Vehicle* b3w_vehicle_get( int handle )
 {
-	if ( handle < 0 || handle >= B3W_MAX_VEHICLES || !g_vehicles[handle].used )
+	Vehicle* v = VehicleAt( handle );
+	return v != NULL && v->used ? v : NULL;
+}
+
+/** How many controllers this world holds, alive — beside `b3w_live_body_count`
+ *  and `b3w_live_joint_count`, so a stranded controller is countable. */
+int b3w_live_vehicle_count( int worldHandle )
+{
+	int count = 0;
+	for ( int i = 0; i < g_vehicleSlots; i++ )
 	{
-		return NULL;
+		if ( g_vehicles[i]->used && g_vehicles[i]->worldHandle == worldHandle )
+		{
+			count++;
+		}
 	}
-	return &g_vehicles[handle];
+	return count;
+}
+
+/** The lowest free slot, growing the registry when every one is taken; -1
+ *  only past the handle limit the tyre tag can carry. */
+static int ReserveVehicleSlot( void )
+{
+	for ( int i = 0; i < g_vehicleSlots; i++ )
+	{
+		if ( !g_vehicles[i]->used )
+		{
+			return i;
+		}
+	}
+
+	if ( g_vehicleSlots >= B3W_VEHICLE_HANDLE_LIMIT )
+	{
+		return -1;
+	}
+
+	if ( g_vehicleSlots == g_vehicleCapacity )
+	{
+		int next = g_vehicleCapacity > 0 ? g_vehicleCapacity * 2 : 64;
+		g_vehicles = (Vehicle**)CheckedRealloc( g_vehicles, (size_t)next * sizeof( Vehicle* ) );
+		g_vehicleCapacity = next;
+	}
+
+	// Zeroed, so it arrives as an unused slot with no wheel arrays — the state
+	// `b3w_vehicle_create`'s memset relies on.
+	Vehicle* v = (Vehicle*)CheckedAlloc( sizeof( Vehicle ) );
+	memset( v, 0, sizeof( Vehicle ) );
+	g_vehicles[g_vehicleSlots] = v;
+	return g_vehicleSlots++;
 }
 
 int b3w_vehicle_create( b3WorldId world, int worldHandle, b3BodyId chassis, b3Filter filter )
 {
-	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	int i = ReserveVehicleSlot();
+	if ( i < 0 )
 	{
-		if ( g_vehicles[i].used )
-		{
-			continue;
-		}
-
-		Vehicle* v = &g_vehicles[i];
-		memset( v, 0, sizeof( Vehicle ) );
-		v->used = true;
-		v->handle = i;
-		v->world = world;
-		v->worldHandle = worldHandle;
-		v->chassis = chassis;
-		v->indexUpAxis = 1;
-		v->indexForwardAxis = 0;
-		v->owner = 0;
-		v->filter = filter;
-		return i;
+		return -1;
 	}
-	return -1;
+
+	Vehicle* v = g_vehicles[i];
+	memset( v, 0, sizeof( Vehicle ) );
+	v->used = true;
+	v->handle = i;
+	v->world = world;
+	v->worldHandle = worldHandle;
+	v->chassis = chassis;
+	v->indexUpAxis = 1;
+	v->indexForwardAxis = 0;
+	v->owner = 0;
+	v->filter = filter;
+	return i;
 }
 
 void b3w_vehicle_destroy( int handle )
@@ -4094,11 +4147,11 @@ void b3w_vehicle_destroy( int handle )
  */
 void b3w_vehicle_set_velocity( int handle, float vx, float vy, float vz, float wx, float wy, float wz )
 {
-	if ( handle < 0 || handle >= B3W_MAX_VEHICLES || !IsVehicleLive( &g_vehicles[handle] ) )
+	Vehicle* v = VehicleAt( handle );
+	if ( v == NULL || !IsVehicleLive( v ) )
 	{
 		return;
 	}
-	Vehicle* v = &g_vehicles[handle];
 	b3Vec3 linear = { vx, vy, vz };
 	b3Vec3 angular = { wx, wy, wz };
 	b3Body_SetLinearVelocity( v->chassis, linear );
@@ -4494,9 +4547,9 @@ int b3w_vehicle_debug_draw( int worldHandle, float* verts, float* colors, int ca
 
 	const int segments = 20;
 
-	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	for ( int i = 0; i < g_vehicleSlots; i++ )
 	{
-		Vehicle* v = &g_vehicles[i];
+		Vehicle* v = g_vehicles[i];
 		if ( !v->used || v->worldHandle != worldHandle )
 		{
 			continue;
@@ -4620,9 +4673,9 @@ static void CastAndPlaceWheels( Vehicle* v )
  */
 void b3w_vehicle_place_wheels( int worldHandle )
 {
-	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	for ( int i = 0; i < g_vehicleSlots; i++ )
 	{
-		Vehicle* v = &g_vehicles[i];
+		Vehicle* v = g_vehicles[i];
 		if ( !IsVehicleLive( v ) || v->worldHandle != worldHandle )
 		{
 			continue;
@@ -4643,9 +4696,9 @@ void b3w_vehicle_place_wheels( int worldHandle )
 int b3w_vehicle_awake_wheels( int worldHandle )
 {
 	int awake = 0;
-	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	for ( int i = 0; i < g_vehicleSlots; i++ )
 	{
-		Vehicle* v = &g_vehicles[i];
+		Vehicle* v = g_vehicles[i];
 		if ( !v->used || v->worldHandle != worldHandle )
 		{
 			continue;
@@ -4677,9 +4730,9 @@ void b3w_vehicle_wheel_sleep( int worldHandle, float* out )
 	out[2] = 1e9f;
 	out[3] = 0.0f;
 
-	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	for ( int i = 0; i < g_vehicleSlots; i++ )
 	{
-		Vehicle* v = &g_vehicles[i];
+		Vehicle* v = g_vehicles[i];
 		if ( !v->used || v->worldHandle != worldHandle )
 		{
 			continue;
@@ -4728,9 +4781,9 @@ void b3w_vehicle_wheel_speeds( int worldHandle, float* out )
 	out[2] = 0.0f;
 	out[3] = 0.0f;
 
-	for ( int i = 0; i < B3W_MAX_VEHICLES; i++ )
+	for ( int i = 0; i < g_vehicleSlots; i++ )
 	{
-		Vehicle* v = &g_vehicles[i];
+		Vehicle* v = g_vehicles[i];
 		if ( !v->used || v->worldHandle != worldHandle )
 		{
 			continue;

@@ -20,8 +20,84 @@
 #include "box3d/box3d.h"
 
 #include <malloc.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/em_js.h>
+#endif
+
+// --- the heap ------------------------------------------------------------
+//
+// The wasm heap has a ceiling (2 GB), and an allocation past it returns NULL.
+// Nothing here used to look: a NULL from `malloc` was written through, so a
+// full heap surfaced as "memory access out of bounds" inside whatever happened
+// to allocate next, or as a refusal that named the wrong cause ("its shape
+// registry is full"). Every allocation in this binding — the shim's, the
+// vehicle code's, Box3D's own through `b3SetAllocator`, and the buffers the
+// host asks for — goes through `CheckedAlloc` / `CheckedRealloc`, and running
+// out is ONE error that says what happened.
+//
+// It is thrown, not returned. Box3D cannot report a failed allocation — it
+// asserts and writes through it — so a return code would cover only the
+// allocations this file makes. A JavaScript exception unwinds every wasm frame
+// between here and the host call. The shim's own tables are left consistent
+// (it allocates before it mutates), but a throw from inside Box3D can leave the
+// world mid-operation, so a host that carries on after this error is carrying
+// on with a world that may refuse or mis-answer from then on. Whether to carry
+// on is the host's decision; this error is what makes it an informed one.
+
+#ifdef __EMSCRIPTEN__
+// clang-format off
+EM_JS( void, b3w_throw_heap_exhausted, ( double requested ), {
+	throw new Error( "box3d: wasm heap exhausted (" + Math.round( HEAPU8.length / 1048576 ) + " MB, asked for " +
+					 requested + " more bytes)" );
+} );
+// clang-format on
+#else
+static void b3w_throw_heap_exhausted( double requested )
+{
+	fprintf( stderr, "box3d: heap exhausted (asked for %.0f more bytes)\n", requested );
+	abort();
+}
+#endif
+
+void* CheckedAlloc( size_t size )
+{
+	void* p = malloc( size );
+	if ( p == NULL && size > 0 )
+	{
+		b3w_throw_heap_exhausted( (double)size );
+	}
+	return p;
+}
+
+void* CheckedRealloc( void* old, size_t size )
+{
+	void* p = realloc( old, size );
+	if ( p == NULL && size > 0 )
+	{
+		b3w_throw_heap_exhausted( (double)size );
+	}
+	return p;
+}
+
+/** Box3D's allocator: its default is `aligned_alloc` with nobody checking. */
+static void* AllocForBox3D( int32_t size, int32_t alignment )
+{
+	void* p = aligned_alloc( (size_t)alignment, (size_t)size );
+	if ( p == NULL && size > 0 )
+	{
+		b3w_throw_heap_exhausted( (double)size );
+	}
+	return p;
+}
+
+static void FreeForBox3D( void* mem )
+{
+	free( mem );
+}
 
 // --- handle tables -------------------------------------------------------
 //
@@ -60,7 +136,49 @@ typedef struct World
 	b3WorldId id;
 	bool inUse;
 
+	/*
+	 * BODIES: a handle is an identity, a slot is storage, and they are two
+	 * different numbers.
+	 *
+	 * A HANDLE is issued once, in creation order, and never reused. The host
+	 * depends on both halves of that: a handle held across a rebuild must find
+	 * nothing rather than the body that replaced it, and a structure's bodies,
+	 * created together, carry consecutive handles that a ray filter excludes as
+	 * one range (`b3w_cast_ray_filtered`).
+	 *
+	 * A SLOT is where a live body's state is kept, and is reused through a free
+	 * list. The table used to be indexed by handle, so it held a row for every
+	 * body ever created — a terrain chunk re-mesh is a new body, so a drive
+	 * across the map grew it without bound, and every walk over it (transform
+	 * readback, the detect-only reset) paid for the dead. Now it is the size of
+	 * the high-water mark of bodies alive at once.
+	 *
+	 * `handleSlot` maps one to the other (open addressing, linear probing,
+	 * backward-shift deletion so no tombstones accumulate). The engine-side
+	 * body's userData holds `slot + 1`, so the per-pair callbacks read their
+	 * state directly and only the host boundary ever hashes.
+	 *
+	 * Every per-body array below is indexed by SLOT.
+	 */
 	b3BodyId* bodies;
+	/** The handle living in each slot, or -1 for a free slot. */
+	int32_t* slotHandle;
+	/** Free slots, as a stack. */
+	int32_t* freeSlots;
+	int freeSlotCount;
+	/** Slots ever used: the table's length. */
+	int bodySlotCount;
+	/** Slots allocated. */
+	int bodyCapacity;
+	/** The next handle to issue. */
+	int nextBodyHandle;
+	/** Live bodies. */
+	int liveBodyCount;
+	int32_t* mapKeys;
+	int32_t* mapSlots;
+	/** A power of two, at least twice the live count. */
+	int mapCapacity;
+
 	/**
 	 * Which structure owns each body, parallel to `bodies`.
 	 *
@@ -80,10 +198,11 @@ typedef struct World
 	 * drop a contact from the solver while still reporting it.
 	 */
 	uint8_t* detectOnly;
-	/** The one body each body never collides with (-1: none): a told rider and
-	 *  its parent. Checked by the custom pair filter, so two riders of the same
-	 *  parent still collide with each other, which a shared negative group
-	 *  index could not express. */
+	/** The one body each body never collides with, as a HANDLE (-1: none): a
+	 *  told rider and its parent. Checked by the custom pair filter, so two
+	 *  riders of the same parent still collide with each other, which a shared
+	 *  negative group index could not express. A handle rather than a slot so
+	 *  that the parent's slot being reused can never exclude a stranger. */
 	int32_t* excludedFrom;
 	/** Bodies placed from a network stream. Two of them never solve a contact
 	 *  between them: their owners resolve it, and the solver shoving one out
@@ -106,8 +225,6 @@ typedef struct World
 	 */
 	uint8_t* massStated;
 	b3MassData* statedMass;
-	int bodyCount;
-	int bodyCapacity;
 
 	/*
 	 * Joints are handed back as handles for the same reasons shapes are, and
@@ -169,28 +286,27 @@ typedef struct World
 	 *  a destroyed world is caught by the slot's null shape id instead. */
 	uint16_t* shapeGen;
 	/*
-	 * The heap hull a slot's shape was built over, or NULL.
+	 * GEOMETRY. Who owns a shape's data decides when it can be freed, and the
+	 * answer differs by kind — see `OwnedGeometry`:
 	 *
-	 * Hulls from `b3CreateCylinder` / `b3CreateHull` are heap-owned and must
-	 * outlive the shape referencing them, unlike `b3MakeBoxHull`'s stack value.
-	 * They used to sit in a separate append-only `hulls[MAX_HULLS]` array
-	 * released only with the world, which leaked steadily — a tank costs 108 of
-	 * them per rebuild and rebuilds happen on every block placed — and past
-	 * 8192 they were not even recorded, so they could never be freed at all.
-	 *
-	 * A hull's lifetime IS its shape's lifetime, so it is stored with the shape
-	 * and freed when the slot is reclaimed. The old comment said a per-shape
-	 * registry was the thing "nobody would keep in sync"; the sweep keeps it in
-	 * sync by construction, because it asks the engine what is still alive.
+	 *  - A hull is CLONED by Box3D into its world's ref-counted hull database
+	 *    (`b3AddHullToDatabase`), so the shim's own hull is freed the moment the
+	 *    shape exists. It used to be kept per slot until the lazy sweep happened
+	 *    to recycle that slot, which held a dead copy for nothing.
+	 *  - A mesh or a height field is REFERENCED, not copied (box3d.h's warning
+	 *    on `b3CreateMeshShape`). The shim made one per shape and never freed
+	 *    any of them: every re-meshed terrain chunk, seam and scenery tile
+	 *    leaked its triangles, ~47.5 bytes each, until the heap hit its 2 GB
+	 *    ceiling and allocations started failing. The shim owns these, and
+	 *    frees them when their shape dies — on every path a shape can die by.
 	 */
-	b3HullData** shapeHull;
 	/** Slots allocated. Grows on demand; never shrinks while the world lives. */
 	int shapeCapacity;
 	int shapeCount;
 	/** Where the last reclaim sweep stopped, so a full registry stays amortised. */
 	int shapeRover;
 
-	// pos(3) + quat(4) per body, interleaved, in body-handle order.
+	// pos(3) + quat(4) per body, interleaved, in SLOT order.
 	float* transforms;
 } World;
 
@@ -216,7 +332,8 @@ static World* GetWorld( int handle )
 	return &g_worlds[handle];
 }
 
-static void ReserveBodies( World* world, int needed )
+/** Grow the per-slot arrays to hold `needed` slots, doubling. */
+static void ReserveBodySlots( World* world, int needed )
 {
 	if ( needed <= world->bodyCapacity )
 	{
@@ -229,22 +346,302 @@ static void ReserveBodies( World* world, int needed )
 		capacity *= 2;
 	}
 
-	world->bodies = (b3BodyId*)realloc( world->bodies, sizeof( b3BodyId ) * capacity );
-	world->transforms = (float*)realloc( world->transforms, sizeof( float ) * 7 * capacity );
-	world->bodyOwner = (uint32_t*)realloc( world->bodyOwner, sizeof( uint32_t ) * capacity );
-	memset( world->bodyOwner + world->bodyCapacity, 0, sizeof( uint32_t ) * (size_t)( capacity - world->bodyCapacity ) );
-	world->detectOnly = (uint8_t*)realloc( world->detectOnly, sizeof( uint8_t ) * capacity );
-	memset( world->detectOnly + world->bodyCapacity, 0, sizeof( uint8_t ) * (size_t)( capacity - world->bodyCapacity ) );
-	world->excludedFrom = (int32_t*)realloc( world->excludedFrom, sizeof( int32_t ) * capacity );
-	memset( world->excludedFrom + world->bodyCapacity, 0xFF, sizeof( int32_t ) * (size_t)( capacity - world->bodyCapacity ) );
-	world->placed = (uint8_t*)realloc( world->placed, sizeof( uint8_t ) * capacity );
-	memset( world->placed + world->bodyCapacity, 0, sizeof( uint8_t ) * (size_t)( capacity - world->bodyCapacity ) );
-	world->massDeferred = (uint8_t*)realloc( world->massDeferred, sizeof( uint8_t ) * capacity );
-	memset( world->massDeferred + world->bodyCapacity, 0, sizeof( uint8_t ) * (size_t)( capacity - world->bodyCapacity ) );
-	world->massStated = (uint8_t*)realloc( world->massStated, sizeof( uint8_t ) * capacity );
-	memset( world->massStated + world->bodyCapacity, 0, sizeof( uint8_t ) * (size_t)( capacity - world->bodyCapacity ) );
-	world->statedMass = (b3MassData*)realloc( world->statedMass, sizeof( b3MassData ) * capacity );
+	// Every field a new slot needs is written when a body takes it, so the
+	// tails are left as they come.
+	world->bodies = (b3BodyId*)CheckedRealloc( world->bodies, sizeof( b3BodyId ) * capacity );
+	world->slotHandle = (int32_t*)CheckedRealloc( world->slotHandle, sizeof( int32_t ) * capacity );
+	world->freeSlots = (int32_t*)CheckedRealloc( world->freeSlots, sizeof( int32_t ) * capacity );
+	world->transforms = (float*)CheckedRealloc( world->transforms, sizeof( float ) * 7 * capacity );
+	world->bodyOwner = (uint32_t*)CheckedRealloc( world->bodyOwner, sizeof( uint32_t ) * capacity );
+	world->detectOnly = (uint8_t*)CheckedRealloc( world->detectOnly, sizeof( uint8_t ) * capacity );
+	world->excludedFrom = (int32_t*)CheckedRealloc( world->excludedFrom, sizeof( int32_t ) * capacity );
+	world->placed = (uint8_t*)CheckedRealloc( world->placed, sizeof( uint8_t ) * capacity );
+	world->massDeferred = (uint8_t*)CheckedRealloc( world->massDeferred, sizeof( uint8_t ) * capacity );
+	world->massStated = (uint8_t*)CheckedRealloc( world->massStated, sizeof( uint8_t ) * capacity );
+	world->statedMass = (b3MassData*)CheckedRealloc( world->statedMass, sizeof( b3MassData ) * capacity );
 	world->bodyCapacity = capacity;
+}
+
+/** Handles are dense and sequential, so a multiplicative hash spreads them. */
+static int MapHome( World* world, int32_t handle )
+{
+	return (int)( ( (uint32_t)handle * 2654435761u ) & (uint32_t)( world->mapCapacity - 1 ) );
+}
+
+/** The slot a handle lives in, or -1: destroyed, never issued, or malformed. */
+static int SlotOf( World* world, int handle )
+{
+	if ( world == NULL || handle < 0 || world->mapCapacity == 0 )
+	{
+		return -1;
+	}
+
+	int mask = world->mapCapacity - 1;
+	for ( int i = MapHome( world, handle );; i = ( i + 1 ) & mask )
+	{
+		int32_t key = world->mapKeys[i];
+		if ( key == handle )
+		{
+			return world->mapSlots[i];
+		}
+		if ( key < 0 )
+		{
+			return -1;
+		}
+	}
+}
+
+static void MapInsert( World* world, int32_t handle, int32_t slot );
+
+/** Keep the map at most half full, so a probe is short and always ends. */
+static void MapReserve( World* world, int live )
+{
+	if ( world->mapCapacity >= 2 * live && world->mapCapacity > 0 )
+	{
+		return;
+	}
+
+	int32_t* oldKeys = world->mapKeys;
+	int32_t* oldSlots = world->mapSlots;
+	int oldCapacity = world->mapCapacity;
+
+	int capacity = oldCapacity == 0 ? 512 : oldCapacity;
+	while ( capacity < 2 * live )
+	{
+		capacity *= 2;
+	}
+
+	// Both allocated before either is installed, so a full heap leaves the old map whole.
+	int32_t* keys = (int32_t*)CheckedAlloc( sizeof( int32_t ) * (size_t)capacity );
+	int32_t* slots = (int32_t*)CheckedAlloc( sizeof( int32_t ) * (size_t)capacity );
+	memset( keys, 0xFF, sizeof( int32_t ) * (size_t)capacity );
+	world->mapKeys = keys;
+	world->mapSlots = slots;
+	world->mapCapacity = capacity;
+
+	for ( int i = 0; i < oldCapacity; ++i )
+	{
+		if ( oldKeys[i] >= 0 )
+		{
+			MapInsert( world, oldKeys[i], oldSlots[i] );
+		}
+	}
+	free( oldKeys );
+	free( oldSlots );
+}
+
+static void MapInsert( World* world, int32_t handle, int32_t slot )
+{
+	int mask = world->mapCapacity - 1;
+	int i = MapHome( world, handle );
+	while ( world->mapKeys[i] >= 0 )
+	{
+		i = ( i + 1 ) & mask;
+	}
+	world->mapKeys[i] = handle;
+	world->mapSlots[i] = slot;
+}
+
+/**
+ * Remove a handle, shifting later entries of its probe run back into the gap.
+ * Leaves no tombstone, so a world that churns bodies for hours probes exactly
+ * as far as one that never destroyed any.
+ */
+static void MapRemove( World* world, int32_t handle )
+{
+	int mask = world->mapCapacity - 1;
+	int i = MapHome( world, handle );
+	while ( world->mapKeys[i] != handle )
+	{
+		if ( world->mapKeys[i] < 0 )
+		{
+			return;
+		}
+		i = ( i + 1 ) & mask;
+	}
+
+	for ( int j = ( i + 1 ) & mask; world->mapKeys[j] >= 0; j = ( j + 1 ) & mask )
+	{
+		// The entry at j may move into the gap at i only if its home does not
+		// lie in the cyclic range (i, j] — otherwise a lookup would stop at i.
+		int home = MapHome( world, world->mapKeys[j] );
+		bool homeInRange = i <= j ? ( i < home && home <= j ) : ( i < home || home <= j );
+		if ( homeInRange )
+		{
+			continue;
+		}
+		world->mapKeys[i] = world->mapKeys[j];
+		world->mapSlots[i] = world->mapSlots[j];
+		i = j;
+	}
+	world->mapKeys[i] = -1;
+}
+
+/**
+ * The slot the next body will take, with every allocation it needs already
+ * made — and nothing about the table changed yet. Split from `CommitBodySlot`
+ * so that Box3D's own create, which can run out of heap too, happens between
+ * the two: a throw there leaves no slot or handle that nothing owns.
+ */
+static int ReserveNextBodySlot( World* world )
+{
+	ReserveBodySlots( world, world->bodySlotCount + 1 );
+	MapReserve( world, world->liveBodyCount + 1 );
+	return world->freeSlotCount > 0 ? world->freeSlots[world->freeSlotCount - 1] : world->bodySlotCount;
+}
+
+/** Take the slot `ReserveNextBodySlot` named and issue its handle. Allocates nothing. */
+static int32_t CommitBodySlot( World* world, int slot )
+{
+	if ( world->freeSlotCount > 0 && world->freeSlots[world->freeSlotCount - 1] == slot )
+	{
+		world->freeSlotCount--;
+	}
+	else
+	{
+		world->bodySlotCount++;
+	}
+
+	int32_t handle = world->nextBodyHandle++;
+	MapInsert( world, handle, slot );
+	world->slotHandle[slot] = handle;
+	world->liveBodyCount++;
+	return handle;
+}
+
+static void ReleaseBodySlot( World* world, int slot )
+{
+	MapRemove( world, world->slotHandle[slot] );
+	world->slotHandle[slot] = -1;
+	world->bodies[slot] = b3_nullBodyId;
+	world->freeSlots[world->freeSlotCount++] = slot;
+	world->liveBodyCount--;
+}
+
+/** The handle a live body's slot holds, for anything reported to the host. */
+static int HandleOfSlot( World* world, int slot )
+{
+	if ( slot < 0 || slot >= world->bodySlotCount )
+	{
+		return -1;
+	}
+	return world->slotHandle[slot];
+}
+
+// --- shape geometry ownership --------------------------------------------
+
+/**
+ * The data a shape REFERENCES and the shim therefore owns, or NULL.
+ *
+ * Only meshes and height fields: Box3D clones a hull into its own database and
+ * copies spheres and capsules by value. Every mesh and height field shape in a
+ * world is made by `b3w_add_mesh_shape` / `b3w_add_height_field`, each over
+ * data of its own, so a shape's geometry is exactly one owner's.
+ */
+static void* OwnedGeometry( b3ShapeId shape, b3ShapeType* type )
+{
+	*type = b3Shape_GetType( shape );
+	if ( *type == b3_meshShape )
+	{
+		return (void*)b3Shape_GetMesh( shape ).data;
+	}
+	if ( *type == b3_heightShape )
+	{
+		return (void*)b3Shape_GetHeightField( shape );
+	}
+	return NULL;
+}
+
+static void FreeGeometry( b3ShapeType type, void* data )
+{
+	if ( data == NULL )
+	{
+		return;
+	}
+	if ( type == b3_meshShape )
+	{
+		b3DestroyMesh( (b3MeshData*)data );
+	}
+	else if ( type == b3_heightShape )
+	{
+		b3DestroyHeightField( (b3HeightFieldData*)data );
+	}
+}
+
+/** Hand geometry to the shape just made over it, or free it now if the engine
+ *  made no shape: then nothing references it and nothing else will free it. */
+static b3ShapeId AttachOwned( b3ShapeId shape, b3ShapeType type, void* data )
+{
+	if ( B3_IS_NULL( shape ) || !b3Shape_IsValid( shape ) )
+	{
+		FreeGeometry( type, data );
+	}
+	return shape;
+}
+
+/** Destroy one shape and free what it referenced — after, never before: the
+ *  destroy still reads the geometry to take the shape out of the broadphase. */
+static void DestroyShapeAndGeometry( b3ShapeId shape, bool updateBodyMass )
+{
+	if ( B3_IS_NULL( shape ) || !b3Shape_IsValid( shape ) )
+	{
+		return;
+	}
+	b3ShapeType type;
+	void* data = OwnedGeometry( shape, &type );
+	b3DestroyShape( shape, updateBodyMass );
+	FreeGeometry( type, data );
+}
+
+typedef struct OwnedShapeData
+{
+	b3ShapeType type;
+	void* data;
+} OwnedShapeData;
+
+/**
+ * Destroy a body and free the geometry of every shape on it.
+ *
+ * Box3D takes a body's shapes with it and tells nobody, which is why the
+ * geometry is gathered first. This is the dominant way a shape dies here — a
+ * terrain chunk is re-meshed by destroying its body — so it is the path that
+ * leaked.
+ */
+static void DestroyBodyAndGeometry( b3BodyId body )
+{
+	int count = b3Body_GetShapeCount( body );
+	b3ShapeId stackShapes[16];
+	b3ShapeId* shapes = count <= 16 ? stackShapes : (b3ShapeId*)CheckedAlloc( sizeof( b3ShapeId ) * (size_t)count );
+	count = b3Body_GetShapes( body, shapes, count );
+
+	// Only the owned entries, packed to the front: read before the body goes,
+	// freed after it.
+	OwnedShapeData stackOwned[16];
+	OwnedShapeData* owned =
+		count <= 16 ? stackOwned : (OwnedShapeData*)CheckedAlloc( sizeof( OwnedShapeData ) * (size_t)count );
+	int ownedCount = 0;
+	for ( int i = 0; i < count; ++i )
+	{
+		OwnedShapeData* o = &owned[ownedCount];
+		o->data = OwnedGeometry( shapes[i], &o->type );
+		ownedCount += o->data != NULL ? 1 : 0;
+	}
+
+	b3DestroyBody( body );
+
+	for ( int i = 0; i < ownedCount; ++i )
+	{
+		FreeGeometry( owned[i].type, owned[i].data );
+	}
+
+	if ( shapes != stackShapes )
+	{
+		free( shapes );
+	}
+	if ( owned != stackOwned )
+	{
+		free( owned );
+	}
 }
 
 // Defined in vehicle.c; registered as the world substep callback below.
@@ -284,6 +681,9 @@ int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableC
 	// already the simulation's thread.
 	def.workerCount = 1;
 
+	// Before Box3D's first allocation; idempotent, so every world may say it.
+	b3SetAllocator( AllocForBox3D, FreeForBox3D );
+
 	World* world = &g_worlds[handle];
 	world->id = b3CreateWorld( &def );
 
@@ -297,13 +697,15 @@ int b3w_create_world( float gx, float gy, float gz, int enableSleep, int enableC
 	// detect-only or placed body would otherwise never have one installed.
 	b3World_SetPreSolveCallback( world->id, PreSolveDetectOnly, world );
 	world->inUse = true;
-	world->bodyCount = 0;
 	world->jointCount = 0;
 	world->jointCapacity = 0;
 	world->jointRover = 0;
 	world->shapeCount = 0;
 
-	ReserveBodies( world, 256 );
+	// The rest of the body table starts zeroed: a destroyed world clears its
+	// whole struct, and the array of them is static.
+	ReserveBodySlots( world, 256 );
+	MapReserve( world, 1 );
 
 	return handle;
 }
@@ -319,25 +721,43 @@ void b3w_destroy_world( int handle )
 	// Before the world goes: its vehicles hold body ids that are about to be
 	// freed, and ids are reused by the next world to take this slot.
 	b3w_vehicle_destroy_world( world->id );
-	b3DestroyWorld( world->id );
 
+	// The world takes every shape with it, so what they referenced is gathered
+	// first. Every mesh and height field is in the shape table: the shim makes
+	// them all, and one it could not register it destroyed on the spot.
+	OwnedShapeData* owned =
+		(OwnedShapeData*)CheckedAlloc( sizeof( OwnedShapeData ) * (size_t)( world->shapeCount > 0 ? world->shapeCount : 1 ) );
+	int ownedCount = 0;
 	for ( int i = 0; i < world->shapeCount; ++i )
 	{
-		if ( world->shapeHull[i] != NULL )
+		if ( B3_IS_NULL( world->shapes[i] ) || !b3Shape_IsValid( world->shapes[i] ) )
 		{
-			b3DestroyHull( world->shapeHull[i] );
+			continue;
 		}
+		OwnedShapeData* o = &owned[ownedCount];
+		o->data = OwnedGeometry( world->shapes[i], &o->type );
+		ownedCount += o->data != NULL ? 1 : 0;
 	}
 
-	// All FOUR of the per-body arrays `ReserveBodies` grows, not just the two
-	// that were here — `bodyOwner` and `detectOnly` leaked on every world
-	// teardown, found by running this under ASan.
+	b3DestroyWorld( world->id );
+
+	for ( int i = 0; i < ownedCount; ++i )
+	{
+		FreeGeometry( owned[i].type, owned[i].data );
+	}
+	free( owned );
+
+	// EVERY array `ReserveBodySlots` grows, not just some — `bodyOwner` and
+	// `detectOnly` once leaked on every world teardown, found under ASan.
 	free( world->joints );
 	free( world->jointGen );
 	free( world->shapes );
 	free( world->shapeGen );
-	free( world->shapeHull );
 	free( world->bodies );
+	free( world->slotHandle );
+	free( world->freeSlots );
+	free( world->mapKeys );
+	free( world->mapSlots );
 	free( world->transforms );
 	free( world->bodyOwner );
 	free( world->detectOnly );
@@ -403,23 +823,23 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
 		def.motionLocks.angularZ = true;
 	}
 
-	ReserveBodies( world, world->bodyCount + 1 );
+	int slot = ReserveNextBodySlot( world );
+	world->bodies[slot] = b3CreateBody( world->id, &def );
+	int32_t handleOut = CommitBodySlot( world, slot );
+	world->bodyOwner[slot] = 0;
+	world->detectOnly[slot] = 0;
+	world->excludedFrom[slot] = -1;
+	world->placed[slot] = 0;
+	world->massDeferred[slot] = 0;
+	world->massStated[slot] = 0;
 
-	int body = world->bodyCount++;
-	world->bodies[body] = b3CreateBody( world->id, &def );
-	world->bodyOwner[body] = 0;
-	world->detectOnly[body] = 0;
-	world->excludedFrom[body] = -1;
-	world->placed[body] = 0;
-	world->massDeferred[body] = 0;
-	world->massStated[body] = 0;
+	// The SLOT rides on the body, so a contact callback reaches the body's state
+	// without a lookup, and a query result names it through `slotHandle`.
+	// Offset by one so that a body whose user data was never set — a vehicle's
+	// wheel — reads as "unknown" rather than as slot zero.
+	b3Body_SetUserData( world->bodies[slot], (void*)(intptr_t)( slot + 1 ) );
 
-	// The handle rides ON the body, so a query result can name it without a
-	// reverse scan of the table. Offset by one so that a body whose user data
-	// was never set reads as "unknown" rather than as body zero.
-	b3Body_SetUserData( world->bodies[body], (void*)(intptr_t)( body + 1 ) );
-
-	return body;
+	return handleOut;
 }
 
 /**
@@ -457,8 +877,8 @@ int b3w_create_body( int handle, int bodyType, float px, float py, float pz, flo
 #define SHAPE_GEN_MASK 0x3FF
 
 /**
- * Make room for one more shape slot, doubling. False only when the heap is out
- * or the slot field cannot address another one.
+ * Make room for one more shape slot, doubling. False only when the slot field
+ * cannot address another one (a full heap throws — see the heap).
  *
  * Generations are PRESERVED across a grow: realloc keeps the existing ones and
  * only the new tail is zeroed. A generation that reset would hand a stale
@@ -482,30 +902,11 @@ static bool ReserveShapeSlot( World* world )
 		return false;
 	}
 
-	b3ShapeId* shapes = (b3ShapeId*)realloc( world->shapes, (size_t)next * sizeof( b3ShapeId ) );
-	if ( shapes == NULL )
-	{
-		return false;
-	}
-	world->shapes = shapes;
-
-	uint16_t* gen = (uint16_t*)realloc( world->shapeGen, (size_t)next * sizeof( uint16_t ) );
-	if ( gen == NULL )
-	{
-		return false;
-	}
-	world->shapeGen = gen;
-
-	b3HullData** hulls = (b3HullData**)realloc( world->shapeHull, (size_t)next * sizeof( b3HullData* ) );
-	if ( hulls == NULL )
-	{
-		return false;
-	}
-	world->shapeHull = hulls;
+	world->shapes = (b3ShapeId*)CheckedRealloc( world->shapes, (size_t)next * sizeof( b3ShapeId ) );
+	world->shapeGen = (uint16_t*)CheckedRealloc( world->shapeGen, (size_t)next * sizeof( uint16_t ) );
 
 	memset( world->shapes + prev, 0, (size_t)( next - prev ) * sizeof( b3ShapeId ) );
 	memset( world->shapeGen + prev, 0, (size_t)( next - prev ) * sizeof( uint16_t ) );
-	memset( world->shapeHull + prev, 0, (size_t)( next - prev ) * sizeof( b3HullData* ) );
 
 	world->shapeCapacity = next;
 	return true;
@@ -514,7 +915,7 @@ static bool ReserveShapeSlot( World* world )
 /** The body's mass is re-derived from its shapes on each add or destroy. */
 static bool MassFromShapes( World* world, int body )
 {
-	if ( body < 0 || body >= world->bodyCount )
+	if ( body < 0 || body >= world->bodySlotCount )
 	{
 		return true;
 	}
@@ -541,12 +942,12 @@ static void ApplyMass( World* world, int body )
 
 static int BodyIndexOfShape( b3ShapeId shapeId );
 
-static int RetainShape( World* world, b3ShapeId shape, b3HullData* hull )
+static int RetainShape( World* world, b3ShapeId shape )
 {
 	if ( !B3_IS_NULL( shape ) && b3Shape_IsValid( shape ) )
 	{
 		int body = BodyIndexOfShape( shape );
-		if ( body >= 0 && body < world->bodyCount && world->massStated[body] != 0 && world->massDeferred[body] == 0 )
+		if ( body >= 0 && body < world->bodySlotCount && world->massStated[body] != 0 && world->massDeferred[body] == 0 )
 		{
 			ApplyMass( world, body );
 		}
@@ -582,31 +983,24 @@ static int RetainShape( World* world, b3ShapeId shape, b3HullData* hull )
 		{
 			// Reusing the slot invalidates every handle that pointed at it.
 			world->shapeGen[slot] = (uint16_t)( ( world->shapeGen[slot] + 1 ) & SHAPE_GEN_MASK );
-
-			// The dead shape's hull goes with it. Safe here and nowhere earlier:
-			// the sweep only picks slots whose shape the engine already reports
-			// invalid, and a hull must outlive the shape built over it.
-			if ( world->shapeHull[slot] != NULL )
-			{
-				b3DestroyHull( world->shapeHull[slot] );
-				world->shapeHull[slot] = NULL;
-			}
 		}
 	}
 
 	// Every slot holds a LIVE shape, so there is nothing to recycle and the
-	// table has to get bigger. -1 now means only that the heap said no.
+	// table has to get bigger. -1 now means only that the slot field cannot
+	// address another shape (the heap running out throws instead). The shape
+	// goes with the refusal: an unregistered shape is one nothing can destroy.
 	if ( slot < 0 )
 	{
 		if ( !ReserveShapeSlot( world ) )
 		{
+			DestroyShapeAndGeometry( shape, true );
 			return -1;
 		}
 		slot = world->shapeCount++;
 	}
 
 	world->shapes[slot] = shape;
-	world->shapeHull[slot] = hull;
 	return (int)( ( (uint32_t)world->shapeGen[slot] << SHAPE_SLOT_BITS ) | (uint32_t)slot );
 }
 
@@ -649,7 +1043,7 @@ int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float
 					   int isSensor )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return -1;
 	}
@@ -678,36 +1072,37 @@ int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateHullShape( bodyId, &def, &hull.base ), NULL );
+	return RetainShape( world, b3CreateHullShape( bodyId, &def, &hull.base ) );
 }
 
+/** Handles ever issued: one past the newest. Never falls — a handle is never
+ *  reused — so it bounds a handle, and counts nothing alive. */
 int b3w_body_count( int handle )
 {
 	World* world = GetWorld( handle );
-	return world == NULL ? 0 : world->bodyCount;
+	return world == NULL ? 0 : world->nextBodyHandle;
 }
 
-// Bodies that EXIST, as opposed to slots ever handed out: `bodyCount` above is
-// the slot array's length and never falls, because a destroyed body keeps its
-// index so no handle can be reused by mistake. A gauge that wants a population
-// reads this one.
+/** Bodies that EXIST. A gauge that wants a population reads this one. */
 int b3w_live_body_count( int handle )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL )
-	{
-		return 0;
-	}
+	return world == NULL ? 0 : world->liveBodyCount;
+}
 
-	int live = 0;
-	for ( int i = 0; i < world->bodyCount; ++i )
-	{
-		if ( !B3_IS_NULL( BodyOf( world, i ) ) )
-		{
-			++live;
-		}
-	}
-	return live;
+/** Rows in the body table: the most bodies alive at once. What the table
+ *  costs, where `b3w_body_count` is what was ever made. */
+int b3w_body_slot_count( int handle )
+{
+	World* world = GetWorld( handle );
+	return world == NULL ? 0 : world->bodySlotCount;
+}
+
+/** The transform row a body's pose is written to by `b3w_read_transforms`, or
+ *  -1 for a body that does not exist. */
+int b3w_body_slot( int handle, int body )
+{
+	return SlotOf( GetWorld( handle ), body );
 }
 
 int b3w_is_awake( int handle, int body )
@@ -758,7 +1153,10 @@ int b3w_transforms_ptr( int handle )
 }
 
 /// Fill the transform buffer from the world. One call per step, then the host
-/// reads 7 floats per body straight out of the heap.
+/// reads 7 floats per body straight out of the heap, at the body's SLOT
+/// (`b3w_body_slot`) — `b3w_body_slot_count` rows. Slots are handed out in
+/// handle order until the first body is destroyed, so a world that never
+/// destroys one reads row = handle.
 void b3w_read_transforms( int handle )
 {
 	World* world = GetWorld( handle );
@@ -768,13 +1166,12 @@ void b3w_read_transforms( int handle )
 	}
 
 	float* out = world->transforms;
-	for ( int i = 0; i < world->bodyCount; ++i )
+	for ( int i = 0; i < world->bodySlotCount; ++i )
 	{
-		// A destroyed body still owns its row. This runs EVERY tick over EVERY
-		// slot, so it is the hottest place a dangling id could be dereferenced —
-		// one destroyed body used to poison the heap here on the very next tick.
-		// Its row is left as a finite identity rather than skipped, so the
-		// buffer's layout never depends on which bodies happen to be alive.
+		// A free slot is written as a finite identity rather than skipped, so
+		// the buffer never holds garbage a stale reader could act on. It runs
+		// every tick over every row, so it is the hottest place a dangling id
+		// could be dereferenced — BodyOf refuses one.
 		b3BodyId id = BodyOf( world, i );
 		if ( B3_IS_NULL( id ) )
 		{
@@ -805,24 +1202,20 @@ void b3w_read_transforms( int handle )
 // crosses the boundary.
 
 /**
- * Resolve a body slot, or null if nothing lives there any more.
+ * Resolve a body SLOT, or null if nothing lives there any more.
  *
- * A slot's index staying inside `bodyCount` does NOT mean the body exists:
- * `b3w_destroy_body` frees it and the array keeps its length, so an index the
- * caller cached before a rebuild still passes a bounds check. Handing that
- * dangling id to Box3D reads freed memory — and since the shipped wasm is
- * built `-DNDEBUG`, `b3Body_IsValid` is compiled out and there is no complaint:
- * the heap is quietly corrupted and the NEXT unrelated query traps. That cost a
- * flying machine its simulation ~1.5 s after take-off, and the trap always
- * named the innocent query rather than the stale handle.
- *
- * So validity is decided HERE, once, for every entry point that names a body.
- * Destroy nulls the slot (cheap, exact); this rejects both the nulled slot and
- * any id Box3D itself no longer recognises.
+ * Entry points take a handle and resolve it to a slot first (`SlotOf`, which
+ * refuses a destroyed or never-issued handle); this is the second line, for a
+ * slot. A freed slot is nulled on destroy, and a Box3D id the engine itself no
+ * longer recognises is refused too. Handing a dangling id to Box3D reads freed
+ * memory — and since the shipped wasm is built `-DNDEBUG`, there is no
+ * complaint: the heap is quietly corrupted and the NEXT unrelated query traps.
+ * That cost a flying machine its simulation ~1.5 s after take-off, and the trap
+ * always named the innocent query rather than the stale handle.
  */
 static b3BodyId BodyOf( World* world, int body )
 {
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || body < 0 || body >= world->bodySlotCount )
 	{
 		return b3_nullBodyId;
 	}
@@ -839,9 +1232,11 @@ static b3BodyId BodyOf( World* world, int body )
 	return id;
 }
 
+/** A body by world handle and body HANDLE, the way the host names one. */
 static b3BodyId BodyId( int handle, int body )
 {
-	return BodyOf( GetWorld( handle ), body );
+	World* world = GetWorld( handle );
+	return BodyOf( world, SlotOf( world, body ) );
 }
 
 /**
@@ -1083,9 +1478,11 @@ void b3w_set_rotation_lock( int handle, int body, int locked )
 	locks.angularZ = locked != 0;
 	b3Body_SetMotionLocks( id, locks );
 	// Box3D re-derives the mass from shapes when the locks change.
-	if ( GetWorld( handle )->massStated[body] != 0 )
+	World* world = GetWorld( handle );
+	int slot = SlotOf( world, body );
+	if ( world->massStated[slot] != 0 )
 	{
-		ApplyMass( GetWorld( handle ), body );
+		ApplyMass( world, slot );
 	}
 }
 
@@ -1170,9 +1567,11 @@ void b3w_set_body_type( int handle, int body, int type )
 	BODY_OR_RETURN( id, handle, body )
 	b3Body_SetType( id, (b3BodyType)type );
 	// Box3D re-derives the mass from shapes on a type change.
-	if ( GetWorld( handle )->massStated[body] != 0 )
+	World* world = GetWorld( handle );
+	int slot = SlotOf( world, body );
+	if ( world->massStated[slot] != 0 )
 	{
-		ApplyMass( GetWorld( handle ), body );
+		ApplyMass( world, slot );
 	}
 }
 
@@ -1206,7 +1605,7 @@ int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius,
 						   float density, float friction, float restitution, int isSensor )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return -1;
 	}
@@ -1231,16 +1630,23 @@ int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius,
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateCapsuleShape( bodyId, &def, &capsule ), NULL );
+	return RetainShape( world, b3CreateCapsuleShape( bodyId, &def, &capsule ) );
 }
 
 // --- terrain and queries -------------------------------------------------
 
 /// Allocate a float buffer in the wasm heap for the host to fill. Returned as a
-/// byte offset; free with `free`.
+/// byte offset; free with `free`. Throws rather than return 0 — see the heap.
 int b3w_alloc_floats( int count )
 {
-	return (int)(intptr_t)malloc( sizeof( float ) * count );
+	return (int)(intptr_t)CheckedAlloc( sizeof( float ) * (size_t)( count > 0 ? count : 1 ) );
+}
+
+/// The same for bytes: every buffer the host allocates in this heap comes from
+/// one of these two, so none of them can be a 0 the host then writes through.
+int b3w_alloc_bytes( int count )
+{
+	return (int)(intptr_t)CheckedAlloc( (size_t)( count > 0 ? count : 1 ) );
 }
 
 /**
@@ -1262,7 +1668,10 @@ int b3w_heap_in_use( void )
  * The host passes heights as a pointer into the wasm heap it filled itself, so
  * a terrain upload is one crossing rather than one per sample. Box3D keeps a
  * REFERENCE to the height field (see b3CreateHeightFieldShape's warning), so
- * the data must outlive the shape — hence the copy into memory we own.
+ * the field must outlive the shape: the shim owns it and frees it when the
+ * shape dies (`OwnedGeometry`). The heights themselves are copied into the
+ * field by `b3CreateHeightField`, so they are read straight from the host's
+ * buffer.
  *
  * Index order is deliberately NOT converted here. Whether the host's array is
  * row-major over x or over z is the host's business, and hiding a transpose in
@@ -1273,14 +1682,20 @@ int b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int 
 						  float scaleZ, float friction, float restitution )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
+	{
+		return -1;
+	}
+
+	// Resolved BEFORE the field is built, so a refusal has nothing to free.
+	b3BodyId bodyId = BodyOf( world, body );
+	if ( B3_IS_NULL( bodyId ) )
 	{
 		return -1;
 	}
 
 	int sampleCount = countX * countZ;
-	float* heights = (float*)malloc( sizeof( float ) * sampleCount );
-	memcpy( heights, (const void*)(intptr_t)heightsPtr, sizeof( float ) * sampleCount );
+	const float* heights = (const float*)(intptr_t)heightsPtr;
 
 	float minHeight = heights[0];
 	float maxHeight = heights[0];
@@ -1291,7 +1706,7 @@ int b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int 
 	}
 
 	b3HeightFieldDef def = { 0 };
-	def.heights = heights;
+	def.heights = (float*)heights; // read only: b3CreateHeightField copies them
 	def.materialIndices = NULL;
 	def.scale = ( b3Vec3 ){ scaleX, scaleY, scaleZ };
 	def.countX = countX;
@@ -1300,7 +1715,6 @@ int b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int 
 	def.globalMaximumHeight = maxHeight;
 
 	b3HeightFieldData* field = b3CreateHeightField( &def );
-	free( heights );
 
 	// Terrain is a surface the game tunes like any other: it states a friction
 	// and a collision group, and taking the library defaults instead left the
@@ -1311,13 +1725,7 @@ int b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int 
 	shapeDef.baseMaterial.friction = friction;
 	shapeDef.baseMaterial.restitution = restitution;
 
-	b3BodyId bodyId = BodyOf( world, body );
-	if ( B3_IS_NULL( bodyId ) )
-	{
-		return -1;
-	}
-
-	return RetainShape( world, b3CreateHeightFieldShape( bodyId, &shapeDef, field ), NULL );
+	return RetainShape( world, AttachOwned( b3CreateHeightFieldShape( bodyId, &shapeDef, field ), b3_heightShape, field ) );
 }
 
 /// Cast a ray and return the hit's world Y, or `missValue` when nothing is hit.
@@ -1404,8 +1812,8 @@ static const b3Vec3 AXIS_Z = { 0.0f, 0.0f, 1.0f };
 #define JOINT_GEN_MASK 0x3FF
 
 /**
- * Make room for one more joint slot, doubling. False only when the heap is out
- * or the slot field cannot address another one.
+ * Make room for one more joint slot, doubling. False only when the slot field
+ * cannot address another one (a full heap throws — see the heap).
  *
  * Generations are PRESERVED across a grow: realloc keeps the existing ones and
  * only the new tail is zeroed. A generation that reset would hand a stale
@@ -1429,19 +1837,8 @@ static bool ReserveJointSlot( World* world )
 		return false;
 	}
 
-	b3JointId* joints = (b3JointId*)realloc( world->joints, (size_t)next * sizeof( b3JointId ) );
-	if ( joints == NULL )
-	{
-		return false;
-	}
-	world->joints = joints;
-
-	uint16_t* gen = (uint16_t*)realloc( world->jointGen, (size_t)next * sizeof( uint16_t ) );
-	if ( gen == NULL )
-	{
-		return false;
-	}
-	world->jointGen = gen;
+	world->joints = (b3JointId*)CheckedRealloc( world->joints, (size_t)next * sizeof( b3JointId ) );
+	world->jointGen = (uint16_t*)CheckedRealloc( world->jointGen, (size_t)next * sizeof( uint16_t ) );
 
 	memset( world->joints + prev, 0, (size_t)( next - prev ) * sizeof( b3JointId ) );
 	memset( world->jointGen + prev, 0, (size_t)( next - prev ) * sizeof( uint16_t ) );
@@ -1489,11 +1886,16 @@ static int RetainJoint( World* world, b3JointId joint )
 	}
 
 	// Every slot holds a LIVE joint, so there is nothing to recycle and the
-	// table has to get bigger. -1 now means only that the heap said no.
+	// table has to get bigger. -1 now means only that the slot field cannot
+	// address another joint; the joint goes with the refusal, as a shape does.
 	if ( slot < 0 )
 	{
 		if ( !ReserveJointSlot( world ) )
 		{
+			if ( b3Joint_IsValid( joint ) )
+			{
+				b3DestroyJoint( joint, true );
+			}
 			return -1;
 		}
 		slot = world->jointCount++;
@@ -1921,8 +2323,9 @@ float b3w_joint_force( int handle, int joint )
  * upward. `weldTolerance` covers the vertex merging that flag also implies —
  * adjacency cannot exist across duplicated vertices.
  *
- * Box3D keeps a reference to the mesh (see b3CreateMeshShape), so the data is
- * copied into memory we own and outlives the shape.
+ * Box3D keeps a reference to the mesh (see b3CreateMeshShape), so the mesh is
+ * the shim's: it outlives the shape and is freed when the shape dies
+ * (`OwnedGeometry`).
  *
  * `surfacesPtr`, when non-zero, is one byte per triangle naming the SURFACE it
  * is — mud, rock, road — and 0 means untagged. Each id becomes a material whose
@@ -1936,19 +2339,26 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 						 float friction, float restitution, int group, int isSensor, int surfacesPtr )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return -1;
 	}
 
-	b3Vec3* vertices = (b3Vec3*)malloc( sizeof( b3Vec3 ) * vertexCount );
+	// Resolved BEFORE the mesh is built, so a refusal has nothing to free.
+	b3BodyId bodyId = BodyOf( world, body );
+	if ( B3_IS_NULL( bodyId ) )
+	{
+		return -1;
+	}
+
+	b3Vec3* vertices = (b3Vec3*)CheckedAlloc( sizeof( b3Vec3 ) * vertexCount );
 	const float* src = (const float*)(intptr_t)verticesPtr;
 	for ( int i = 0; i < vertexCount; ++i )
 	{
 		vertices[i] = ( b3Vec3 ){ src[3 * i], src[3 * i + 1], src[3 * i + 2] };
 	}
 
-	int32_t* indices = (int32_t*)malloc( sizeof( int32_t ) * 3 * triangleCount );
+	int32_t* indices = (int32_t*)CheckedAlloc( sizeof( int32_t ) * 3 * triangleCount );
 	memcpy( indices, (const void*)(intptr_t)indicesPtr, sizeof( int32_t ) * 3 * triangleCount );
 
 	// The highest surface named decides how many materials there are: a mesh
@@ -1976,6 +2386,10 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 	b3MeshData* mesh = b3CreateMesh( &def, NULL, 0 );
 	free( vertices );
 	free( indices );
+	if ( mesh == NULL )
+	{
+		return -1;
+	}
 
 	b3ShapeDef shapeDef = b3DefaultShapeDef();
 	shapeDef.enableCustomFiltering = true;
@@ -2029,13 +2443,8 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 	 */
 	shapeDef.enableSpeculativeContact = true;
 
-	b3BodyId bodyId = BodyOf( world, body );
-	if ( B3_IS_NULL( bodyId ) )
-	{
-		return -1;
-	}
-
-	return RetainShape( world, b3CreateMeshShape( bodyId, &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } ), NULL );
+	b3ShapeId shape = b3CreateMeshShape( bodyId, &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } );
+	return RetainShape( world, AttachOwned( shape, b3_meshShape, mesh ) );
 }
 
 // --- joint motors and limits ---------------------------------------------
@@ -2199,17 +2608,15 @@ int b3w_cast_sphere( int handle, float cx, float cy, float cz, float radius, flo
 
 // --- the rest of the shape vocabulary ------------------------------------
 //
-// Hulls built by b3CreateCylinder and b3CreateHull are HEAP-owned and must
-// outlive the shape that references them, unlike b3MakeBoxHull's stack value.
-// They are kept on the world and released with it, because the game rebuilds
-// structures constantly and a per-shape free would need a registry nobody
-// would keep in sync.
+// Hulls built by b3CreateCylinder and b3CreateHull are heap-allocated, and
+// freed as soon as the shape exists: `b3CreateHullShape` clones the hull into
+// the world's ref-counted hull database, so nothing references ours after it.
 
 int b3w_add_sphere_shape( int handle, int body, float radius, float ox, float oy, float oz, float density,
 						  float friction, float restitution, int group, int isSensor )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return -1;
 	}
@@ -2231,7 +2638,7 @@ int b3w_add_sphere_shape( int handle, int body, float radius, float ox, float oy
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateSphereShape( bodyId, &def, &sphere ), NULL );
+	return RetainShape( world, b3CreateSphereShape( bodyId, &def, &sphere ) );
 }
 
 /// A cylinder about local Y, matching how the game orients wheels.
@@ -2239,7 +2646,7 @@ int b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius
 							 float friction, float restitution, int group, int isSensor )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return -1;
 	}
@@ -2263,8 +2670,10 @@ int b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius
 	}
 
 	b3HullData* hull = b3CreateCylinder( 2.0f * halfHeight, radius, -halfHeight, sides );
+	b3ShapeId shape = b3CreateHullShape( bodyId, &def, hull );
+	b3DestroyHull( hull );
 
-	return RetainShape( world, b3CreateHullShape( bodyId, &def, hull ), hull );
+	return RetainShape( world, shape );
 }
 
 /// A convex hull over a point cloud the host uploaded.
@@ -2272,12 +2681,12 @@ int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int
 						 float friction, float restitution, int group, int isSensor )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return -1;
 	}
 
-	b3Vec3* points = (b3Vec3*)malloc( sizeof( b3Vec3 ) * pointCount );
+	b3Vec3* points = (b3Vec3*)CheckedAlloc( sizeof( b3Vec3 ) * pointCount );
 	const float* src = (const float*)(intptr_t)pointsPtr;
 	for ( int i = 0; i < pointCount; ++i )
 	{
@@ -2304,37 +2713,40 @@ int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int
 	b3BodyId bodyId = BodyOf( world, body );
 	if ( B3_IS_NULL( bodyId ) )
 	{
+		b3DestroyHull( hull );
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateHullShape( bodyId, &def, hull ), hull );
+	b3ShapeId shape = b3CreateHullShape( bodyId, &def, hull );
+	b3DestroyHull( hull );
+
+	return RetainShape( world, shape );
 }
 
 // --- lifecycle and world state -------------------------------------------
 
-/// Destroy a body and everything attached to it. The handle stays allocated so
-/// that stale references fail a validity check rather than addressing a
-/// recycled body — `b3w_is_valid` is the way to ask.
-///
-/// The slot is NULLED, which is what makes that promise true: a freed
-/// `b3BodyId` left in place is not merely stale, it is unsafe to ask about at
-/// all once Box3D reuses the index behind it. See `BodyOf`.
+/// Destroy a body and everything attached to it, geometry included. The handle
+/// is retired, never reissued, so a stale reference fails a validity check
+/// rather than addressing another body — `b3w_is_valid` is the way to ask. Its
+/// slot goes back to the free list for the next body.
 void b3w_destroy_body( int handle, int body )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return;
 	}
 
+	// The slot is released even if the engine no longer knows the body: the
+	// handle is the host's to retire, and it is retired here. After the
+	// destroy, not before: gathering a big body's shapes allocates, and a full
+	// heap must not leave a live body mapped to a slot the free list hands on.
 	b3BodyId id = BodyOf( world, body );
-	if ( B3_IS_NULL( id ) )
+	if ( B3_IS_NON_NULL( id ) )
 	{
-		return;
+		DestroyBodyAndGeometry( id );
 	}
-
-	world->bodies[body] = b3_nullBodyId;
-	b3DestroyBody( id );
+	ReleaseBodySlot( world, body );
 }
 
 /**
@@ -2391,11 +2803,12 @@ static bool CustomFilterExclusion( b3ShapeId shapeIdA, b3ShapeId shapeIdB, void*
 	World* world = (World*)context;
 	int a = BodyIndexOfShape( shapeIdA );
 	int b = BodyIndexOfShape( shapeIdB );
-	if ( a < 0 || b < 0 || a >= world->bodyCount || b >= world->bodyCount )
+	if ( a < 0 || b < 0 || a >= world->bodySlotCount || b >= world->bodySlotCount )
 	{
 		return true;
 	}
-	return world->excludedFrom[a] != b && world->excludedFrom[b] != a;
+	// Slots in, handles compared: an exclusion names the other body's handle.
+	return world->excludedFrom[a] != world->slotHandle[b] && world->excludedFrom[b] != world->slotHandle[a];
 }
 
 /**
@@ -2406,7 +2819,7 @@ static bool CustomFilterExclusion( b3ShapeId shapeIdA, b3ShapeId shapeIdB, void*
 void b3w_set_body_exclusion( int handle, int body, int other )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return;
 	}
@@ -2418,7 +2831,7 @@ void b3w_set_body_exclusion( int handle, int body, int other )
 	b3BodyId id = world->bodies[body];
 	int count = b3Body_GetShapeCount( id );
 	b3ShapeId stack[64];
-	b3ShapeId* shapes = count <= 64 ? stack : (b3ShapeId*)malloc( sizeof( b3ShapeId ) * (size_t)count );
+	b3ShapeId* shapes = count <= 64 ? stack : (b3ShapeId*)CheckedAlloc( sizeof( b3ShapeId ) * (size_t)count );
 	count = b3Body_GetShapes( id, shapes, count );
 	for ( int i = 0; i < count; ++i )
 	{
@@ -2463,13 +2876,13 @@ static bool PreSolveDetectOnly( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos po
 	int a = BodyIndexOfShape( shapeIdA );
 	int b = BodyIndexOfShape( shapeIdB );
 
-	if ( a >= 0 && b >= 0 && a < world->bodyCount && b < world->bodyCount && world->placed[a] && world->placed[b] )
+	if ( a >= 0 && b >= 0 && a < world->bodySlotCount && b < world->bodySlotCount && world->placed[a] && world->placed[b] )
 	{
 		return false;
 	}
 
-	bool aDetect = a >= 0 && a < world->bodyCapacity && world->detectOnly[a] != 0;
-	bool bDetect = b >= 0 && b < world->bodyCapacity && world->detectOnly[b] != 0;
+	bool aDetect = a >= 0 && a < world->bodySlotCount && world->detectOnly[a] != 0;
+	bool bDetect = b >= 0 && b < world->bodySlotCount && world->detectOnly[b] != 0;
 
 	if ( !aDetect && !bDetect )
 	{
@@ -2492,8 +2905,8 @@ static bool PreSolveDetectOnly( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos po
 	 *
 	 * Terrain has no owner; every machine's bodies carry their structure's id.
 	 */
-	uint32_t ownerA = ( a >= 0 && a < world->bodyCount ) ? world->bodyOwner[a] : 0;
-	uint32_t ownerB = ( b >= 0 && b < world->bodyCount ) ? world->bodyOwner[b] : 0;
+	uint32_t ownerA = ( a >= 0 && a < world->bodySlotCount ) ? world->bodyOwner[a] : 0;
+	uint32_t ownerB = ( b >= 0 && b < world->bodySlotCount ) ? world->bodyOwner[b] : 0;
 
 	if ( ownerA != 0 && ownerB != 0 )
 	{
@@ -2514,7 +2927,7 @@ static bool PreSolveDetectOnly( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos po
 void b3w_set_body_placed( int handle, int body, int on )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return;
 	}
@@ -2559,7 +2972,7 @@ void b3w_set_detect_only( int handle, int bodiesPtr, int count )
 
 	const int32_t* src = (const int32_t*)(intptr_t)bodiesPtr;
 
-	for ( int i = 0; i < world->bodyCapacity; ++i )
+	for ( int i = 0; i < world->bodySlotCount; ++i )
 	{
 		if ( world->detectOnly[i] == 0 )
 		{
@@ -2581,7 +2994,7 @@ void b3w_set_detect_only( int handle, int bodiesPtr, int count )
 
 	for ( int i = 0; i < count; ++i )
 	{
-		int body = src[i];
+		int body = SlotOf( world, src[i] );
 		b3BodyId markBody = BodyOf( world, body );
 		if ( B3_IS_NULL( markBody ) )
 		{
@@ -2632,7 +3045,7 @@ void b3w_set_maximum_linear_speed( int handle, float speed )
 int b3w_shape_count( int handle, int body )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return B3W_UNKNOWN;
 	}
@@ -2704,6 +3117,7 @@ static float OnRayHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float frac
 typedef struct
 {
 	ClosestRayHit closest;
+	World* world;
 	int exclude;
 	int skipLo;
 	int skipHi;
@@ -2723,13 +3137,16 @@ static float OnFilteredRayHit( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, fl
 	(void)childIndex;
 
 	FilteredRayHit* ctx = (FilteredRayHit*)context;
-	int body = BodyIndexOfShape( shapeId );
 
 	if ( b3w_is_tyre( shapeId ) )
 	{
 		return -1.0f;
 	}
 
+	// The exclusions are HANDLES, a run of them for one structure, so the hit is
+	// compared as one.
+	int slot = BodyIndexOfShape( shapeId );
+	int body = slot >= 0 ? HandleOfSlot( ctx->world, slot ) : -1;
 	if ( body >= 0 && ( body == ctx->exclude || ( body >= ctx->skipLo && body <= ctx->skipHi ) ) )
 	{
 		return -1.0f;
@@ -2764,6 +3181,7 @@ int b3w_cast_ray_filtered( int handle, float ox, float oy, float oz, float dx, f
 	}
 
 	FilteredRayHit ctx = { .closest = { .fraction = 1.0f, .body = -1, .hit = false },
+						   .world = world,
 						   .exclude = exclude,
 						   .skipLo = skipLo,
 						   .skipHi = skipHi };
@@ -2813,7 +3231,8 @@ int b3w_cast_ray_detailed( int handle, float ox, float oy, float oz, float dx, f
 	out[4] = closest.normal.y;
 	out[5] = closest.normal.z;
 	out[6] = closest.fraction;
-	out[7] = (float)closest.body;
+	// The callback recorded the SLOT; the host names bodies by handle.
+	out[7] = (float)( closest.body >= 0 ? HandleOfSlot( world, closest.body ) : -1 );
 	return 1;
 }
 
@@ -2873,7 +3292,7 @@ void b3w_set_revolute_servo( int handle, int joint, float targetRadians, float h
 void b3w_body_set_bullet( int handle, int body, int flag )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return;
 	}
@@ -2888,7 +3307,7 @@ void b3w_body_set_bullet( int handle, int body, int flag )
 void b3w_body_allow_fast_rotation( int handle, int body, int flag )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return;
 	}
@@ -2899,7 +3318,7 @@ void b3w_body_allow_fast_rotation( int handle, int body, int flag )
 void b3w_body_set_owner( int handle, int body, unsigned int owner )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return;
 	}
@@ -2907,16 +3326,25 @@ void b3w_body_set_owner( int handle, int body, unsigned int owner )
 	world->bodyOwner[body] = (uint32_t)owner;
 }
 
-/** The owner of a body, by index. 0 when unowned. Read by the wheel cast. */
-uint32_t b3w_owner_of_body( int handle, int body )
+/** The owner of a body, by SLOT — what a body's userData carries. 0 when
+ *  unowned. Read by the wheel cast in vehicle.c, never by the host. */
+uint32_t b3w_owner_of_slot( int handle, int slot )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || slot < 0 || slot >= world->bodySlotCount )
 	{
 		return 0;
 	}
 
-	return world->bodyOwner[body];
+	return world->bodyOwner[slot];
+}
+
+/** The handle of the body in a slot, -1 for none: how vehicle.c names a body
+ *  it found by userData when it reports one to the host. */
+int b3w_handle_of_slot( int handle, int slot )
+{
+	World* world = GetWorld( handle );
+	return world == NULL ? -1 : HandleOfSlot( world, slot );
 }
 
 /// Current joint angle in radians, which the servo and the game's readouts need.
@@ -2935,7 +3363,7 @@ float b3w_revolute_angle( int handle, int joint )
 void b3w_body_defer_mass( int handle, int body, int deferred )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return;
 	}
@@ -2973,8 +3401,8 @@ void b3w_destroy_shape( int handle, int shape )
 	if ( b3Shape_IsValid( *id ) )
 	{
 		int body = BodyIndexOfShape( *id );
-		b3DestroyShape( *id, MassFromShapes( world, body ) );
-		if ( body >= 0 && body < world->bodyCount && world->massStated[body] != 0 && world->massDeferred[body] == 0 )
+		DestroyShapeAndGeometry( *id, MassFromShapes( world, body ) );
+		if ( body >= 0 && body < world->bodySlotCount && world->massStated[body] != 0 && world->massDeferred[body] == 0 )
 		{
 			ApplyMass( world, body );
 		}
@@ -3075,7 +3503,7 @@ void* b3w_vehicle_get( int handle );
 int b3w_create_vehicle( int handle, int chassis, int category, int mask, int group )
 {
 	World* world = GetWorld( handle );
-	b3BodyId chassisBody = BodyOf( world, chassis );
+	b3BodyId chassisBody = BodyOf( world, SlotOf( world, chassis ) );
 	if ( B3_IS_NULL( chassisBody ) )
 	{
 		return -1;
@@ -3123,7 +3551,7 @@ void b3w_step_vehicle( int vehicle, float dt )
 void b3w_set_sleep_threshold( int handle, int body, float threshold )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount || threshold < 0.0f )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 || threshold < 0.0f )
 	{
 		return;
 	}
@@ -3140,7 +3568,7 @@ void b3w_set_sleep_threshold( int handle, int body, float threshold )
 void b3w_set_body_mass( int handle, int body, float mass )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount || mass <= 0.0f )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 || mass <= 0.0f )
 	{
 		return;
 	}
@@ -3195,7 +3623,7 @@ void b3w_set_body_mass_data( int handle, int body, float mass, float cx, float c
 							 float izz, float ixy, float ixz, float iyz )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return;
 	}
@@ -3240,7 +3668,7 @@ void b3w_set_body_mass_data( int handle, int body, float mass, float cx, float c
 int b3w_body_contacts( int handle, int body, float* out, int capacity )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount || capacity <= 0 )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 || capacity <= 0 )
 	{
 		return 0;
 	}
@@ -3268,7 +3696,7 @@ int b3w_body_contacts( int handle, int body, float* out, int capacity )
 		float sign = queriedIsA ? 1.0f : -1.0f;
 
 		intptr_t tagged = (intptr_t)b3Body_GetUserData( otherId );
-		int otherIndex = tagged > 0 ? (int)( tagged - 1 ) : -1;
+		int otherIndex = tagged > 0 ? HandleOfSlot( world, (int)( tagged - 1 ) ) : -1;
 
 		for ( int m = 0; m < data[i].manifoldCount && written < capacity; m++ )
 		{
@@ -3326,7 +3754,7 @@ int b3w_body_pair_impulse( int handle, int body, int other, float* out )
 {
 	out[0] = out[1] = out[2] = 0.0f;
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount || other < 0 || other >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 || ( other = SlotOf( world, other ) ) < 0 )
 	{
 		return 0;
 	}
@@ -3340,11 +3768,7 @@ int b3w_body_pair_impulse( int handle, int body, int other, float* out )
 	}
 
 	b3ContactData stack[64];
-	b3ContactData* data = capacity <= 64 ? stack : (b3ContactData*)malloc( sizeof( b3ContactData ) * (size_t)capacity );
-	if ( data == NULL )
-	{
-		return 0;
-	}
+	b3ContactData* data = capacity <= 64 ? stack : (b3ContactData*)CheckedAlloc( sizeof( b3ContactData ) * (size_t)capacity );
 	int count = b3Body_GetContactData( id, data, capacity );
 
 	int touching = 0;
@@ -3388,7 +3812,7 @@ int b3w_body_pair_impulse( int handle, int body, int other, float* out )
 float b3w_body_max_approach_speed( int handle, int body )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return 0.0f;
 	}
@@ -3404,11 +3828,7 @@ float b3w_body_max_approach_speed( int handle, int body )
 	b3ContactData* data = local;
 	if ( count > 64 )
 	{
-		data = (b3ContactData*)malloc( (size_t)count * sizeof( b3ContactData ) );
-		if ( data == NULL )
-		{
-			return 0.0f;
-		}
+		data = (b3ContactData*)CheckedAlloc( (size_t)count * sizeof( b3ContactData ) );
 	}
 	count = b3Body_GetContactData( id, data, count );
 
@@ -3458,7 +3878,7 @@ void b3w_body_aabb( int handle, int body, float* out )
 void b3w_body_inertia_tensor( int handle, int body, float* out )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return;
 	}
@@ -3483,7 +3903,7 @@ void b3w_body_inertia_tensor( int handle, int body, float* out )
 int b3w_body_shape_states( int handle, int body, float* out, int capacity )
 {
 	World* world = GetWorld( handle );
-	if ( world == NULL || body < 0 || body >= world->bodyCount )
+	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
 	{
 		return 0;
 	}
@@ -3569,7 +3989,7 @@ int b3w_cast_sphere_filtered( int handle, float cx, float cy, float cz, float ra
 	b3ShapeProxy proxy = { .points = &point, .count = 1, .radius = radius };
 
 	FilteredCastHit ctx = { .closest = { .fraction = 1.0f, .normal = { 0.0f, 1.0f, 0.0f }, .hit = false },
-							.exclude = BodyOf( world, exclude ) };
+							.exclude = BodyOf( world, SlotOf( world, exclude ) ) };
 
 	b3World_CastShape( world->id, ( b3Pos ){ cx, cy, cz }, &proxy, ( b3Vec3 ){ dx, dy, dz }, b3DefaultQueryFilter(),
 					   OnFilteredCastHit, &ctx );
@@ -3688,9 +4108,9 @@ int b3w_debug_draw( int handle, float* verts, float* colors, int capacityVerts, 
 
 	DebugSink sink = { verts, colors, capacityVerts, 0, 1.0f, 1.0f, 1.0f };
 
-	for ( int i = 0; i < world->bodyCount; ++i )
+	for ( int i = 0; i < world->bodySlotCount; ++i )
 	{
-		if ( i == excludeBody )
+		if ( world->slotHandle[i] == excludeBody )
 		{
 			continue;
 		}
