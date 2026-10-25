@@ -43,7 +43,9 @@
 // asserts and writes through it — so a return code would cover only the
 // allocations this file makes. A JavaScript exception unwinds every wasm frame
 // between here and the host call. The shim's own tables are left consistent
-// (it allocates before it mutates), but a throw from inside Box3D can leave the
+// (it allocates before it mutates, and claims a table slot before it creates
+// the shape or joint that will fill it), and nothing it still held is lost
+// (see "held allocations"), but a throw from inside Box3D can leave the
 // world mid-operation, so a host that carries on after this error is carrying
 // on with a world that may refuse or mis-answer from then on. Whether to carry
 // on is the host's decision; this error is what makes it an informed one.
@@ -63,12 +65,65 @@ static void b3w_throw_heap_exhausted( double requested )
 }
 #endif
 
+// --- held allocations ----------------------------------------------------
+//
+// The throw unwinds every C frame without running any of them, so whatever a
+// call still owned when the heap ran out would be lost: a scratch array, or
+// geometry not yet handed to the shape about to be made over it. Such an
+// allocation is HELD for exactly that window, and running out releases every
+// held one before it throws. Nothing held is referenced by the world — it is
+// unheld the moment something else owns it — so releasing it is always safe.
+
+typedef struct Held
+{
+	void* p;
+	void ( *release )( void* );
+} Held;
+
+// A call nests at most three windows (a body's shapes, a map grow, a mesh);
+// one past the end is simply not held, so the worst case is the old leak.
+#define HELD_MAX 8
+static Held g_held[HELD_MAX];
+static int g_heldCount = 0;
+
+static void* Hold( void* p, void ( *release )( void* ) )
+{
+	if ( p != NULL && g_heldCount < HELD_MAX )
+	{
+		g_held[g_heldCount++] = ( Held ){ p, release };
+	}
+	return p;
+}
+
+/** Ownership has passed on (or the call is done with it): no longer released on a throw. */
+static void Unhold( void* p )
+{
+	for ( int i = g_heldCount - 1; i >= 0; --i )
+	{
+		if ( g_held[i].p == p )
+		{
+			g_held[i] = g_held[--g_heldCount];
+			return;
+		}
+	}
+}
+
+static void RunOutOfHeap( double requested )
+{
+	while ( g_heldCount > 0 )
+	{
+		Held held = g_held[--g_heldCount];
+		held.release( held.p );
+	}
+	b3w_throw_heap_exhausted( requested );
+}
+
 void* CheckedAlloc( size_t size )
 {
 	void* p = malloc( size );
 	if ( p == NULL && size > 0 )
 	{
-		b3w_throw_heap_exhausted( (double)size );
+		RunOutOfHeap( (double)size );
 	}
 	return p;
 }
@@ -78,9 +133,37 @@ void* CheckedRealloc( void* old, size_t size )
 	void* p = realloc( old, size );
 	if ( p == NULL && size > 0 )
 	{
-		b3w_throw_heap_exhausted( (double)size );
+		RunOutOfHeap( (double)size );
 	}
 	return p;
+}
+
+/** Scratch for one call: freed by `FreeHeld`, or by a throw if the heap runs out first. */
+static void* AllocHeld( size_t size )
+{
+	return Hold( CheckedAlloc( size ), free );
+}
+
+static void FreeHeld( void* p )
+{
+	Unhold( p );
+	free( p );
+}
+
+// Geometry not yet given to a shape, released as Box3D frees it.
+static void ReleaseMesh( void* p )
+{
+	b3DestroyMesh( (b3MeshData*)p );
+}
+
+static void ReleaseHeightField( void* p )
+{
+	b3DestroyHeightField( (b3HeightFieldData*)p );
+}
+
+static void ReleaseHull( void* p )
+{
+	b3DestroyHull( (b3HullData*)p );
 }
 
 /** Box3D's allocator: its default is `aligned_alloc` with nobody checking. */
@@ -89,7 +172,7 @@ static void* AllocForBox3D( int32_t size, int32_t alignment )
 	void* p = aligned_alloc( (size_t)alignment, (size_t)size );
 	if ( p == NULL && size > 0 )
 	{
-		b3w_throw_heap_exhausted( (double)size );
+		RunOutOfHeap( (double)size );
 	}
 	return p;
 }
@@ -412,8 +495,9 @@ static void MapReserve( World* world, int live )
 	}
 
 	// Both allocated before either is installed, so a full heap leaves the old map whole.
-	int32_t* keys = (int32_t*)CheckedAlloc( sizeof( int32_t ) * (size_t)capacity );
+	int32_t* keys = (int32_t*)AllocHeld( sizeof( int32_t ) * (size_t)capacity );
 	int32_t* slots = (int32_t*)CheckedAlloc( sizeof( int32_t ) * (size_t)capacity );
+	Unhold( keys );
 	memset( keys, 0xFF, sizeof( int32_t ) * (size_t)capacity );
 	world->mapKeys = keys;
 	world->mapSlots = slots;
@@ -611,14 +695,14 @@ static void DestroyBodyAndGeometry( b3BodyId body )
 {
 	int count = b3Body_GetShapeCount( body );
 	b3ShapeId stackShapes[16];
-	b3ShapeId* shapes = count <= 16 ? stackShapes : (b3ShapeId*)CheckedAlloc( sizeof( b3ShapeId ) * (size_t)count );
+	b3ShapeId* shapes = count <= 16 ? stackShapes : (b3ShapeId*)AllocHeld( sizeof( b3ShapeId ) * (size_t)count );
 	count = b3Body_GetShapes( body, shapes, count );
 
 	// Only the owned entries, packed to the front: read before the body goes,
 	// freed after it.
 	OwnedShapeData stackOwned[16];
 	OwnedShapeData* owned =
-		count <= 16 ? stackOwned : (OwnedShapeData*)CheckedAlloc( sizeof( OwnedShapeData ) * (size_t)count );
+		count <= 16 ? stackOwned : (OwnedShapeData*)AllocHeld( sizeof( OwnedShapeData ) * (size_t)count );
 	int ownedCount = 0;
 	for ( int i = 0; i < count; ++i )
 	{
@@ -636,11 +720,11 @@ static void DestroyBodyAndGeometry( b3BodyId body )
 
 	if ( shapes != stackShapes )
 	{
-		free( shapes );
+		FreeHeld( shapes );
 	}
 	if ( owned != stackOwned )
 	{
-		free( owned );
+		FreeHeld( owned );
 	}
 }
 
@@ -942,7 +1026,45 @@ static void ApplyMass( World* world, int body )
 
 static int BodyIndexOfShape( b3ShapeId shapeId );
 
-static int RetainShape( World* world, b3ShapeId shape )
+/**
+ * The slot the next shape will take, with any growth it needs already done, or
+ * -1 when the slot field cannot address another shape (a full heap throws).
+ *
+ * Claimed BEFORE the shape is created and filled by `RetainShape` after, which
+ * allocates nothing: a throw while the table grows then leaves no shape in the
+ * world that the table does not know of — one nothing could ever destroy.
+ * Nothing about the table is taken here; an unused claim costs nothing.
+ *
+ * Recycling is tried BEFORE growing, deliberately: it holds the table at the
+ * high-water mark of what is actually alive rather than at everything ever
+ * created, which is the whole difference between this and the append-only
+ * version that leaked.
+ */
+static int ClaimShapeSlot( World* world )
+{
+	if ( world->shapeCount < world->shapeCapacity )
+	{
+		return world->shapeCount;
+	}
+
+	// Full. Sweep for a slot whose shape has since died, resuming where the
+	// last sweep stopped so a steady state costs about one probe.
+	for ( int n = 0; n < world->shapeCapacity; n++ )
+	{
+		int i = world->shapeRover;
+		world->shapeRover = ( i + 1 ) % world->shapeCapacity;
+		if ( !b3Shape_IsValid( world->shapes[i] ) )
+		{
+			return i;
+		}
+	}
+
+	// Every slot holds a LIVE shape, so the table has to get bigger.
+	return ReserveShapeSlot( world ) ? world->shapeCount : -1;
+}
+
+/** Record a shape in the slot `ClaimShapeSlot` named and return its handle. Allocates nothing. */
+static int RetainShape( World* world, int slot, b3ShapeId shape )
 {
 	if ( !B3_IS_NULL( shape ) && b3Shape_IsValid( shape ) )
 	{
@@ -953,51 +1075,14 @@ static int RetainShape( World* world, b3ShapeId shape )
 		}
 	}
 
-	int slot = -1;
-
-	if ( world->shapeCount < world->shapeCapacity )
+	if ( slot == world->shapeCount )
 	{
-		slot = world->shapeCount++;
+		world->shapeCount++;
 	}
 	else
 	{
-		// Full. Sweep for a slot whose shape has since died, resuming where the
-		// last sweep stopped so a steady state costs about one probe.
-		//
-		// Recycling is tried BEFORE growing, deliberately: it holds the table at
-		// the high-water mark of what is actually alive rather than at
-		// everything ever created, which is the whole difference between this
-		// and the append-only version that leaked.
-		for ( int n = 0; n < world->shapeCapacity; n++ )
-		{
-			int i = world->shapeRover;
-			world->shapeRover = ( i + 1 ) % world->shapeCapacity;
-			if ( !b3Shape_IsValid( world->shapes[i] ) )
-			{
-				slot = i;
-				break;
-			}
-		}
-
-		if ( slot >= 0 )
-		{
-			// Reusing the slot invalidates every handle that pointed at it.
-			world->shapeGen[slot] = (uint16_t)( ( world->shapeGen[slot] + 1 ) & SHAPE_GEN_MASK );
-		}
-	}
-
-	// Every slot holds a LIVE shape, so there is nothing to recycle and the
-	// table has to get bigger. -1 now means only that the slot field cannot
-	// address another shape (the heap running out throws instead). The shape
-	// goes with the refusal: an unregistered shape is one nothing can destroy.
-	if ( slot < 0 )
-	{
-		if ( !ReserveShapeSlot( world ) )
-		{
-			DestroyShapeAndGeometry( shape, true );
-			return -1;
-		}
-		slot = world->shapeCount++;
+		// Reusing the slot invalidates every handle that pointed at it.
+		world->shapeGen[slot] = (uint16_t)( ( world->shapeGen[slot] + 1 ) & SHAPE_GEN_MASK );
 	}
 
 	world->shapes[slot] = shape;
@@ -1072,7 +1157,12 @@ int b3w_add_box_shape( int handle, int body, float hx, float hy, float hz, float
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateHullShape( bodyId, &def, &hull.base ) );
+	int slot = ClaimShapeSlot( world );
+	if ( slot < 0 )
+	{
+		return -1;
+	}
+	return RetainShape( world, slot, b3CreateHullShape( bodyId, &def, &hull.base ) );
 }
 
 /** Handles ever issued: one past the newest. Never falls — a handle is never
@@ -1630,7 +1720,12 @@ int b3w_add_capsule_shape( int handle, int body, float halfHeight, float radius,
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateCapsuleShape( bodyId, &def, &capsule ) );
+	int slot = ClaimShapeSlot( world );
+	if ( slot < 0 )
+	{
+		return -1;
+	}
+	return RetainShape( world, slot, b3CreateCapsuleShape( bodyId, &def, &capsule ) );
 }
 
 // --- terrain and queries -------------------------------------------------
@@ -1714,7 +1809,12 @@ int b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int 
 	def.globalMinimumHeight = minHeight;
 	def.globalMaximumHeight = maxHeight;
 
-	b3HeightFieldData* field = b3CreateHeightField( &def );
+	int slot = ClaimShapeSlot( world );
+	if ( slot < 0 )
+	{
+		return -1;
+	}
+	b3HeightFieldData* field = Hold( b3CreateHeightField( &def ), ReleaseHeightField );
 
 	// Terrain is a surface the game tunes like any other: it states a friction
 	// and a collision group, and taking the library defaults instead left the
@@ -1725,7 +1825,9 @@ int b3w_add_height_field( int handle, int body, int heightsPtr, int countX, int 
 	shapeDef.baseMaterial.friction = friction;
 	shapeDef.baseMaterial.restitution = restitution;
 
-	return RetainShape( world, AttachOwned( b3CreateHeightFieldShape( bodyId, &shapeDef, field ), b3_heightShape, field ) );
+	b3ShapeId shape = b3CreateHeightFieldShape( bodyId, &shapeDef, field );
+	Unhold( field );
+	return RetainShape( world, slot, AttachOwned( shape, b3_heightShape, field ) );
 }
 
 /// Cast a ray and return the hit's world Y, or `missValue` when nothing is hit.
@@ -1848,57 +1950,50 @@ static bool ReserveJointSlot( World* world )
 }
 
 /**
- * Record a joint and return its handle, or -1 if no slot could be had.
+ * The slot the next joint will take, or -1 when the slot field cannot address
+ * another one — claimed before the joint is created, for the reason
+ * `ClaimShapeSlot` gives: a throw while the table grows must not leave a joint
+ * constraining two bodies with no handle to remove it by.
  *
  * Recycling is tried BEFORE growing, deliberately: it holds the table at the
  * high-water mark of what is actually alive rather than at everything ever
  * created, which is the whole difference between this and the bump allocator
  * that leaked.
  */
-static int RetainJoint( World* world, b3JointId joint )
+static int ClaimJointSlot( World* world )
 {
-	int slot = -1;
-
 	if ( world->jointCount < world->jointCapacity )
 	{
-		slot = world->jointCount++;
+		return world->jointCount;
+	}
+
+	// Full. Sweep for a slot whose joint has since died, resuming where the
+	// last sweep stopped so a steady state costs about one probe.
+	for ( int n = 0; n < world->jointCapacity; n++ )
+	{
+		int i = world->jointRover;
+		world->jointRover = ( i + 1 ) % world->jointCapacity;
+		if ( !b3Joint_IsValid( world->joints[i] ) )
+		{
+			return i;
+		}
+	}
+
+	// Every slot holds a LIVE joint, so the table has to get bigger.
+	return ReserveJointSlot( world ) ? world->jointCount : -1;
+}
+
+/** Record a joint in the slot `ClaimJointSlot` named and return its handle. Allocates nothing. */
+static int RetainJoint( World* world, int slot, b3JointId joint )
+{
+	if ( slot == world->jointCount )
+	{
+		world->jointCount++;
 	}
 	else
 	{
-		// Full. Sweep for a slot whose joint has since died, resuming where the
-		// last sweep stopped so a steady state costs about one probe.
-		for ( int n = 0; n < world->jointCapacity; n++ )
-		{
-			int i = world->jointRover;
-			world->jointRover = ( i + 1 ) % world->jointCapacity;
-			if ( !b3Joint_IsValid( world->joints[i] ) )
-			{
-				slot = i;
-				break;
-			}
-		}
-
 		// Reusing the slot invalidates every handle that pointed at it.
-		if ( slot >= 0 )
-		{
-			world->jointGen[slot] = (uint16_t)( ( world->jointGen[slot] + 1 ) & JOINT_GEN_MASK );
-		}
-	}
-
-	// Every slot holds a LIVE joint, so there is nothing to recycle and the
-	// table has to get bigger. -1 now means only that the slot field cannot
-	// address another joint; the joint goes with the refusal, as a shape does.
-	if ( slot < 0 )
-	{
-		if ( !ReserveJointSlot( world ) )
-		{
-			if ( b3Joint_IsValid( joint ) )
-			{
-				b3DestroyJoint( joint, true );
-			}
-			return -1;
-		}
-		slot = world->jointCount++;
+		world->jointGen[slot] = (uint16_t)( ( world->jointGen[slot] + 1 ) & JOINT_GEN_MASK );
 	}
 
 	world->joints[slot] = joint;
@@ -2031,7 +2126,12 @@ int b3w_add_revolute_joint( int handle, int bodyA, int bodyB, float ax, float ay
 	def.base.localFrameA = FrameAlong( ( b3Vec3 ){ ax, ay, az }, AXIS_Z, axis );
 	def.base.localFrameB = FrameAlong( ( b3Vec3 ){ bx, by, bz }, AXIS_Z, axis );
 
-	return RetainJoint( world, b3CreateRevoluteJoint( world->id, &def ) );
+	int slot = ClaimJointSlot( world );
+	if ( slot < 0 )
+	{
+		return -1;
+	}
+	return RetainJoint( world, slot, b3CreateRevoluteJoint( world->id, &def ) );
 }
 
 /**
@@ -2076,7 +2176,12 @@ int b3w_add_motor_joint( int handle, int bodyA, int bodyB, float hertz, float da
 	def.angularDampingRatio = angularDampingRatio;
 	def.maxSpringTorque = maxTorque;
 
-	return RetainJoint( world, b3CreateMotorJoint( world->id, &def ) );
+	int slot = ClaimJointSlot( world );
+	if ( slot < 0 )
+	{
+		return -1;
+	}
+	return RetainJoint( world, slot, b3CreateMotorJoint( world->id, &def ) );
 }
 
 int b3w_add_prismatic_joint( int handle, int bodyA, int bodyB, float ax, float ay, float az, float bx, float by,
@@ -2106,7 +2211,12 @@ int b3w_add_prismatic_joint( int handle, int bodyA, int bodyB, float ax, float a
 	def.base.localFrameA = FrameAlong( ( b3Vec3 ){ ax, ay, az }, AXIS_X, axis );
 	def.base.localFrameB = FrameAlong( ( b3Vec3 ){ bx, by, bz }, AXIS_X, axis );
 
-	return RetainJoint( world, b3CreatePrismaticJoint( world->id, &def ) );
+	int slot = ClaimJointSlot( world );
+	if ( slot < 0 )
+	{
+		return -1;
+	}
+	return RetainJoint( world, slot, b3CreatePrismaticJoint( world->id, &def ) );
 }
 
 /**
@@ -2154,7 +2264,12 @@ int b3w_add_weld_joint( int handle, int bodyA, int bodyB, float px, float py, fl
 	def.linearDampingRatio = dampingRatio;
 	def.angularDampingRatio = dampingRatio;
 
-	return RetainJoint( world, b3CreateWeldJoint( world->id, &def ) );
+	int slot = ClaimJointSlot( world );
+	if ( slot < 0 )
+	{
+		return -1;
+	}
+	return RetainJoint( world, slot, b3CreateWeldJoint( world->id, &def ) );
 }
 
 /**
@@ -2189,7 +2304,12 @@ int b3w_add_ball_joint( int handle, int bodyA, int bodyB, float px, float py, fl
 	def.base.localFrameA = b3InvMulTransforms( fa, anchor );
 	def.base.localFrameB = b3InvMulTransforms( fb, anchor );
 
-	return RetainJoint( world, b3CreateSphericalJoint( world->id, &def ) );
+	int slot = ClaimJointSlot( world );
+	if ( slot < 0 )
+	{
+		return -1;
+	}
+	return RetainJoint( world, slot, b3CreateSphericalJoint( world->id, &def ) );
 }
 
 /**
@@ -2252,7 +2372,12 @@ int b3w_add_distance_joint( int handle, int bodyA, int bodyB, float ax, float ay
 	// straight through the truck; same-machine filtering is the shape group's job.
 	def.base.collideConnected = true;
 
-	return RetainJoint( world, b3CreateDistanceJoint( world->id, &def ) );
+	int slot = ClaimJointSlot( world );
+	if ( slot < 0 )
+	{
+		return -1;
+	}
+	return RetainJoint( world, slot, b3CreateDistanceJoint( world->id, &def ) );
 }
 
 /**
@@ -2351,14 +2476,20 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 		return -1;
 	}
 
-	b3Vec3* vertices = (b3Vec3*)CheckedAlloc( sizeof( b3Vec3 ) * vertexCount );
+	int slot = ClaimShapeSlot( world );
+	if ( slot < 0 )
+	{
+		return -1;
+	}
+
+	b3Vec3* vertices = (b3Vec3*)AllocHeld( sizeof( b3Vec3 ) * vertexCount );
 	const float* src = (const float*)(intptr_t)verticesPtr;
 	for ( int i = 0; i < vertexCount; ++i )
 	{
 		vertices[i] = ( b3Vec3 ){ src[3 * i], src[3 * i + 1], src[3 * i + 2] };
 	}
 
-	int32_t* indices = (int32_t*)CheckedAlloc( sizeof( int32_t ) * 3 * triangleCount );
+	int32_t* indices = (int32_t*)AllocHeld( sizeof( int32_t ) * 3 * triangleCount );
 	memcpy( indices, (const void*)(intptr_t)indicesPtr, sizeof( int32_t ) * 3 * triangleCount );
 
 	// The highest surface named decides how many materials there are: a mesh
@@ -2383,9 +2514,9 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 	def.vertexCount = vertexCount;
 	def.triangleCount = triangleCount;
 
-	b3MeshData* mesh = b3CreateMesh( &def, NULL, 0 );
-	free( vertices );
-	free( indices );
+	b3MeshData* mesh = Hold( b3CreateMesh( &def, NULL, 0 ), ReleaseMesh );
+	FreeHeld( vertices );
+	FreeHeld( indices );
 	if ( mesh == NULL )
 	{
 		return -1;
@@ -2444,7 +2575,8 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 	shapeDef.enableSpeculativeContact = true;
 
 	b3ShapeId shape = b3CreateMeshShape( bodyId, &shapeDef, mesh, ( b3Vec3 ){ 1.0f, 1.0f, 1.0f } );
-	return RetainShape( world, AttachOwned( shape, b3_meshShape, mesh ) );
+	Unhold( mesh );
+	return RetainShape( world, slot, AttachOwned( shape, b3_meshShape, mesh ) );
 }
 
 // --- joint motors and limits ---------------------------------------------
@@ -2638,7 +2770,12 @@ int b3w_add_sphere_shape( int handle, int body, float radius, float ox, float oy
 		return -1;
 	}
 
-	return RetainShape( world, b3CreateSphereShape( bodyId, &def, &sphere ) );
+	int slot = ClaimShapeSlot( world );
+	if ( slot < 0 )
+	{
+		return -1;
+	}
+	return RetainShape( world, slot, b3CreateSphereShape( bodyId, &def, &sphere ) );
 }
 
 /// A cylinder about local Y, matching how the game orients wheels.
@@ -2669,11 +2806,18 @@ int b3w_add_cylinder_shape( int handle, int body, float halfHeight, float radius
 		return -1;
 	}
 
-	b3HullData* hull = b3CreateCylinder( 2.0f * halfHeight, radius, -halfHeight, sides );
+	int slot = ClaimShapeSlot( world );
+	if ( slot < 0 )
+	{
+		return -1;
+	}
+
+	b3HullData* hull = Hold( b3CreateCylinder( 2.0f * halfHeight, radius, -halfHeight, sides ), ReleaseHull );
 	b3ShapeId shape = b3CreateHullShape( bodyId, &def, hull );
+	Unhold( hull );
 	b3DestroyHull( hull );
 
-	return RetainShape( world, shape );
+	return RetainShape( world, slot, shape );
 }
 
 /// A convex hull over a point cloud the host uploaded.
@@ -2686,15 +2830,21 @@ int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int
 		return -1;
 	}
 
-	b3Vec3* points = (b3Vec3*)CheckedAlloc( sizeof( b3Vec3 ) * pointCount );
+	int slot = ClaimShapeSlot( world );
+	if ( slot < 0 )
+	{
+		return -1;
+	}
+
+	b3Vec3* points = (b3Vec3*)AllocHeld( sizeof( b3Vec3 ) * pointCount );
 	const float* src = (const float*)(intptr_t)pointsPtr;
 	for ( int i = 0; i < pointCount; ++i )
 	{
 		points[i] = ( b3Vec3 ){ src[3 * i], src[3 * i + 1], src[3 * i + 2] };
 	}
 
-	b3HullData* hull = b3CreateHull( points, pointCount, maxVertices );
-	free( points );
+	b3HullData* hull = Hold( b3CreateHull( points, pointCount, maxVertices ), ReleaseHull );
+	FreeHeld( points );
 	if ( hull == NULL )
 	{
 		return -1;
@@ -2713,14 +2863,16 @@ int b3w_add_hull_shape( int handle, int body, int pointsPtr, int pointCount, int
 	b3BodyId bodyId = BodyOf( world, body );
 	if ( B3_IS_NULL( bodyId ) )
 	{
+		Unhold( hull );
 		b3DestroyHull( hull );
 		return -1;
 	}
 
 	b3ShapeId shape = b3CreateHullShape( bodyId, &def, hull );
+	Unhold( hull );
 	b3DestroyHull( hull );
 
-	return RetainShape( world, shape );
+	return RetainShape( world, slot, shape );
 }
 
 // --- lifecycle and world state -------------------------------------------
@@ -2831,7 +2983,7 @@ void b3w_set_body_exclusion( int handle, int body, int other )
 	b3BodyId id = world->bodies[body];
 	int count = b3Body_GetShapeCount( id );
 	b3ShapeId stack[64];
-	b3ShapeId* shapes = count <= 64 ? stack : (b3ShapeId*)CheckedAlloc( sizeof( b3ShapeId ) * (size_t)count );
+	b3ShapeId* shapes = count <= 64 ? stack : (b3ShapeId*)AllocHeld( sizeof( b3ShapeId ) * (size_t)count );
 	count = b3Body_GetShapes( id, shapes, count );
 	for ( int i = 0; i < count; ++i )
 	{
@@ -2847,7 +2999,7 @@ void b3w_set_body_exclusion( int handle, int body, int other )
 	}
 	if ( shapes != stack )
 	{
-		free( shapes );
+		FreeHeld( shapes );
 	}
 }
 
