@@ -58,7 +58,7 @@ static int b3QueryMeshTriangles( int* indices, int capacity, const b3Mesh* mesh,
 		.count = 0,
 	};
 
-	b3QueryMesh( mesh, bounds, b3CollectTriangleIndicesCallback, &context );
+	b3QueryMeshWithGhosts( mesh, bounds, b3CollectTriangleIndicesCallback, &context );
 	return context.count;
 }
 
@@ -605,6 +605,9 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 		manifold->triangleFlags = triangle.flags;
 		manifold->feature = b3_featureNone;
 
+		// A ghost claims the edges and vertices it shares, as its own mesh would, and is never a contact itself.
+		bool isGhost = ( triangle.flags & b3_ghostTriangle ) != 0;
+
 		switch ( shapeB->type )
 		{
 			case b3_capsuleShape:
@@ -657,7 +660,10 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 				(void)b3AddVertex( &foundVertices, triangle.i2 );
 				(void)b3AddVertex( &foundVertices, triangle.i3 );
 
-				acceptedManifolds[acceptedManifoldCount++] = manifold;
+				if ( isGhost == false )
+				{
+					acceptedManifolds[acceptedManifoldCount++] = manifold;
+				}
 			}
 			else if ( manifold->feature == b3_featureHullFace )
 			{
@@ -671,7 +677,10 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 					(void)b3AddVertex( &foundVertices, triangle.i2 );
 					(void)b3AddVertex( &foundVertices, triangle.i3 );
 
-					acceptedManifolds[acceptedManifoldCount++] = manifold;
+					if ( isGhost == false )
+					{
+						acceptedManifolds[acceptedManifoldCount++] = manifold;
+					}
 				}
 				else
 				{
@@ -690,7 +699,10 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 						(void)b3AddVertex( &foundVertices, triangle.i1 );
 						(void)b3AddVertex( &foundVertices, triangle.i2 );
 						(void)b3AddVertex( &foundVertices, triangle.i3 );
-						acceptedManifolds[acceptedManifoldCount++] = manifold;
+						if ( isGhost == false )
+						{
+							acceptedManifolds[acceptedManifoldCount++] = manifold;
+						}
 					}
 					else
 					{
@@ -783,7 +795,7 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 					break;
 			}
 
-			if ( shouldCollide == true )
+			if ( shouldCollide == true && ( m->triangleFlags & b3_ghostTriangle ) == 0 )
 			{
 				acceptedManifolds[acceptedManifoldCount++] = m;
 			}
@@ -798,6 +810,11 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 		{
 			b3LocalManifold* m = tentativeManifolds[i];
 			int triangleFlags = m->triangleFlags;
+
+			if ( triangleFlags & b3_ghostTriangle )
+			{
+				continue;
+			}
 
 			if ( ( triangleFlags & b3_allFlatEdges ) == b3_allFlatEdges )
 			{

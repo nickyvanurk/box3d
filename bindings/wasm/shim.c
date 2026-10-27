@@ -2434,14 +2434,13 @@ float b3w_joint_force( int handle, int joint )
 /**
  * Attach a static triangle mesh.
  *
- * No internal-edge flag is passed because Box3D has none to pass: ghost-contact
- * rejection is unconditional in `mesh_contact.c`, which classifies each
- * triangle manifold by feature and accepts an edge or vertex contact only when
- * no adjacent triangle already claimed it. Rapier needs
- * `TriMeshFlags.FIX_INTERNAL_EDGES` for the same effect, and without it a
- * capsule crossing the shared edge of two coplanar triangles is flicked
- * upward. `weldTolerance` covers the vertex merging that flag also implies —
- * adjacency cannot exist across duplicated vertices.
+ * Internal edges are identified (`identifyEdges`). `mesh_contact.c` rejects a
+ * sphere's edge or vertex contact when an adjacent triangle already claimed it,
+ * but a hull's or capsule's only on an edge the mesh has marked FLAT, and only
+ * `b3IdentifyEdges` marks them: without it every box sliding over two coplanar
+ * triangles met the edge between them (a box at 30 m/s on a flat plane of
+ * 1 m quads rose 3.5 m). Adjacency is by vertex INDEX, so the caller shares
+ * vertices by position; nothing is welded here, so no vertex moves.
  *
  * Box3D keeps a reference to the mesh (see b3CreateMeshShape), so the mesh is
  * the shim's: it outlives the shape and is freed when the shape dies
@@ -2454,9 +2453,17 @@ float b3w_joint_force( int handle, int joint )
  * keeps the shape's friction and restitution, so a surface changes what a TYRE
  * makes of the ground (see `b3w_set_surface` in vehicle.c) and nothing about
  * how a crate slides on it.
+ *
+ * The last `ghostTriangleCount` triangles are GHOSTS (`b3MeshDef::ghostTriangleCount`):
+ * a neighbouring mesh's faces along a cut, there only so the classification
+ * above sees across it. The rejection works within one mesh, so a surface the
+ * caller cut into tiles loses it at every cut, and a shape sliding over one
+ * meets the shared edge itself, along a normal no face has. Ghosts never
+ * collide and no query returns them. Their surfaces are read like any other
+ * triangle's, so `surfacesPtr` covers them too.
  */
 int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, int indicesPtr, int triangleCount,
-						 float friction, float restitution, int group, int isSensor, int surfacesPtr )
+						 float friction, float restitution, int group, int isSensor, int surfacesPtr, int ghostTriangleCount )
 {
 	World* world = GetWorld( handle );
 	if ( world == NULL || ( body = SlotOf( world, body ) ) < 0 )
@@ -2508,6 +2515,8 @@ int b3w_add_mesh_shape( int handle, int body, int verticesPtr, int vertexCount, 
 	def.weldTolerance = 1e-4f;
 	def.vertexCount = vertexCount;
 	def.triangleCount = triangleCount;
+	def.ghostTriangleCount = ghostTriangleCount;
+	def.identifyEdges = true;
 
 	// Not held: nothing allocates between here and the shape create, and that
 	// call takes the reference before it allocates — releasing the mesh on a

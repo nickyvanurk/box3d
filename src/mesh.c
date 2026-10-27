@@ -953,6 +953,7 @@ static bool b3SortMeshTriangles( b3MeshData* mesh )
 {
 	b3MeshTriangle* triangles = b3GetMeshTrianglesWrite( mesh );
 	uint8_t* materialIndices = b3GetMeshMaterialIndicesWrite( mesh );
+	uint8_t* flags = b3GetMeshFlagsWrite( mesh );
 
 	// Sort triangles in depth-first-order
 	int offset = 0;
@@ -961,6 +962,10 @@ static bool b3SortMeshTriangles( b3MeshData* mesh )
 
 	b3Array( uint8_t ) tempMaterialIndices;
 	b3Array_CreateN( tempMaterialIndices, mesh->triangleCount );
+
+	// Flags travel with their triangle: a ghost is marked before the sort.
+	b3Array( uint8_t ) tempFlags;
+	b3Array_CreateN( tempFlags, mesh->triangleCount );
 
 	int count = 0;
 	b3MeshNode* stack[B3_MESH_STACK_SIZE];
@@ -990,6 +995,7 @@ static bool b3SortMeshTriangles( b3MeshData* mesh )
 				int index = triangleOffset + triangle;
 				b3Array_Push( tempTriangles, triangles[index] );
 				b3Array_Push( tempMaterialIndices, materialIndices[index] );
+				b3Array_Push( tempFlags, flags[index] );
 			}
 
 			node->triangleOffset = offset;
@@ -1004,9 +1010,11 @@ static bool b3SortMeshTriangles( b3MeshData* mesh )
 	// Copy sorted triangle array back to tree
 	memcpy( triangles, tempTriangles.data, mesh->triangleCount * sizeof( b3MeshTriangle ) );
 	memcpy( materialIndices, tempMaterialIndices.data, mesh->triangleCount * sizeof( uint8_t ) );
+	memcpy( flags, tempFlags.data, mesh->triangleCount * sizeof( uint8_t ) );
 
 	b3Array_Destroy( tempTriangles );
 	b3Array_Destroy( tempMaterialIndices );
+	b3Array_Destroy( tempFlags );
 
 	return true;
 }
@@ -1608,6 +1616,7 @@ b3MeshData* b3CreateMesh( const b3MeshDef* def, int* degenerateTriangleIndices, 
 	float minArea = 0.01f * B3_LINEAR_SLOP * B3_LINEAR_SLOP;
 	float surfaceArea = 0.0f;
 	int materialCount = 1;
+	int firstGhost = triangleCount - b3ClampInt( def->ghostTriangleCount, 0, triangleCount );
 
 	for ( int index = 0; index < triangleCount; ++index )
 	{
@@ -1638,8 +1647,6 @@ b3MeshData* b3CreateMesh( const b3MeshDef* def, int* degenerateTriangleIndices, 
 			continue;
 		}
 
-		surfaceArea += area;
-
 		b3AABB box = {
 			b3Min( vertex1, b3Min( vertex2, vertex3 ) ),
 			b3Max( vertex1, b3Max( vertex2, vertex3 ) ),
@@ -1659,7 +1666,12 @@ b3MeshData* b3CreateMesh( const b3MeshDef* def, int* degenerateTriangleIndices, 
 			materialCount = b3MaxInt( materialCount, def->materialIndices[index] + 1 );
 		}
 
-		meshBounds = b3AABB_Union( meshBounds, box );
+		// A ghost is in the tree, where the contact finds it, and out of the bounds the broadphase pairs by.
+		if ( index < firstGhost )
+		{
+			meshBounds = b3AABB_Union( meshBounds, box );
+			surfaceArea += area;
+		}
 	}
 
 	// Update triangle count due to degenerates being skipped
@@ -1727,7 +1739,7 @@ b3MeshData* b3CreateMesh( const b3MeshDef* def, int* degenerateTriangleIndices, 
 		triangles[index].index1 = indices.data[3 * primitive.triangleIndex + 0];
 		triangles[index].index2 = indices.data[3 * primitive.triangleIndex + 1];
 		triangles[index].index3 = indices.data[3 * primitive.triangleIndex + 2];
-		flags[index] = 0;
+		flags[index] = primitive.triangleIndex >= firstGhost ? b3_ghostTriangle : 0;
 
 		// Copy material indices if they exist. Otherwise the material indices are all zeroes.
 		if ( def->materialIndices != NULL )
@@ -1803,6 +1815,8 @@ bool b3OverlapMesh( const b3Mesh* shape, b3Transform shapeTransform, const b3Sha
 	const b3MeshNode* node = b3GetRoot( shape->data );
 	const b3MeshTriangle* triangles = b3GetMeshTriangles( shape->data );
 	const b3Vec3* vertices = b3GetMeshVertices( shape->data );
+	const uint8_t* flags = b3GetMeshFlags( shape->data );
+	const uint8_t ghostMask = b3_ghostTriangle;
 
 	while ( true )
 	{
@@ -1819,6 +1833,11 @@ bool b3OverlapMesh( const b3Mesh* shape, b3Transform shapeTransform, const b3Sha
 				for ( int index = 0; index < triangleCount; ++index )
 				{
 					int triangleIndex = triangleOffset + index;
+					if ( flags[triangleIndex] & ghostMask )
+					{
+						continue;
+					}
+
 					b3MeshTriangle triangle = triangles[triangleIndex];
 
 					b3Vec3 vertex1 = vertices[triangle.index1];
@@ -1911,6 +1930,8 @@ b3CastOutput b3RayCastMesh( const b3Mesh* mesh, const b3RayCastInput* input )
 	const b3MeshTriangle* triangles = b3GetMeshTriangles( data );
 	const b3Vec3* vertices = b3GetMeshVertices( data );
 	const uint8_t* materialIndices = b3GetMeshMaterialIndices( data );
+	const uint8_t* flags = b3GetMeshFlags( data );
+	const uint8_t ghostMask = b3_ghostTriangle;
 
 	while ( true )
 	{
@@ -1929,6 +1950,11 @@ b3CastOutput b3RayCastMesh( const b3Mesh* mesh, const b3RayCastInput* input )
 				for ( int index = 0; index < triangleCount; ++index )
 				{
 					int triangleIndex = triangleOffset + index;
+					if ( flags[triangleIndex] & ghostMask )
+					{
+						continue;
+					}
+
 					b3MeshTriangle triangle = triangles[triangleIndex];
 
 					// Collide ray with triangle in scaled space
@@ -2046,6 +2072,8 @@ b3CastOutput b3ShapeCastMesh( const b3Mesh* mesh, const b3ShapeCastInput* input 
 	const b3MeshTriangle* triangles = b3GetMeshTriangles( data );
 	const b3Vec3* vertices = b3GetMeshVertices( data );
 	const uint8_t* materialIndices = b3GetMeshMaterialIndices( data );
+	const uint8_t* flags = b3GetMeshFlags( data );
+	const uint8_t ghostMask = b3_ghostTriangle;
 
 	while ( true )
 	{
@@ -2065,6 +2093,11 @@ b3CastOutput b3ShapeCastMesh( const b3Mesh* mesh, const b3ShapeCastInput* input 
 				for ( int index = 0; index < triangleCount; ++index )
 				{
 					int triangleIndex = triangleOffset + index;
+					if ( flags[triangleIndex] & ghostMask )
+					{
+						continue;
+					}
+
 					b3MeshTriangle triangle = triangles[triangleIndex];
 
 					// Collide ray with triangle in scaled space
@@ -2224,6 +2257,8 @@ int b3ShapeCastMeshAll( const b3Mesh* mesh, const b3ShapeCastInput* input, b3Cas
 	const b3MeshTriangle* triangles = b3GetMeshTriangles( data );
 	const b3Vec3* vertices = b3GetMeshVertices( data );
 	const uint8_t* materialIndices = b3GetMeshMaterialIndices( data );
+	const uint8_t* flags = b3GetMeshFlags( data );
+	const uint8_t ghostMask = b3_ghostTriangle;
 
 	while ( true )
 	{
@@ -2243,6 +2278,11 @@ int b3ShapeCastMeshAll( const b3Mesh* mesh, const b3ShapeCastInput* input, b3Cas
 				for ( int index = 0; index < triangleCount; ++index )
 				{
 					int triangleIndex = triangleOffset + index;
+					if ( flags[triangleIndex] & ghostMask )
+					{
+						continue;
+					}
+
 					b3MeshTriangle triangle = triangles[triangleIndex];
 
 					// Collide ray with triangle in scaled space
@@ -2377,7 +2417,7 @@ b3Triangle b3GetMeshTriangle( const b3Mesh* mesh, int triangleIndex )
 		result.i3 = triangle.index2;
 
 		// mesh is inverted, so concave edges are now convex
-		result.flags = 0;
+		result.flags = triangleFlags & b3_ghostTriangle;
 		result.flags |= ( triangleFlags & b3_inverseConcaveEdge1 ) ? b3_concaveEdge1 : 0;
 		result.flags |= ( triangleFlags & b3_inverseConcaveEdge2 ) ? b3_concaveEdge2 : 0;
 		result.flags |= ( triangleFlags & b3_inverseConcaveEdge3 ) ? b3_concaveEdge3 : 0;
@@ -2432,6 +2472,8 @@ int b3CollideMoverAndMesh( b3PlaneResult* planes, int capacity, const b3Mesh* sh
 	const b3MeshNode* node = b3GetRoot( shape->data );
 	const b3MeshTriangle* triangles = b3GetMeshTriangles( shape->data );
 	const b3Vec3* vertices = b3GetMeshVertices( shape->data );
+	const uint8_t* flags = b3GetMeshFlags( shape->data );
+	const uint8_t ghostMask = b3_ghostTriangle;
 
 	int planeCount = 0;
 	while ( planeCount < capacity )
@@ -2449,6 +2491,11 @@ int b3CollideMoverAndMesh( b3PlaneResult* planes, int capacity, const b3Mesh* sh
 				for ( int index = 0; index < triangleCount; ++index )
 				{
 					int triangleIndex = triangleOffset + index;
+					if ( flags[triangleIndex] & ghostMask )
+					{
+						continue;
+					}
+
 					b3MeshTriangle triangle = triangles[triangleIndex];
 
 					b3Vec3 vertex1 = vertices[triangle.index1];
@@ -2512,7 +2559,20 @@ int b3CollideMoverAndMesh( b3PlaneResult* planes, int capacity, const b3Mesh* sh
 	return planeCount;
 }
 
+static void b3QueryMeshTriangles( const b3Mesh* mesh, b3AABB bounds, b3MeshQueryFcn* fcn, void* context, bool includeGhosts );
+
 void b3QueryMesh( const b3Mesh* mesh, b3AABB bounds, b3MeshQueryFcn* fcn, void* context )
+{
+	b3QueryMeshTriangles( mesh, bounds, fcn, context, false );
+}
+
+// The contact needs a mesh's ghosts: they are how it tells an edge a neighbour owns from a free one.
+void b3QueryMeshWithGhosts( const b3Mesh* mesh, b3AABB bounds, b3MeshQueryFcn* fcn, void* context )
+{
+	b3QueryMeshTriangles( mesh, bounds, fcn, context, true );
+}
+
+static void b3QueryMeshTriangles( const b3Mesh* mesh, b3AABB bounds, b3MeshQueryFcn* fcn, void* context, bool includeGhosts )
 {
 	b3Vec3 meshScale = mesh->scale;
 	bool clockwise = meshScale.x * meshScale.y * meshScale.z > 0.0f;
@@ -2534,6 +2594,8 @@ void b3QueryMesh( const b3Mesh* mesh, b3AABB bounds, b3MeshQueryFcn* fcn, void* 
 	const b3MeshNode* node = b3GetRoot( data );
 	const b3MeshTriangle* triangles = b3GetMeshTriangles( data );
 	const b3Vec3* vertices = b3GetMeshVertices( data );
+	const uint8_t* flags = b3GetMeshFlags( data );
+	const uint8_t ghostMask = includeGhosts ? 0 : b3_ghostTriangle;
 
 	while ( true )
 	{
@@ -2551,6 +2613,11 @@ void b3QueryMesh( const b3Mesh* mesh, b3AABB bounds, b3MeshQueryFcn* fcn, void* 
 				for ( int index = 0; index < triangleCount; ++index )
 				{
 					int triangleIndex = triangleOffset + index;
+					if ( flags[triangleIndex] & ghostMask )
+					{
+						continue;
+					}
+
 					b3MeshTriangle triangle = triangles[triangleIndex];
 
 					b3Vec3 vertex1 = vertices[triangle.index1];

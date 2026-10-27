@@ -146,6 +146,9 @@ static inline int b3GetHeightFieldTriangleCount( const b3HeightFieldData* height
 
 // Mesh
 b3Triangle b3GetMeshTriangle( const b3Mesh* mesh, int triangleIndex );
+
+/// `b3QueryMesh` with the mesh's ghosts included. Only the contact wants them.
+void b3QueryMeshWithGhosts( const b3Mesh* mesh, b3AABB bounds, b3MeshQueryFcn* fcn, void* context );
 bool b3IsValidMesh( const b3MeshData* meshData );
 
 static inline bool b3ShouldShapesCollide( b3Filter filterA, b3Filter filterB )

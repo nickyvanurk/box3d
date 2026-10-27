@@ -2100,6 +2100,13 @@ typedef struct b3MeshDef
 
 	/// Compute triangle adjacency information using shared edges
 	bool identifyEdges;
+
+	/// How many of the triangles, counted from the END of `indices`, are ghosts: faces of the
+	/// meshes beside this one that border it, carried only so this mesh judges the edges and
+	/// vertices it shares with them as one mesh would. A ghost never collides, no query returns
+	/// it, and it is not in the mesh's bounds. A surface cut into several meshes carries each
+	/// piece's ring of neighbours as ghosts, so that a cut is not an edge.
+	int ghostTriangleCount;
 } b3MeshDef;
 
 /// 64-bit mesh version. Useful for validating serialized data.
@@ -2123,6 +2130,9 @@ typedef enum b3MeshEdgeFlags
 	b3_flatEdge3 = b3_concaveEdge3 | b3_inverseConcaveEdge3,
 
 	b3_allFlatEdges = b3_flatEdge1 | b3_flatEdge2 | b3_flatEdge3,
+
+	/// Adjacency only. See `b3MeshDef::ghostTriangleCount`.
+	b3_ghostTriangle = 0x80,
 
 } b3MeshEdgeFlags;
 
