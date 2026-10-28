@@ -4360,9 +4360,18 @@ int b3w_debug_draw( int handle, float* verts, float* colors, int capacityVerts, 
 					const uint8_t* base = (const uint8_t*)data;
 					const b3Vec3* verts = (const b3Vec3*)( base + data->vertexOffset );
 					const b3MeshTriangle* tris = (const b3MeshTriangle*)( base + data->triangleOffset );
+					const uint8_t* flags = b3GetMeshFlags( data );
 
 					for ( int t = 0; t < data->triangleCount; ++t )
 					{
+						// A ghost is a neighbour's face, held for adjacency only:
+						// the neighbour draws it, and drawing it here too doubles
+						// the overlay's cost along every cut.
+						if ( flags != NULL && ( flags[t] & b3_ghostTriangle ) )
+						{
+							continue;
+						}
+
 						b3Vec3 a = verts[tris[t].index1];
 						b3Vec3 b = verts[tris[t].index2];
 						b3Vec3 c = verts[tris[t].index3];
